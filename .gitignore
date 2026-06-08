@@ -1,0 +1,31 @@
+# Data (large, clinical, sensitive)
+data/raw/
+data/processed/
+*.mp4
+*.avi
+
+# Models & checkpoints
+models/checkpoints/
+*.pth
+*.pt
+*.onnx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Logs, outputs
+logs/
+outputs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
