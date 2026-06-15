@@ -7,13 +7,11 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 
-# Adjust module versions to your cluster (Snellius)
 module load 2023
-module load Anaconda3/2023.09-0
-module load CUDA/12.1.1
+module load Python/3.11.3-GCCcore-12.3.0
 
-conda activate rarp
 cd $SLURM_SUBMIT_DIR
+source venv/bin/activate
 
 # "$@" forwards any extra sbatch args to python, e.g.:
 #   sbatch jobs/finetune_seg.sh --epochs 20
