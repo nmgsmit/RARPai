@@ -1,0 +1,26 @@
+_base_: ../base.yaml
+
+data:
+  video_path: data\raw\RARP_voorbeeld_A.mp4   # override via CLI: data.video_path=your_video.mp4
+  frame_skip: 10
+  max_frames: 1
+  resize: [540, 960]                # downscale to 540p for faster inference
+
+segmentation:
+  model: sam2
+  device: cuda
+  params:
+    hf_model_id: facebook/sam2-hiera-tiny  # swap for sam2-hiera-tiny for max speed
+    prompt_frame: 0                          # frame index to place your prompt on
+    # Set ONE of the following:
+    # Option A — click points on the urethra
+    points: [[135, 620]]          # [x, y] in pixels at the resize resolution
+    point_labels: [1]             # 1 = foreground, 0 = background
+    # Option B — draw a bounding box (comment out points/point_labels above)
+    # box: [x1, y1, x2, y2]
+
+output:
+  dir: outputs/sam2/
+  save_masks: true
+  save_overlay: true
+  overlay_alpha: 0.5

@@ -1,0 +1,28 @@
+data:
+  video_path: null        # required — set in experiment config or CLI override
+  frame_skip: 1           # process every Nth frame
+  max_frames: null        # cap at N frames (null = all)
+  resize: null            # [H, W] or null to keep original resolution
+
+segmentation:
+  model: null             # registry key, e.g. sam2
+  device: cuda
+  params: {}
+
+depth:
+  enabled: false
+  model: null
+  device: cuda
+  params: {}
+
+length:
+  enabled: false
+  method: null
+  params: {}
+
+output:
+  dir: outputs/
+  save_masks: true
+  save_overlay: true
+  overlay_alpha: 0.4
+  fps: null               # null = match input video fps

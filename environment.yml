@@ -1,0 +1,26 @@
+name: rarp
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # PyTorch with CUDA — installed via pytorch conda channel
+  - pytorch::pytorch>=2.5.1
+  - pytorch::torchvision>=0.20.0
+  - pytorch::pytorch-cuda=12.1
+
+  # Everything else via pip
+  - pip:
+    - git+https://github.com/facebookresearch/sam2.git
+    - opencv-python>=4.8
+    - numpy>=1.24,<2.0
+    - pyyaml>=6.0
+    - tqdm>=4.65
+    - matplotlib>=3.7
+    - timm==1.0.13
+    - huggingface-hub>=0.23
