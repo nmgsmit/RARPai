@@ -3,9 +3,9 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 #SBATCH --time=08:00:00
-#SBATCH --partition=gpu
-#SBATCH --gpus=1
+#SBATCH --partition=genoa
 #SBATCH --cpus-per-task=16
+#SBATCH --mem=64G
 
 # Adjust module versions to your cluster (Snellius)
 module load 2023
