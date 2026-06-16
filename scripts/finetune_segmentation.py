@@ -108,18 +108,30 @@ def dice_ce_loss(logits, target, num_classes):
 
 
 @torch.no_grad()
-def miou(model, loader, num_classes, device):
+def validate(model, loader, num_classes, device):
     inter = torch.zeros(num_classes)
     union = torch.zeros(num_classes)
+    dice_inter = torch.zeros(num_classes)
+    dice_denom = torch.zeros(num_classes)
+    total_loss = 0.0
     model.eval()
     for x, y in loader:
-        pred = model(x.to(device)).argmax(1).cpu()
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        total_loss += dice_ce_loss(logits, y, num_classes).item()
+        pred = logits.argmax(1).cpu()
+        y_cpu = y.cpu()
         for c in range(num_classes):
-            p, t = pred == c, y == c
+            p, t = pred == c, y_cpu == c
             inter[c] += (p & t).sum()
             union[c] += (p | t).sum()
-    iou = inter / union.clamp(min=1)
-    return iou[union > 0].mean().item()
+            dice_inter[c] += (p & t).sum()
+            dice_denom[c] += p.sum() + t.sum()
+    present = union > 0
+    val_miou = (inter / union.clamp(min=1))[present].mean().item()
+    val_dice = (2 * dice_inter / dice_denom.clamp(min=1))[present].mean().item()
+    val_loss = total_loss / len(loader)
+    return val_miou, val_dice, val_loss
 
 
 def main():
@@ -203,14 +215,19 @@ def main():
             scaler.update()
             run += loss.item()
         sched.step()
-        val = miou(model, va, nc, device)
         avg_loss = run / len(tr)
-        print(f"epoch {ep+1}/{args.epochs}  loss={avg_loss:.4f}  val_mIoU={val:.4f}", flush=True)
-        wandb.log({"train/loss": avg_loss, "val/mIoU": val, "epoch": ep + 1})
-        if val > best:
-            best = val
+        val_miou, val_dice, val_loss = validate(model, va, nc, device)
+        lr = opt.param_groups[0]["lr"]
+        print(f"epoch {ep+1}/{args.epochs}  loss={avg_loss:.4f}  val_loss={val_loss:.4f}  "
+              f"val_mIoU={val_miou:.4f}  val_dice={val_dice:.4f}", flush=True)
+        wandb.log({"train/loss": avg_loss, "val/loss": val_loss,
+                   "val/mIoU": val_miou, "val/dice": val_dice,
+                   "lr": lr, "epoch": ep + 1})
+        if val_miou > best:
+            best = val_miou
             torch.save(model.state_dict(), outdir / "best.pth")
             wandb.run.summary["best_val_mIoU"] = best
+            wandb.run.summary["best_val_dice"] = val_dice
 
     wandb.finish()
     print(f"[done] best val_mIoU={best:.4f} -> {outdir/'best.pth'}")
