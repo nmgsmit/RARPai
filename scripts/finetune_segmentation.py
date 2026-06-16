@@ -10,11 +10,14 @@ Data layout (same as SurgeNet):
 Run a no-data smoke test first on the cluster:
     python scripts/finetune_segmentation.py --smoke
 
+Hyperparameters follow the SurgeNet paper (Jaspers et al., MedIA 2025, §5.1.2):
+AdamW lr=1e-5, fully-trainable encoder, 256x256, batch 16, flips+rotation aug.
+Their ablation shows a trainable encoder beats a frozen one — so we do NOT freeze.
+
 Real run:
     python scripts/finetune_segmentation.py \
         --data-root ../data/RARPSurgenet/fold1 \
-        --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth \
-        --freeze-encoder
+        --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth
 """
 from __future__ import annotations
 import argparse
@@ -63,18 +66,22 @@ class SegDataset(Dataset):
 
     def __getitem__(self, i):
         img = Image.open(self.frames[i]).convert("RGB").resize(
-            (self.img_size, self.img_size), Image.BILINEAR)
+            (self.img_size, self.img_size), Image.BICUBIC)
         msk = Image.open(self.masks[i]).convert("L").resize(
             (self.img_size, self.img_size), Image.NEAREST)
         img = np.array(img)
         msk = np.array(msk)
         if self.augment:
-            if random.random() < 0.5:                        # horizontal flip
-                img = img[:, ::-1].copy()
-                msk = msk[:, ::-1].copy()
-            if random.random() < 0.2:                        # tiny brightness jitter
-                f = 1.0 + random.uniform(-0.08, 0.08)
-                img = np.clip(img.astype(np.float32) * f, 0, 255).astype(np.uint8)
+            # SurgeNet paper aug: h/v flip + rotation, p=0.5 each. rot is k*90deg
+            # so masks stay label-exact (no interpolation / border fill).
+            if random.random() < 0.5:
+                img, msk = img[:, ::-1], msk[:, ::-1]
+            if random.random() < 0.5:
+                img, msk = img[::-1], msk[::-1]
+            if random.random() < 0.5:
+                k = random.randint(1, 3)
+                img, msk = np.rot90(img, k), np.rot90(msk, k)
+            img, msk = np.ascontiguousarray(img), np.ascontiguousarray(msk)
         x = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
         x = (x - IMAGENET_MEAN) / IMAGENET_STD
         y = torch.from_numpy(msk).long()
@@ -144,15 +151,10 @@ def main():
     ap.add_argument("--out",           default="outputs/rarp_finetune")
     ap.add_argument("--run-name",      default=None)
     ap.add_argument("--num-classes",   type=int,   default=0)
-    ap.add_argument("--img-size",      type=int,   default=768)   # #4 higher resolution
-    ap.add_argument("--epochs",        type=int,   default=50)
-    ap.add_argument("--warmup-epochs", type=int,   default=3)     # #6 warmup
-    ap.add_argument("--batch-size",    type=int,   default=4)     # smaller for 768²
-    ap.add_argument("--lr",            type=float, default=1e-4)  # same LR as baseline
-    ap.add_argument("--encoder-lr",    type=float, default=1e-6,
-                    help="encoder LR when not frozen (very low)")
-    ap.add_argument("--freeze-encoder", action="store_true",      # #2 freeze encoder
-                    help="freeze pretrained encoder, only train FPN head")
+    ap.add_argument("--img-size",      type=int,   default=512)   # >paper(256): thin urethra survives NEAREST downsample
+    ap.add_argument("--epochs",        type=int,   default=10)
+    ap.add_argument("--batch-size",    type=int,   default=8)     # halved from paper's 16 to fit 512² in memory
+    ap.add_argument("--lr",            type=float, default=1e-5)  # paper, whole model
     ap.add_argument("--no-augment",    action="store_true")
     ap.add_argument("--workers",       type=int,   default=8)
     ap.add_argument("--seed",          type=int,   default=42)
@@ -173,8 +175,7 @@ def main():
 
     root = Path(args.data_root)
     nc   = args.num_classes or detect_num_classes(root / "Train")
-    print(f"[setup] num_classes={nc} img_size={args.img_size} device={device} "
-          f"freeze_encoder={args.freeze_encoder}")
+    print(f"[setup] num_classes={nc} img_size={args.img_size} device={device}")
 
     import wandb
     wandb.init(
@@ -183,9 +184,7 @@ def main():
         name=args.run_name,
         config=dict(
             num_classes=nc, img_size=args.img_size, epochs=args.epochs,
-            warmup_epochs=args.warmup_epochs, batch_size=args.batch_size,
-            lr=args.lr, encoder_lr=args.encoder_lr,
-            freeze_encoder=args.freeze_encoder,
+            batch_size=args.batch_size, lr=args.lr,
             augment=not args.no_augment, loss="dice+ce", seed=args.seed,
             encoder_ckpt=args.encoder_ckpt, data_root=str(root),
         ),
@@ -202,24 +201,10 @@ def main():
     model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None).to(device)
     load_encoder(model, args.encoder_ckpt)
 
-    # #2 discriminative LR: encoder gets very low LR or is frozen
-    if args.freeze_encoder:
-        for p in model.metaformer.parameters():
-            p.requires_grad = False
-        param_groups = [{"params": model.FPN.parameters(), "lr": args.lr}]
-        print(f"[optim] encoder FROZEN | head lr={args.lr}")
-    else:
-        param_groups = [
-            {"params": model.metaformer.parameters(), "lr": args.encoder_lr},
-            {"params": model.FPN.parameters(),        "lr": args.lr},
-        ]
-        print(f"[optim] encoder_lr={args.encoder_lr} head_lr={args.lr}")
-
-    opt    = torch.optim.AdamW(param_groups, weight_decay=1e-2)
-    # #6 linear warmup then cosine
-    warmup = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.1, total_iters=args.warmup_epochs)
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs - args.warmup_epochs)
-    sched  = torch.optim.lr_scheduler.SequentialLR(opt, [warmup, cosine], milestones=[args.warmup_epochs])
+    # paper: whole model (encoder + FPN) trainable at one LR. ponytail: constant
+    # LR — paper halves on a 10-epoch plateau, which never fires in a 10-epoch run.
+    opt    = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
+    print(f"[optim] AdamW lr={args.lr} (encoder trainable)")
     scaler = torch.amp.GradScaler(device)
 
     outdir = Path(args.out)
@@ -237,10 +222,9 @@ def main():
             scaler.step(opt)
             scaler.update()
             run += loss.item()
-        sched.step()
         avg_loss = run / len(tr)
         val_miou, val_dice, val_loss = validate(model, va, nc, device)
-        lr = opt.param_groups[-1]["lr"]
+        lr = opt.param_groups[0]["lr"]
         print(f"epoch {ep+1}/{args.epochs}  train_loss={avg_loss:.4f}  val_loss={val_loss:.4f}  "
               f"val_mIoU={val_miou:.4f}  val_dice={val_dice:.4f}", flush=True)
         wandb.log({"train/loss": avg_loss, "val/loss": val_loss,
