@@ -102,24 +102,22 @@ def load_encoder(model: MetaFormerFPN, ckpt_path: str):
           f"unexpected={len(msg.unexpected_keys)}")
 
 
-def focal_tversky_ce_loss(logits, target, num_classes, class_weights=None,
-                          alpha=0.3, beta=0.7, gamma=0.75):
-    """Weighted CE + Focal-Tversky. beta>alpha penalizes false negatives,
-    which helps thin/small structures (catheter, urethra)."""
-    ce = F.cross_entropy(logits, target, weight=class_weights)
+def dice_ce_loss(logits, target, num_classes, class_weights=None):
+    """Weighted Dice + CE. Simple, stable, works well."""
+    if class_weights is not None:
+        ce = F.cross_entropy(logits, target, weight=class_weights)
+    else:
+        ce = F.cross_entropy(logits, target)
     probs = logits.softmax(1)
     oh = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
     dims = (0, 2, 3)
-    tp = (probs * oh).sum(dims)
-    fp = (probs * (1 - oh)).sum(dims)
-    fn = ((1 - probs) * oh).sum(dims)
-    tversky = (tp + 1.0) / (tp + alpha * fp + beta * fn + 1.0)
-    ft = (1.0 - tversky) ** gamma
+    inter = (probs * oh).sum(dims)
+    dice = (2 * inter + 1.0) / (probs.sum(dims) + oh.sum(dims) + 1.0)
     if class_weights is not None:
-        ft = (ft * class_weights).sum() / class_weights.sum()
+        dice = (dice * class_weights).sum() / class_weights.sum()
     else:
-        ft = ft.mean()
-    return ce + ft
+        dice = dice.mean()
+    return ce + (1.0 - dice)
 
 
 @torch.no_grad()
@@ -133,7 +131,7 @@ def validate(model, loader, num_classes, device, class_weights=None):
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         logits = model(x)
-        total_loss += focal_tversky_ce_loss(logits, y, num_classes, class_weights=class_weights).item()
+        total_loss += dice_ce_loss(logits, y, num_classes, class_weights=class_weights).item()
         pred = logits.argmax(1).cpu()
         y_cpu = y.cpu()
         for c in range(num_classes):
@@ -178,7 +176,7 @@ def main():
         y = torch.randint(0, 12, (2, args.img_size, args.img_size), device=device)
         out = m(x)
         assert out.shape[-2:] == x.shape[-2:], f"output {out.shape} != input HxW"
-        focal_tversky_ce_loss(out, y, 12).backward()
+        dice_ce_loss(out, y, 12).backward()
         print(f"[smoke] ok | out={tuple(out.shape)} device={device}")
         return
 
@@ -249,7 +247,7 @@ def main():
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad()
             with torch.amp.autocast(device):
-                loss = focal_tversky_ce_loss(model(x), y, nc, class_weights=class_weights)
+                loss = dice_ce_loss(model(x), y, nc, class_weights=class_weights)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
