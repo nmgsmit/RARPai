@@ -138,10 +138,11 @@ def validate(model, loader, num_classes, device):
             union[c]      += (p | t).sum()
             dice_inter[c] += (p & t).sum()
             dice_denom[c] += p.sum() + t.sum()
-    present  = union > 0
-    val_miou = (inter / union.clamp(min=1))[present].mean().item()
-    val_dice = (2 * dice_inter / dice_denom.clamp(min=1))[present].mean().item()
-    return val_miou, val_dice, total_loss / len(loader)
+    present    = union > 0
+    per_dice   = (2 * dice_inter / dice_denom.clamp(min=1))
+    val_miou   = (inter / union.clamp(min=1))[present].mean().item()
+    val_dice   = per_dice[present].mean().item()
+    return val_miou, val_dice, total_loss / len(loader), per_dice
 
 
 def main():
@@ -223,12 +224,15 @@ def main():
             scaler.update()
             run += loss.item()
         avg_loss = run / len(tr)
-        val_miou, val_dice, val_loss = validate(model, va, nc, device)
+        val_miou, val_dice, val_loss, per_dice = validate(model, va, nc, device)
         lr = opt.param_groups[0]["lr"]
         print(f"epoch {ep+1}/{args.epochs}  train_loss={avg_loss:.4f}  val_loss={val_loss:.4f}  "
-              f"val_mIoU={val_miou:.4f}  val_dice={val_dice:.4f}", flush=True)
+              f"val_mIoU={val_miou:.4f}  val_dice={val_dice:.4f}  "
+              f"catheter={per_dice[1]:.4f}  urethra={per_dice[3]:.4f}", flush=True)
         wandb.log({"train/loss": avg_loss, "val/loss": val_loss,
                    "val/mIoU": val_miou, "val/dice": val_dice,
+                   "val/dice_catheter": per_dice[1].item(),
+                   "val/dice_urethra":  per_dice[3].item(),
                    "lr": lr, "epoch": ep + 1})
         # #5 save best by Dice
         if val_dice > best:
@@ -236,6 +240,20 @@ def main():
             torch.save(model.state_dict(), outdir / "best.pth")
             wandb.run.summary["best_val_dice"] = best
             wandb.run.summary["best_val_mIoU"] = val_miou
+
+    # final test-set eval using best checkpoint
+    te = DataLoader(SegDataset(root / "Test", args.img_size),
+                    args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+    model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
+    te_miou, te_dice, te_loss, te_per_dice = validate(model, te, nc, device)
+    print(f"[test]  mIoU={te_miou:.4f}  dice={te_dice:.4f}  "
+          f"catheter={te_per_dice[1]:.4f}  urethra={te_per_dice[3]:.4f}", flush=True)
+    wandb.run.summary.update({
+        "test/mIoU":         te_miou,
+        "test/dice":         te_dice,
+        "test/dice_catheter": te_per_dice[1].item(),
+        "test/dice_urethra":  te_per_dice[3].item(),
+    })
 
     wandb.finish()
     print(f"[done] best val_dice={best:.4f} -> {outdir/'best.pth'}")
