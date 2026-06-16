@@ -34,11 +34,21 @@ CLASS_COLORS = {
 
 
 def load_model(checkpoint_path, device):
-    model = MetaFormerFPN(num_classes=4, pretrained="ImageNet", pretrained_weights=None).to(device)
+    # auto-detect num_classes from checkpoint
     state = torch.load(checkpoint_path, map_location=device)
+    # find a head layer to infer num_classes
+    num_classes = None
+    for key, val in state.items():
+        if "head.fc2.weight" in key:
+            num_classes = val.shape[0]
+            break
+    if num_classes is None:
+        raise ValueError("could not infer num_classes from checkpoint")
+
+    model = MetaFormerFPN(num_classes=num_classes, pretrained="ImageNet", pretrained_weights=None).to(device)
     model.load_state_dict(state)
     model.eval()
-    print(f"[model] loaded {checkpoint_path}")
+    print(f"[model] loaded {checkpoint_path} (num_classes={num_classes})")
     return model
 
 
@@ -85,7 +95,6 @@ def main():
     ap.add_argument("--checkpoint", required=True, help="model checkpoint path")
     ap.add_argument("--output", required=True, help="output video path")
     ap.add_argument("--img-size", type=int, default=512)
-    ap.add_argument("--num-classes", type=int, default=4)
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
