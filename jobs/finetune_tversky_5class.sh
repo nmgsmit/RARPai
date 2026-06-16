@@ -3,7 +3,7 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 #SBATCH --time=08:00:00
-#SBATCH --partition=genoa
+#SBATCH --partition=gpu_h100
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 
@@ -20,6 +20,6 @@ python scripts/finetune_seg_tversky.py \
     --data-root ../data/RARPSurgenet/fold1 \
     --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth \
     --out outputs/rarp_tversky_5class \
-    --run-name tversky-ema-5class \
-    --keep-classes 1,2,3,4 \
+    --run-name tverskyall \
+    --keep-classes 0,1,2,3,4 \
     "$@"
