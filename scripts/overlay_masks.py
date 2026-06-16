@@ -95,6 +95,7 @@ def main():
     ap.add_argument("--checkpoint", required=True, help="model checkpoint path")
     ap.add_argument("--output", required=True, help="output video path")
     ap.add_argument("--img-size", type=int, default=512)
+    ap.add_argument("--fps", type=int, default=30, help="output fps (default 30)")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -106,7 +107,8 @@ def main():
         print(f"ERROR: cannot open {args.video}")
         return
 
-    fps = cap.get(cv2.CAP_PROP_FPS)
+    input_fps = cap.get(cv2.CAP_PROP_FPS)
+    fps = args.fps
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -115,17 +117,25 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     out = cv2.VideoWriter(args.output, fourcc, fps, (width, height))
 
-    print(f"[video] {num_frames} frames @ {fps:.1f} fps, {width}x{height}")
+    # frame skipping if output fps < input fps
+    frame_step = max(1, int(round(input_fps / fps)))
+    output_frames = (num_frames + frame_step - 1) // frame_step
+    print(f"[video] input: {num_frames} frames @ {input_fps:.1f} fps, {width}x{height}")
+    print(f"[video] output: ~{output_frames} frames @ {fps} fps (step={frame_step})")
 
+    frame_idx = 0
+    written = 0
     for i in range(num_frames):
         ret, frame = cap.read()
         if not ret:
             break
-        mask = segment_frame(frame, model, args.img_size, device)
-        overlay = overlay_mask(frame, mask)
-        out.write(overlay)
-        if (i + 1) % 30 == 0:
-            print(f"[progress] {i+1}/{num_frames}")
+        if i % frame_step == 0:
+            mask = segment_frame(frame, model, args.img_size, device)
+            overlay = overlay_mask(frame, mask)
+            out.write(overlay)
+            written += 1
+            if written % 30 == 0:
+                print(f"[progress] {written}/{output_frames}")
 
     cap.release()
     out.release()
