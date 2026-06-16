@@ -41,6 +41,18 @@ from metaformer import MetaFormerFPN  # noqa: E402
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
+# raw mask label ids. We keep only catheter+prostate; everything else -> background.
+RAW_NAMES = {0: "background", 1: "catheter", 2: "prostate", 3: "urethra", 4: "apicalvesicle"}
+
+
+def build_remap(keep):
+    """LUT mapping raw label ids -> compact ids. kept classes become 1..K (in the
+    given order), every other id (incl. raw background) maps to 0=background."""
+    lut = np.zeros(256, dtype=np.uint8)
+    for new_id, old_id in enumerate(keep, start=1):
+        lut[old_id] = new_id
+    return lut
+
 
 def seed_everything(seed: int):
     random.seed(seed)
@@ -66,12 +78,13 @@ def photometric(img):
 
 
 class SegDataset(Dataset):
-    def __init__(self, split_dir: Path, img_size: int, augment: bool = False):
+    def __init__(self, split_dir: Path, img_size: int, remap, augment: bool = False):
         self.frames = sorted((split_dir / "frames").glob("*.png"))
         self.masks  = sorted((split_dir / "masks").glob("*.png"))
         assert len(self.frames) == len(self.masks) and self.frames, \
             f"frame/mask count mismatch or empty in {split_dir}"
         self.img_size = img_size
+        self.remap    = remap
         self.augment  = augment
 
     def __len__(self):
@@ -83,7 +96,7 @@ class SegDataset(Dataset):
         msk = Image.open(self.masks[i]).convert("L").resize(
             (self.img_size, self.img_size), Image.NEAREST)
         img = np.array(img)
-        msk = np.array(msk)
+        msk = self.remap[np.array(msk)]                 # drop unwanted classes -> bg
         if self.augment:
             if random.random() < 0.5:               # hflip (only safe geometric one)
                 img, msk = img[:, ::-1].copy(), msk[:, ::-1].copy()
@@ -107,13 +120,6 @@ class EMA:
                 self.shadow[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
             else:
                 self.shadow[k].copy_(v)  # ints (e.g. counters) just copied
-
-
-def detect_num_classes(split_dir: Path) -> int:
-    hi = 0
-    for m in sorted((split_dir / "masks").glob("*.png")):
-        hi = max(hi, int(np.array(Image.open(m).convert("L")).max()))
-    return hi + 1
 
 
 def load_encoder(model: MetaFormerFPN, ckpt_path: str):
@@ -176,7 +182,9 @@ def main():
     ap.add_argument("--encoder-ckpt", default="../backbones/RARP_checkpoint_epoch0050_teacher.pth")
     ap.add_argument("--out",          default="outputs/rarp_tversky")
     ap.add_argument("--run-name",     default="tversky-ema")
-    ap.add_argument("--num-classes",  type=int,   default=0)
+    ap.add_argument("--keep-classes", default="1,2",
+                    help="raw class ids to optimize; all others -> background. "
+                         "Default catheter(1),prostate(2).")
     ap.add_argument("--img-size",     type=int,   default=512)
     ap.add_argument("--epochs",       type=int,   default=30)
     ap.add_argument("--batch-size",   type=int,   default=8)
@@ -208,9 +216,13 @@ def main():
         print(f"[smoke] ok | out={tuple(out.shape)} device={device}")
         return
 
-    root = Path(args.data_root)
-    nc   = args.num_classes or detect_num_classes(root / "Train")
-    print(f"[setup] num_classes={nc} img_size={args.img_size} device={device}")
+    root  = Path(args.data_root)
+    keep  = [int(c) for c in args.keep_classes.split(",")]
+    names = ["background"] + [RAW_NAMES.get(c, f"class{c}") for c in keep]  # compact-id -> name
+    remap = build_remap(keep)
+    nc    = len(keep) + 1
+    print(f"[setup] keep={keep} -> num_classes={nc} ({names}) "
+          f"img_size={args.img_size} device={device}")
 
     import wandb
     wandb.init(
@@ -218,7 +230,8 @@ def main():
         entity=os.getenv("WANDB_ENTITY") or None,
         name=args.run_name,
         config=dict(
-            num_classes=nc, img_size=args.img_size, epochs=args.epochs,
+            num_classes=nc, keep_classes=keep, class_names=names,
+            img_size=args.img_size, epochs=args.epochs,
             batch_size=args.batch_size, lr=args.lr,
             alpha=args.alpha, beta=args.beta, ema_decay=args.ema_decay,
             augment=not args.no_augment, loss="tversky+ce(bg-excluded)",
@@ -229,10 +242,10 @@ def main():
 
     g  = torch.Generator()
     g.manual_seed(args.seed)
-    tr = DataLoader(SegDataset(root / "Train", args.img_size, augment=not args.no_augment),
+    tr = DataLoader(SegDataset(root / "Train", args.img_size, remap, augment=not args.no_augment),
                     args.batch_size, shuffle=True, num_workers=args.workers,
                     pin_memory=True, drop_last=True, generator=g)
-    va = DataLoader(SegDataset(root / "Validation", args.img_size),
+    va = DataLoader(SegDataset(root / "Validation", args.img_size, remap),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
 
     model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None).to(device)
@@ -271,32 +284,32 @@ def main():
 
         sched.step(val_loss)
         lr = opt.param_groups[0]["lr"]
+        fg_dice = per_dice[1:].mean().item()           # mean over kept classes only
+        per_cls = "  ".join(f"{names[c]}={per_dice[c]:.4f}" for c in range(1, nc))
         print(f"epoch {ep+1}/{args.epochs}  train_loss={avg_loss:.4f}  val_loss={val_loss:.4f}  "
-              f"val_mIoU={val_miou:.4f}  val_dice={val_dice:.4f}  "
-              f"catheter={per_dice[1]:.4f}  urethra={per_dice[3]:.4f}", flush=True)
+              f"val_mIoU={val_miou:.4f}  fg_dice={fg_dice:.4f}  {per_cls}", flush=True)
         wandb.log({"train/loss": avg_loss, "val/loss": val_loss,
-                   "val/mIoU": val_miou, "val/dice": val_dice,
-                   "val/dice_catheter": per_dice[1].item(),
-                   "val/dice_urethra":  per_dice[3].item(),
+                   "val/mIoU": val_miou, "val/dice": fg_dice,
+                   **{f"val/dice_{names[c]}": per_dice[c].item() for c in range(1, nc)},
                    "lr": lr, "epoch": ep + 1})
-        if val_dice > best:
-            best = val_dice
+        if fg_dice > best:                             # checkpoint on the classes we optimize
+            best = fg_dice
             torch.save(ema.shadow, outdir / "best.pth")   # save the EMA weights
             wandb.run.summary["best_val_dice"] = best
             wandb.run.summary["best_val_mIoU"] = val_miou
 
     # final test-set eval using best (EMA) checkpoint
-    te = DataLoader(SegDataset(root / "Test", args.img_size),
+    te = DataLoader(SegDataset(root / "Test", args.img_size, remap),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
     te_miou, te_dice, te_loss, te_per_dice = validate(model, te, nc, device, args.alpha, args.beta)
-    print(f"[test]  mIoU={te_miou:.4f}  dice={te_dice:.4f}  "
-          f"catheter={te_per_dice[1]:.4f}  urethra={te_per_dice[3]:.4f}", flush=True)
+    te_fg = te_per_dice[1:].mean().item()
+    te_per = "  ".join(f"{names[c]}={te_per_dice[c]:.4f}" for c in range(1, nc))
+    print(f"[test]  mIoU={te_miou:.4f}  fg_dice={te_fg:.4f}  {te_per}", flush=True)
     wandb.run.summary.update({
-        "test/mIoU":          te_miou,
-        "test/dice":          te_dice,
-        "test/dice_catheter": te_per_dice[1].item(),
-        "test/dice_urethra":  te_per_dice[3].item(),
+        "test/mIoU":  te_miou,
+        "test/dice":  te_fg,
+        **{f"test/dice_{names[c]}": te_per_dice[c].item() for c in range(1, nc)},
     })
 
     wandb.finish()
