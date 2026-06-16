@@ -140,7 +140,11 @@ def validate(model, loader, num_classes, device, class_weights=None):
             union[c] += (p | t).sum()
             dice_inter[c] += (p & t).sum()
             dice_denom[c] += p.sum() + t.sum()
-    present = union > 0
+    # Compute metrics only on classes with non-zero weight in class_weights
+    if class_weights is not None:
+        present = (union > 0) & (class_weights > 0)
+    else:
+        present = union > 0
     miou = (inter / union.clamp(min=1))[present].mean().item()
     dice = (2 * dice_inter / dice_denom.clamp(min=1))[present].mean().item()
     val_loss = total_loss / len(loader)
