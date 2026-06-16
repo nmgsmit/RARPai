@@ -87,18 +87,25 @@ def load_encoder(model: MetaFormerFPN, ckpt_path: str):
           f"unexpected={len(msg.unexpected_keys)}")
 
 
-def dice_ce_loss(logits, target, num_classes):
-    ce = F.cross_entropy(logits, target)
+def dice_ce_loss(logits, target, num_classes, class_weights=None):
+    if class_weights is not None:
+        ce = F.cross_entropy(logits, target, weight=class_weights)
+    else:
+        ce = F.cross_entropy(logits, target)
     probs = logits.softmax(1)
     oh = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
     dims = (0, 2, 3)
     inter = (probs * oh).sum(dims)
     dice = (2 * inter + 1.0) / (probs.sum(dims) + oh.sum(dims) + 1.0)
-    return ce + (1.0 - dice.mean())
+    if class_weights is not None:
+        dice = (dice * class_weights).sum() / class_weights.sum()
+    else:
+        dice = dice.mean()
+    return ce + (1.0 - dice)
 
 
 @torch.no_grad()
-def validate(model, loader, num_classes, device):
+def validate(model, loader, num_classes, device, class_weights=None):
     inter = torch.zeros(num_classes)
     union = torch.zeros(num_classes)
     dice_inter = torch.zeros(num_classes)
@@ -108,7 +115,7 @@ def validate(model, loader, num_classes, device):
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         logits = model(x)
-        total_loss += dice_ce_loss(logits, y, num_classes).item()
+        total_loss += dice_ce_loss(logits, y, num_classes, class_weights=class_weights).item()
         pred = logits.argmax(1).cpu()
         y_cpu = y.cpu()
         for c in range(num_classes):
@@ -147,13 +154,21 @@ def main():
         y = torch.randint(0, 12, (2, args.img_size, args.img_size), device=device)
         out = m(x)
         assert out.shape[-2:] == x.shape[-2:], f"output {out.shape} != input HxW"
-        dice_ce_loss(out, y, 12).backward()
+        loss = dice_ce_loss(out, y, 12)
+        loss.backward()
         print(f"[smoke] ok | out={tuple(out.shape)} device={device}")
         return
 
     root = Path(args.data_root)
     nc = args.num_classes or detect_num_classes(root / "Train")
     print(f"[setup] num_classes={nc} img_size={args.img_size} device={device}")
+
+    # Only optimize catheter (class 1) and urethra (class 3), ignore others
+    class_weights = torch.ones(nc)
+    class_weights[[0, 2, 4]] = 0.0  # zero out background, class 2, class 4
+    class_weights = class_weights / class_weights.sum()  # normalize
+    class_weights = class_weights.to(device)
+    print(f"[classes] optimizing only: 1=catheter, 3=urethra | weights={class_weights.tolist()}")
 
     import wandb
     wandb.init(
@@ -193,14 +208,14 @@ def main():
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad()
             with torch.amp.autocast(device):
-                loss = dice_ce_loss(model(x), y, nc)
+                loss = dice_ce_loss(model(x), y, nc, class_weights=class_weights)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
             run += loss.item()
         sched.step()
         avg_loss = run / len(tr)
-        val_miou, val_dice, val_loss = validate(model, va, nc, device)
+        val_miou, val_dice, val_loss = validate(model, va, nc, device, class_weights=class_weights)
         print(f"epoch {ep+1}/{args.epochs}  train_loss={avg_loss:.4f}  "
               f"val_loss={val_loss:.4f}  val_mIoU={val_miou:.4f}  val_dice={val_dice:.4f}", flush=True)
         wandb.log({
