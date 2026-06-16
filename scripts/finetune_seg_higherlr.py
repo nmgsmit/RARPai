@@ -1,21 +1,12 @@
 """
-Finetune a MetaFormerFPN (CAFormer-S18 encoder) segmentation model from a
-SurgeNet pretrained encoder checkpoint (e.g. SurgeNet-RARP teacher).
+Finetune variant: higher LR (1e-4), minimal aug — mirrors the light-flower-6
+run (commit 16ab508) which was one of the best observed runs, but replaces
+CosineAnnealingLR (decays from epoch 1) with ReduceLROnPlateau.
 
-Data layout (same as SurgeNet):
-    <data_root>/<split>/frames/*.png
-    <data_root>/<split>/masks/*.png   # single-channel, pixel value = class id
-    split in {Train, Validation, Test}
-
-Run a no-data smoke test first on the cluster:
-    python scripts/finetune_segmentation.py --smoke
-
-Hyperparameters follow the SurgeNet paper (Jaspers et al., MedIA 2025, §5.1.2):
-AdamW lr=1e-5, fully-trainable encoder, 256x256, batch 16, flips+rotation aug.
-Their ablation shows a trainable encoder beats a frozen one — so we do NOT freeze.
+Compare against finetune_segmentation.py (surgenet-paper: lr=1e-5, D4 aug).
 
 Real run:
-    python scripts/finetune_segmentation.py \
+    python scripts/finetune_seg_higherlr.py \
         --data-root ../data/RARPSurgenet/fold1 \
         --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth
 """
@@ -35,7 +26,6 @@ from torch.utils.data import DataLoader, Dataset
 
 load_dotenv()
 
-# vendored from https://github.com/timjaspers0801/surgenet
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "surgenet"))
 from metaformer import MetaFormerFPN  # noqa: E402
 
@@ -72,16 +62,9 @@ class SegDataset(Dataset):
         img = np.array(img)
         msk = np.array(msk)
         if self.augment:
-            # SurgeNet paper aug: h/v flip + rotation, p=0.5 each. rot is k*90deg
-            # so masks stay label-exact (no interpolation / border fill).
+            # light-flower-6 aug: hflip only
             if random.random() < 0.5:
-                img, msk = img[:, ::-1], msk[:, ::-1]
-            if random.random() < 0.5:
-                img, msk = img[::-1], msk[::-1]
-            if random.random() < 0.5:
-                k = random.randint(1, 3)
-                img, msk = np.rot90(img, k), np.rot90(msk, k)
-            img, msk = np.ascontiguousarray(img), np.ascontiguousarray(msk)
+                img, msk = img[:, ::-1].copy(), msk[:, ::-1].copy()
         x = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
         x = (x - IMAGENET_MEAN) / IMAGENET_STD
         y = torch.from_numpy(msk).long()
@@ -109,7 +92,7 @@ def load_encoder(model: MetaFormerFPN, ckpt_path: str):
 
 
 def dice_ce_loss(logits, target, num_classes):
-    ce = F.cross_entropy(logits, target)
+    ce    = F.cross_entropy(logits, target)
     probs = logits.softmax(1)
     oh    = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
     dims  = (0, 2, 3)
@@ -127,39 +110,39 @@ def validate(model, loader, num_classes, device):
     total_loss = 0.0
     model.eval()
     for x, y in loader:
-        x, y   = x.to(device), y.to(device)
-        logits  = model(x)
+        x, y    = x.to(device), y.to(device)
+        logits   = model(x)
         total_loss += dice_ce_loss(logits, y, num_classes).item()
-        pred   = logits.argmax(1).cpu()
-        y_cpu  = y.cpu()
+        pred    = logits.argmax(1).cpu()
+        y_cpu   = y.cpu()
         for c in range(num_classes):
             p, t = pred == c, y_cpu == c
             inter[c]      += (p & t).sum()
             union[c]      += (p | t).sum()
             dice_inter[c] += (p & t).sum()
             dice_denom[c] += p.sum() + t.sum()
-    present    = union > 0
-    per_dice   = (2 * dice_inter / dice_denom.clamp(min=1))
-    val_miou   = (inter / union.clamp(min=1))[present].mean().item()
-    val_dice   = per_dice[present].mean().item()
+    present  = union > 0
+    per_dice = (2 * dice_inter / dice_denom.clamp(min=1))
+    val_miou = (inter / union.clamp(min=1))[present].mean().item()
+    val_dice = per_dice[present].mean().item()
     return val_miou, val_dice, total_loss / len(loader), per_dice
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-root",     default="../data/RARPSurgenet/fold1")
-    ap.add_argument("--encoder-ckpt",  default="../backbones/RARP_checkpoint_epoch0050_teacher.pth")
-    ap.add_argument("--out",           default="outputs/rarp_finetune")
-    ap.add_argument("--run-name",      default="surgenet-paper")
-    ap.add_argument("--num-classes",   type=int,   default=0)
-    ap.add_argument("--img-size",      type=int,   default=512)   # >paper(256): thin urethra survives NEAREST downsample
-    ap.add_argument("--epochs",        type=int,   default=15)
-    ap.add_argument("--batch-size",    type=int,   default=8)     # halved from paper's 16 to fit 512² in memory
-    ap.add_argument("--lr",            type=float, default=1e-5)  # paper, whole model
-    ap.add_argument("--no-augment",    action="store_true")
-    ap.add_argument("--workers",       type=int,   default=8)
-    ap.add_argument("--seed",          type=int,   default=42)
-    ap.add_argument("--smoke",         action="store_true")
+    ap.add_argument("--data-root",    default="../data/RARPSurgenet/fold1")
+    ap.add_argument("--encoder-ckpt", default="../backbones/RARP_checkpoint_epoch0050_teacher.pth")
+    ap.add_argument("--out",          default="outputs/rarp_higherlr")
+    ap.add_argument("--run-name",     default="higherlr-plateau")
+    ap.add_argument("--num-classes",  type=int,   default=0)
+    ap.add_argument("--img-size",     type=int,   default=512)
+    ap.add_argument("--epochs",       type=int,   default=15)
+    ap.add_argument("--batch-size",   type=int,   default=8)
+    ap.add_argument("--lr",           type=float, default=1e-4)
+    ap.add_argument("--no-augment",   action="store_true")
+    ap.add_argument("--workers",      type=int,   default=8)
+    ap.add_argument("--seed",         type=int,   default=42)
+    ap.add_argument("--smoke",        action="store_true")
     args = ap.parse_args()
     seed_everything(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -234,7 +217,6 @@ def main():
                    "val/dice_catheter": per_dice[1].item(),
                    "val/dice_urethra":  per_dice[3].item(),
                    "lr": lr, "epoch": ep + 1})
-        # #5 save best by Dice
         if val_dice > best:
             best = val_dice
             torch.save(model.state_dict(), outdir / "best.pth")
@@ -249,8 +231,8 @@ def main():
     print(f"[test]  mIoU={te_miou:.4f}  dice={te_dice:.4f}  "
           f"catheter={te_per_dice[1]:.4f}  urethra={te_per_dice[3]:.4f}", flush=True)
     wandb.run.summary.update({
-        "test/mIoU":         te_miou,
-        "test/dice":         te_dice,
+        "test/mIoU":          te_miou,
+        "test/dice":          te_dice,
         "test/dice_catheter": te_per_dice[1].item(),
         "test/dice_urethra":  te_per_dice[3].item(),
     })

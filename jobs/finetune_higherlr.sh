@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=surgenet-paper
+#SBATCH --job-name=higherlr-plateau
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 #SBATCH --time=08:00:00
@@ -13,10 +13,8 @@ module load Python/3.11.3-GCCcore-12.3.0
 cd $SLURM_SUBMIT_DIR
 source venv/bin/activate
 
-# "$@" forwards any extra sbatch args to python, e.g.:
-#   sbatch jobs/finetune_seg.sh --img-size 768 --batch-size 4
-python scripts/finetune_segmentation.py \
+python scripts/finetune_seg_higherlr.py \
     --data-root ../data/RARPSurgenet/fold1 \
     --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth \
-    --out outputs/rarp_finetune \
+    --out outputs/rarp_higherlr \
     "$@"
