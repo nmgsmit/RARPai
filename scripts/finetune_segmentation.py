@@ -142,11 +142,15 @@ def validate(model, loader, num_classes, device, class_weights=None):
             dice_denom[c] += p.sum() + t.sum()
     # Compute metrics only on classes with non-zero weight in class_weights
     if class_weights is not None:
-        present = (union > 0) & (class_weights > 0)
+        w_cpu = class_weights.cpu() if class_weights.device.type == 'cuda' else class_weights
+        present = (union > 0) & (w_cpu > 0)
     else:
         present = union > 0
-    miou = (inter / union.clamp(min=1))[present].mean().item()
-    dice = (2 * dice_inter / dice_denom.clamp(min=1))[present].mean().item()
+    if present.sum() > 0:
+        miou = (inter / union.clamp(min=1))[present].mean().item()
+        dice = (2 * dice_inter / dice_denom.clamp(min=1))[present].mean().item()
+    else:
+        miou, dice = 0.0, 0.0
     val_loss = total_loss / len(loader)
     return miou, dice, val_loss
 
