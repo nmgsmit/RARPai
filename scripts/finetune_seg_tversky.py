@@ -285,16 +285,16 @@ def main():
 
         sched.step(val_loss)
         lr = opt.param_groups[0]["lr"]
-        fg_dice = per_dice[1:].mean().item()           # mean over kept classes only
-        per_cls = "  ".join(f"{names[c]}={per_dice[c]:.4f}" for c in range(1, nc))
+        track = [(c, names[c]) for c in range(1, nc) if names[c] in ("catheter", "urethra")]
+        per_cls = "  ".join(f"{n}={per_dice[c]:.4f}" for c, n in track)
         print(f"epoch {ep+1}/{args.epochs}  train_loss={avg_loss:.4f}  val_loss={val_loss:.4f}  "
-              f"val_mIoU={val_miou:.4f}  fg_dice={fg_dice:.4f}  {per_cls}", flush=True)
+              f"val_mIoU={val_miou:.4f}  val_dice={val_dice:.4f}  {per_cls}", flush=True)
         wandb.log({"train/loss": avg_loss, "val/loss": val_loss,
-                   "val/mIoU": val_miou, "val/dice": fg_dice,
-                   **{f"val/dice_{names[c]}": per_dice[c].item() for c in range(1, nc)},
+                   "val/mIoU": val_miou, "val/dice": val_dice,
+                   **{f"val/dice_{n}": per_dice[c].item() for c, n in track},
                    "lr": lr, "epoch": ep + 1})
-        if fg_dice > best:                             # checkpoint on the classes we optimize
-            best = fg_dice
+        if val_dice > best:
+            best = val_dice
             torch.save(ema.shadow, outdir / "best.pth")   # save the EMA weights
             wandb.run.summary["best_val_dice"] = best
             wandb.run.summary["best_val_mIoU"] = val_miou
@@ -304,13 +304,13 @@ def main():
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
     te_miou, te_dice, te_loss, te_per_dice = validate(model, te, nc, device, args.alpha, args.beta)
-    te_fg = te_per_dice[1:].mean().item()
-    te_per = "  ".join(f"{names[c]}={te_per_dice[c]:.4f}" for c in range(1, nc))
-    print(f"[test]  mIoU={te_miou:.4f}  fg_dice={te_fg:.4f}  {te_per}", flush=True)
+    track = [(c, names[c]) for c in range(1, nc) if names[c] in ("catheter", "urethra")]
+    te_per = "  ".join(f"{n}={te_per_dice[c]:.4f}" for c, n in track)
+    print(f"[test]  mIoU={te_miou:.4f}  dice={te_dice:.4f}  {te_per}", flush=True)
     wandb.run.summary.update({
         "test/mIoU":  te_miou,
-        "test/dice":  te_fg,
-        **{f"test/dice_{names[c]}": te_per_dice[c].item() for c in range(1, nc)},
+        "test/dice":  te_dice,
+        **{f"test/dice_{n}": te_per_dice[c].item() for c, n in track},
     })
 
     wandb.finish()
