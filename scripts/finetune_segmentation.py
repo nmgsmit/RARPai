@@ -153,7 +153,7 @@ def main():
     ap.add_argument("--run-name",      default="surgenet-paper")
     ap.add_argument("--num-classes",   type=int,   default=0)
     ap.add_argument("--img-size",      type=int,   default=512)   # >paper(256): thin urethra survives NEAREST downsample
-    ap.add_argument("--epochs",        type=int,   default=15)
+    ap.add_argument("--epochs",        type=int,   default=30)
     ap.add_argument("--batch-size",    type=int,   default=8)     # halved from paper's 16 to fit 512² in memory
     ap.add_argument("--lr",            type=float, default=1e-5)  # paper, whole model
     ap.add_argument("--no-augment",    action="store_true")
