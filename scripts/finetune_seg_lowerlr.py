@@ -1,9 +1,9 @@
 """
-Finetune variant: lower LR (5e-4), hflip-only aug — middle ground between
+Finetune variant: lower LR (5e-5), hflip-only aug — middle ground between
 surgenet-paper (1e-5, D4) and higherlr-plateau (1e-4, hflip).
 
 higherlr-plateau shows val_loss increasing after epoch 4-5 (overfitting).
-This run tests if 5e-4 + hflip avoids that.
+This run tests if 5e-5 + hflip avoids that.
 
 Real run:
     python scripts/finetune_seg_lowerlr.py \
@@ -138,7 +138,7 @@ def main():
     ap.add_argument("--img-size",     type=int,   default=512)
     ap.add_argument("--epochs",       type=int,   default=30)
     ap.add_argument("--batch-size",   type=int,   default=8)
-    ap.add_argument("--lr",           type=float, default=5e-4)
+    ap.add_argument("--lr",           type=float, default=5e-5)
     ap.add_argument("--no-augment",   action="store_true")
     ap.add_argument("--workers",      type=int,   default=8)
     ap.add_argument("--seed",         type=int,   default=42)

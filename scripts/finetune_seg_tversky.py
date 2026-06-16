@@ -1,6 +1,7 @@
 """
 Finetune variant: background-excluded Tversky+CE loss, photometric augmentation,
-and weight EMA. Built on the lowerlr config (lr=5e-4, hflip).
+and weight EMA. Built on the lowerlr config (lr=5e-5, hflip).
+Optimizes catheter(1) + urethra(3); other classes remapped to background.
 
 Why these three:
   - Loss: the old dice term averaged over ALL classes incl. background, diluting
@@ -182,13 +183,13 @@ def main():
     ap.add_argument("--encoder-ckpt", default="../backbones/RARP_checkpoint_epoch0050_teacher.pth")
     ap.add_argument("--out",          default="outputs/rarp_tversky")
     ap.add_argument("--run-name",     default="tversky-ema")
-    ap.add_argument("--keep-classes", default="1,2",
+    ap.add_argument("--keep-classes", default="1,3",
                     help="raw class ids to optimize; all others -> background. "
-                         "Default catheter(1),prostate(2).")
+                         "Default catheter(1),urethra(3).")
     ap.add_argument("--img-size",     type=int,   default=512)
     ap.add_argument("--epochs",       type=int,   default=30)
     ap.add_argument("--batch-size",   type=int,   default=8)
-    ap.add_argument("--lr",           type=float, default=5e-4)
+    ap.add_argument("--lr",           type=float, default=5e-5)
     ap.add_argument("--alpha",        type=float, default=0.4, help="Tversky FP weight")
     ap.add_argument("--beta",         type=float, default=0.6, help="Tversky FN weight")
     ap.add_argument("--ema-decay",    type=float, default=0.999)
