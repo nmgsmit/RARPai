@@ -8,7 +8,7 @@ sam2>=1.0
 
 # Computer vision
 opencv-python>=4.8
-numpy>=1.24,<2.0
+numpy>=1.24
 
 # Config / utils
 pyyaml>=6.0
@@ -22,3 +22,7 @@ huggingface-hub>=0.23
 
 # Visualisation / notebooks
 matplotlib>=3.7
+
+# Experiment tracking
+wandb>=0.17
+python-dotenv>=1.0

@@ -17,15 +17,18 @@ Real run:
 """
 from __future__ import annotations
 import argparse
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from dotenv import load_dotenv
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+
+load_dotenv()  # picks up .env from cwd (repo root)
 
 # vendored from https://github.com/timjaspers0801/surgenet
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "surgenet"))
@@ -115,6 +118,7 @@ def main():
     ap.add_argument("--encoder-ckpt",
                     default="../backbones/RARP_checkpoint_epoch0050_teacher.pth")
     ap.add_argument("--out", default="outputs/rarp_finetune")
+    ap.add_argument("--run-name", default=None, help="wandb run name")
     ap.add_argument("--num-classes", type=int, default=0, help="0 = auto-detect")
     ap.add_argument("--img-size", type=int, default=512)
     ap.add_argument("--epochs", type=int, default=50)
@@ -138,6 +142,22 @@ def main():
     root = Path(args.data_root)
     nc = args.num_classes or detect_num_classes(root / "Train")
     print(f"[setup] num_classes={nc} img_size={args.img_size} device={device}")
+
+    import wandb
+    wandb.init(
+        project=os.getenv("WANDB_PROJECT", "rarp-segmentation"),
+        entity=os.getenv("WANDB_ENTITY") or None,
+        name=args.run_name,
+        config=dict(
+            num_classes=nc,
+            img_size=args.img_size,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            encoder_ckpt=args.encoder_ckpt,
+            data_root=str(root),
+        ),
+    )
 
     tr = DataLoader(SegDataset(root / "Train", args.img_size), args.batch_size,
                     shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True)
@@ -168,10 +188,15 @@ def main():
             run += loss.item()
         sched.step()
         val = miou(model, va, nc, device)
-        print(f"epoch {ep+1}/{args.epochs}  loss={run/len(tr):.4f}  val_mIoU={val:.4f}", flush=True)
+        avg_loss = run / len(tr)
+        print(f"epoch {ep+1}/{args.epochs}  loss={avg_loss:.4f}  val_mIoU={val:.4f}", flush=True)
+        wandb.log({"train/loss": avg_loss, "val/mIoU": val, "epoch": ep + 1})
         if val > best:
             best = val
             torch.save(model.state_dict(), outdir / "best.pth")
+            wandb.run.summary["best_val_mIoU"] = best
+
+    wandb.finish()
     print(f"[done] best val_mIoU={best:.4f} -> {outdir/'best.pth'}")
 
 
