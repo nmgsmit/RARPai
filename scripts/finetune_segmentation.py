@@ -32,6 +32,15 @@ from torch.utils.data import DataLoader, Dataset
 
 load_dotenv()  # picks up .env from cwd (repo root)
 
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 # vendored from https://github.com/timjaspers0801/surgenet
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "surgenet"))
 from metaformer import MetaFormerFPN  # noqa: E402
@@ -174,8 +183,10 @@ def main():
                     help="freeze pretrained encoder, train decoder only")
     ap.add_argument("--no-augment", action="store_true", help="disable light augmentation")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--smoke", action="store_true", help="no-data build+step self-test")
     args = ap.parse_args()
+    seed_everything(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     if args.smoke:
@@ -208,14 +219,16 @@ def main():
             num_classes=nc, img_size=args.img_size, epochs=args.epochs,
             warmup_epochs=args.warmup_epochs, batch_size=args.batch_size,
             lr=args.lr, encoder_lr=args.encoder_lr, freeze_encoder=args.freeze_encoder,
-            augment=not args.no_augment, loss="focal_tversky+ce",
+            augment=not args.no_augment, loss="dice+ce", seed=args.seed,
             encoder_ckpt=args.encoder_ckpt, data_root=str(root),
         ),
     )
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
     tr = DataLoader(SegDataset(root / "Train", args.img_size, augment=not args.no_augment),
                     args.batch_size, shuffle=True, num_workers=args.workers,
-                    pin_memory=True, drop_last=True)
+                    pin_memory=True, drop_last=True, generator=g)
     va = DataLoader(SegDataset(root / "Validation", args.img_size),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
 
