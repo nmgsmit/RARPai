@@ -19,5 +19,4 @@ python scripts/finetune_segmentation.py \
     --data-root ../data/RARPSurgenet/fold1 \
     --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth \
     --out outputs/rarp_finetune \
-    --freeze-encoder \
     "$@"
