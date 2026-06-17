@@ -13,16 +13,15 @@ module load Python/3.11.3-GCCcore-12.3.0
 cd $SLURM_SUBMIT_DIR
 source venv/bin/activate
 
-# Same script/loss/EMA/aug/ReduceLROnPlateau as tversky-ema, but all classes,
-# lr=1e-4, 50 epochs. NOTE: --keep-classes 0,1,2,3,4 makes a 6-class model with a
-# dead class and puts background INTO the Tversky term; use 1,2,3,4 for a clean
-# 5-class model with background excluded (see chat).
+# Same script/loss/EMA/aug/ReduceLROnPlateau as tversky-ema, but all 5 classes,
+# lr=1e-4, 50 epochs. keep-classes 1,2,3,4 = clean 5-class model: background is
+# class 0 (in CE + metrics, excluded from the Tversky region term).
 python scripts/finetune_seg_tversky.py \
     --data-root ../data/RARPSurgenet/fold1 \
     --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth \
     --out outputs/rarp_tversky_5class \
     --run-name tverskyall \
-    --keep-classes 0,1,2,3,4 \
+    --keep-classes 1,2,3,4 \
     --lr 1e-4 \
     --epochs 50 \
     "$@"
