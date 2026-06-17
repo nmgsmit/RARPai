@@ -46,6 +46,11 @@ IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 RAW_NAMES = {0: "background", 1: "catheter", 2: "prostate", 3: "urethra", 4: "apicalvesicle"}
 
 
+def round32(x):
+    """CAFormer downsamples by 32, so H and W must be multiples of 32."""
+    return max(32, int(round(x / 32)) * 32)
+
+
 def build_remap(keep):
     """LUT mapping raw label ids -> compact ids. kept classes become 1..K (in the
     given order), every other id (incl. raw background) maps to 0=background."""
@@ -79,23 +84,22 @@ def photometric(img):
 
 
 class SegDataset(Dataset):
-    def __init__(self, split_dir: Path, img_size: int, remap, augment: bool = False):
+    def __init__(self, split_dir: Path, size_hw, remap, augment: bool = False):
         self.frames = sorted((split_dir / "frames").glob("*.png"))
         self.masks  = sorted((split_dir / "masks").glob("*.png"))
         assert len(self.frames) == len(self.masks) and self.frames, \
             f"frame/mask count mismatch or empty in {split_dir}"
-        self.img_size = img_size
-        self.remap    = remap
-        self.augment  = augment
+        self.size_hw = size_hw                           # (H, W)
+        self.remap   = remap
+        self.augment = augment
 
     def __len__(self):
         return len(self.frames)
 
     def __getitem__(self, i):
-        img = Image.open(self.frames[i]).convert("RGB").resize(
-            (self.img_size, self.img_size), Image.BICUBIC)
-        msk = Image.open(self.masks[i]).convert("L").resize(
-            (self.img_size, self.img_size), Image.NEAREST)
+        h, w = self.size_hw
+        img = Image.open(self.frames[i]).convert("RGB").resize((w, h), Image.BICUBIC)
+        msk = Image.open(self.masks[i]).convert("L").resize((w, h), Image.NEAREST)
         img = np.array(img)
         msk = self.remap[np.array(msk)]                 # drop unwanted classes -> bg
         if self.augment:
@@ -188,7 +192,9 @@ def main():
     ap.add_argument("--keep-classes", default="1,3",
                     help="raw class ids to optimize; all others -> background. "
                          "Default catheter(1),urethra(3).")
-    ap.add_argument("--img-size",     type=int,   default=512)
+    ap.add_argument("--img-size",     type=int,   default=512, help="square size if --height/--width unset")
+    ap.add_argument("--height",       type=int,   default=0,   help="rectangular train height (rounded to /32)")
+    ap.add_argument("--width",        type=int,   default=0,   help="rectangular train width (rounded to /32)")
     ap.add_argument("--epochs",       type=int,   default=30)
     ap.add_argument("--batch-size",   type=int,   default=8)
     ap.add_argument("--lr",           type=float, default=5e-5)
@@ -226,8 +232,12 @@ def main():
     names = ["background"] + [RAW_NAMES.get(c, f"class{c}") for c in keep]  # compact-id -> name
     remap = build_remap(keep)
     nc    = len(keep) + 1
+    if args.height and args.width:
+        size_hw = (round32(args.height), round32(args.width))
+    else:
+        size_hw = (args.img_size, args.img_size)
     print(f"[setup] keep={keep} -> num_classes={nc} ({names}) "
-          f"img_size={args.img_size} device={device}")
+          f"size_hw={size_hw} device={device}")
 
     import wandb
     wandb.init(
@@ -236,7 +246,7 @@ def main():
         name=args.run_name,
         config=dict(
             num_classes=nc, keep_classes=keep, class_names=names,
-            img_size=args.img_size, epochs=args.epochs,
+            size_hw=size_hw, epochs=args.epochs,
             batch_size=args.batch_size, lr=args.lr,
             alpha=args.alpha, beta=args.beta, ema_decay=args.ema_decay,
             bg_in_loss=args.bg_in_loss,
@@ -248,10 +258,10 @@ def main():
 
     g  = torch.Generator()
     g.manual_seed(args.seed)
-    tr = DataLoader(SegDataset(root / "Train", args.img_size, remap, augment=not args.no_augment),
+    tr = DataLoader(SegDataset(root / "Train", size_hw, remap, augment=not args.no_augment),
                     args.batch_size, shuffle=True, num_workers=args.workers,
                     pin_memory=True, drop_last=True, generator=g)
-    va = DataLoader(SegDataset(root / "Validation", args.img_size, remap),
+    va = DataLoader(SegDataset(root / "Validation", size_hw, remap),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
 
     model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None).to(device)
@@ -305,7 +315,7 @@ def main():
             wandb.run.summary["best_val_mIoU"] = val_miou
 
     # final test-set eval using best (EMA) checkpoint
-    te = DataLoader(SegDataset(root / "Test", args.img_size, remap),
+    te = DataLoader(SegDataset(root / "Test", size_hw, remap),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
     te_miou, te_dice, te_loss, te_per_dice = validate(model, te, nc, device, args.alpha, args.beta, args.bg_in_loss)
