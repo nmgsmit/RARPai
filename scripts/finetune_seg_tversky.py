@@ -201,6 +201,8 @@ def main():
     ap.add_argument("--alpha",        type=float, default=0.4, help="Tversky FP weight")
     ap.add_argument("--beta",         type=float, default=0.6, help="Tversky FN weight")
     ap.add_argument("--ema-decay",    type=float, default=0.999)
+    ap.add_argument("--accum-steps",  type=int,   default=1,
+                    help="gradient accumulation steps; effective batch = batch_size * accum_steps")
     ap.add_argument("--bg-in-loss",   action="store_true",
                     help="include background in the Tversky region term (default excluded)")
     ap.add_argument("--no-augment",   action="store_true")
@@ -247,7 +249,8 @@ def main():
         config=dict(
             num_classes=nc, keep_classes=keep, class_names=names,
             size_hw=size_hw, epochs=args.epochs,
-            batch_size=args.batch_size, lr=args.lr,
+            batch_size=args.batch_size, accum_steps=args.accum_steps,
+            eff_batch=args.batch_size * args.accum_steps, lr=args.lr,
             alpha=args.alpha, beta=args.beta, ema_decay=args.ema_decay,
             bg_in_loss=args.bg_in_loss,
             augment=not args.no_augment, loss="tversky+ce(bg-excluded)",
@@ -277,19 +280,30 @@ def main():
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
     best = -1.0
+    accum = max(1, args.accum_steps)
     for ep in range(args.epochs):
         model.train()
         run = 0.0
-        for x, y in tr:
+        opt.zero_grad()
+        pending = False
+        for i, (x, y) in enumerate(tr):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
-            opt.zero_grad()
             with torch.amp.autocast(device):
                 loss = tversky_ce_loss(model(x), y, nc, args.alpha, args.beta, args.bg_in_loss)
-            scaler.scale(loss).backward()
+            scaler.scale(loss / accum).backward()   # average grads over accum micro-batches
+            run += loss.item()
+            pending = True
+            if (i + 1) % accum == 0:
+                scaler.step(opt)
+                scaler.update()
+                opt.zero_grad()
+                ema.update(model)
+                pending = False
+        if pending:                                 # flush leftover micro-batches
             scaler.step(opt)
             scaler.update()
+            opt.zero_grad()
             ema.update(model)
-            run += loss.item()
         avg_loss = run / len(tr)
 
         # validate on the EMA weights, then restore live weights for training

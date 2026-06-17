@@ -25,6 +25,7 @@ python scripts/finetune_seg_tversky.py \
     --keep-classes 1,2,3,4 \
     --height 1080 --width 1350 \
     --batch-size 2 \
+    --accum-steps 4 \
     --lr 1e-4 \
     --epochs 50 \
     --bg-in-loss \
