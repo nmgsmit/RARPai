@@ -136,9 +136,10 @@ def load_encoder(model: MetaFormerFPN, ckpt_path: str):
           f"unexpected={len(msg.unexpected_keys)}")
 
 
-def tversky_ce_loss(logits, target, num_classes, alpha=0.4, beta=0.6):
-    """CE + (1 - mean foreground Tversky). Background (class 0) excluded from the
-    Tversky term. alpha weights FP, beta weights FN; alpha=beta=0.5 -> Dice."""
+def tversky_ce_loss(logits, target, num_classes, alpha=0.4, beta=0.6, include_bg=False):
+    """CE + (1 - mean Tversky). Background (class 0) is excluded from the Tversky
+    term unless include_bg=True (keeps it, which can sharpen fg/bg boundaries).
+    alpha weights FP, beta weights FN; alpha=beta=0.5 -> Dice."""
     ce    = F.cross_entropy(logits, target)
     probs = logits.softmax(1)
     oh    = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
@@ -147,11 +148,12 @@ def tversky_ce_loss(logits, target, num_classes, alpha=0.4, beta=0.6):
     fp = (probs * (1 - oh)).sum(dims)
     fn = ((1 - probs) * oh).sum(dims)
     tversky = (tp + 1.0) / (tp + alpha * fp + beta * fn + 1.0)
-    return ce + (1.0 - tversky[1:].mean())          # drop background class 0
+    region = tversky if include_bg else tversky[1:]   # optionally keep background
+    return ce + (1.0 - region.mean())
 
 
 @torch.no_grad()
-def validate(model, loader, num_classes, device, alpha, beta):
+def validate(model, loader, num_classes, device, alpha, beta, include_bg=False):
     inter      = torch.zeros(num_classes)
     union      = torch.zeros(num_classes)
     dice_inter = torch.zeros(num_classes)
@@ -161,7 +163,7 @@ def validate(model, loader, num_classes, device, alpha, beta):
     for x, y in loader:
         x, y    = x.to(device), y.to(device)
         logits   = model(x)
-        total_loss += tversky_ce_loss(logits, y, num_classes, alpha, beta).item()
+        total_loss += tversky_ce_loss(logits, y, num_classes, alpha, beta, include_bg).item()
         pred    = logits.argmax(1).cpu()
         y_cpu   = y.cpu()
         for c in range(num_classes):
@@ -193,6 +195,8 @@ def main():
     ap.add_argument("--alpha",        type=float, default=0.4, help="Tversky FP weight")
     ap.add_argument("--beta",         type=float, default=0.6, help="Tversky FN weight")
     ap.add_argument("--ema-decay",    type=float, default=0.999)
+    ap.add_argument("--bg-in-loss",   action="store_true",
+                    help="include background in the Tversky region term (default excluded)")
     ap.add_argument("--no-augment",   action="store_true")
     ap.add_argument("--workers",      type=int,   default=8)
     ap.add_argument("--seed",         type=int,   default=42)
@@ -235,6 +239,7 @@ def main():
             img_size=args.img_size, epochs=args.epochs,
             batch_size=args.batch_size, lr=args.lr,
             alpha=args.alpha, beta=args.beta, ema_decay=args.ema_decay,
+            bg_in_loss=args.bg_in_loss,
             augment=not args.no_augment, loss="tversky+ce(bg-excluded)",
             aug="hflip+photometric", seed=args.seed,
             encoder_ckpt=args.encoder_ckpt, data_root=str(root),
@@ -269,7 +274,7 @@ def main():
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             opt.zero_grad()
             with torch.amp.autocast(device):
-                loss = tversky_ce_loss(model(x), y, nc, args.alpha, args.beta)
+                loss = tversky_ce_loss(model(x), y, nc, args.alpha, args.beta, args.bg_in_loss)
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
@@ -280,7 +285,7 @@ def main():
         # validate on the EMA weights, then restore live weights for training
         live = deepcopy(model.state_dict())
         model.load_state_dict(ema.shadow)
-        val_miou, val_dice, val_loss, per_dice = validate(model, va, nc, device, args.alpha, args.beta)
+        val_miou, val_dice, val_loss, per_dice = validate(model, va, nc, device, args.alpha, args.beta, args.bg_in_loss)
         model.load_state_dict(live)
 
         sched.step(val_loss)
@@ -303,7 +308,7 @@ def main():
     te = DataLoader(SegDataset(root / "Test", args.img_size, remap),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
-    te_miou, te_dice, te_loss, te_per_dice = validate(model, te, nc, device, args.alpha, args.beta)
+    te_miou, te_dice, te_loss, te_per_dice = validate(model, te, nc, device, args.alpha, args.beta, args.bg_in_loss)
     track = [(c, names[c]) for c in range(1, nc) if names[c] in ("catheter", "urethra")]
     te_per = "  ".join(f"{n}={te_per_dice[c]:.4f}" for c, n in track)
     print(f"[test]  mIoU={te_miou:.4f}  dice={te_dice:.4f}  {te_per}", flush=True)

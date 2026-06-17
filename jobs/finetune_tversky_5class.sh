@@ -14,8 +14,8 @@ cd $SLURM_SUBMIT_DIR
 source venv/bin/activate
 
 # Same script/loss/EMA/aug/ReduceLROnPlateau as tversky-ema, but all 5 classes,
-# lr=1e-4, 50 epochs. keep-classes 1,2,3,4 = clean 5-class model: background is
-# class 0 (in CE + metrics, excluded from the Tversky region term).
+# lr=1e-4, 50 epochs. keep-classes 1,2,3,4 = clean 5-class model (bg is class 0).
+# --bg-in-loss: background IS included in the Tversky term here (sharper edges).
 python scripts/finetune_seg_tversky.py \
     --data-root ../data/RARPSurgenet/fold1 \
     --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth \
@@ -24,4 +24,5 @@ python scripts/finetune_seg_tversky.py \
     --keep-classes 1,2,3,4 \
     --lr 1e-4 \
     --epochs 50 \
+    --bg-in-loss \
     "$@"
