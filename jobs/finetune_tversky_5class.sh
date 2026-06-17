@@ -13,13 +13,16 @@ module load Python/3.11.3-GCCcore-12.3.0
 cd $SLURM_SUBMIT_DIR
 source venv/bin/activate
 
-# Identical to jobs/finetune_tversky.sh (same script, loss, EMA, aug, lr=5e-5)
-# but keeps ALL foreground classes (catheter, prostate, urethra, apicalvesicle)
-# instead of remapping the unwanted ones to background.
+# Same script/loss/EMA/aug/ReduceLROnPlateau as tversky-ema, but all classes,
+# lr=1e-4, 50 epochs. NOTE: --keep-classes 0,1,2,3,4 makes a 6-class model with a
+# dead class and puts background INTO the Tversky term; use 1,2,3,4 for a clean
+# 5-class model with background excluded (see chat).
 python scripts/finetune_seg_tversky.py \
     --data-root ../data/RARPSurgenet/fold1 \
     --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth \
     --out outputs/rarp_tversky_5class \
     --run-name tverskyall \
     --keep-classes 0,1,2,3,4 \
+    --lr 1e-4 \
+    --epochs 50 \
     "$@"
