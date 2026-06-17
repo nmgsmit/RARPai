@@ -53,22 +53,39 @@ def load_model(checkpoint_path, device):
 
 
 @torch.no_grad()
-def segment_frame(frame_bgr, model, img_size, device):
+def segment_frame(frame_bgr, model, img_size, device, square_crop=False):
     """
     Segment a single frame (BGR numpy array) and return mask (HxW, class ids).
+    With --square-crop: center-crop to square before inference, place prediction back.
     """
     h, w = frame_bgr.shape[:2]
-    # RGB, resize, normalize
     img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    img_pil = Image.fromarray(img_rgb).resize((img_size, img_size), Image.BICUBIC)
+
+    if square_crop:
+        # center-crop to square (1920x1080 -> 1080x1080, keeping center)
+        s = min(h, w)
+        x0 = (w - s) // 2
+        y0 = (h - s) // 2
+        crop = img_rgb[y0:y0+s, x0:x0+s]
+        img_pil = Image.fromarray(crop).resize((img_size, img_size), Image.BICUBIC)
+    else:
+        x0 = y0 = s = None
+        img_pil = Image.fromarray(img_rgb).resize((img_size, img_size), Image.BICUBIC)
+
     x = torch.from_numpy(np.array(img_pil)).permute(2, 0, 1).float() / 255.0
     x = (x - IMAGENET_MEAN) / IMAGENET_STD
     x = x.unsqueeze(0).to(device)
-    # infer
     logits = model(x)
-    pred = logits.argmax(1)[0].cpu().numpy()  # (H_model, W_model)
-    # resize back to original frame size
-    pred_resized = cv2.resize(pred.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+    pred = logits.argmax(1)[0].cpu().numpy()
+
+    if square_crop:
+        # scale prediction back to crop size, then place into full-frame mask
+        pred_crop = cv2.resize(pred.astype(np.float32), (s, s), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+        pred_resized = np.zeros((h, w), dtype=np.uint8)
+        pred_resized[y0:y0+s, x0:x0+s] = pred_crop
+    else:
+        pred_resized = cv2.resize(pred.astype(np.float32), (w, h), interpolation=cv2.INTER_NEAREST).astype(np.uint8)
+
     return pred_resized
 
 
@@ -96,6 +113,8 @@ def main():
     ap.add_argument("--output", required=True, help="output video path")
     ap.add_argument("--img-size", type=int, default=512)
     ap.add_argument("--fps", type=int, default=30, help="output fps (default 30)")
+    ap.add_argument("--square-crop", action="store_true",
+                    help="center-crop to square before inference (avoids stretch distortion)")
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -130,7 +149,7 @@ def main():
         if not ret:
             break
         if i % frame_step == 0:
-            mask = segment_frame(frame, model, args.img_size, device)
+            mask = segment_frame(frame, model, args.img_size, device, args.square_crop)
             overlay = overlay_mask(frame, mask)
             out.write(overlay)
             written += 1
