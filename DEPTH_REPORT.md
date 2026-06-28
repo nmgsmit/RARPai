@@ -54,20 +54,26 @@ pose rotation+translation stats, and a **fixed 8-frame Validation panel** render
 lowest **Validation photometric** proxy. SCARED forgetting-check skipped (SCARED not staged on
 Snellius). Stereo metric: N/A (data is monocular).
 
-## Results (run 24269078, 20 epochs, ~46 min on 1×H100, fp32)
-- wandb run: https://wandb.ai/ngmtue/rarp/runs/fb33zvkr (name `endodac-rarp`)
-- **Best Validation photometric: 0.0605 @ epoch 12** → `outputs/rarp_depth/best.pth`
-- **Test photometric: 0.0173** (smoothness 0.0160)
-- Trajectory: train_photo 0.0199→0.0134 (monotonic), val_photo 0.0659→0.0605 (plateaus after the
-  epoch-10 LR×0.1 step), pose_trans 0.0011→0.0028 (finite throughout — pose net learns real motion).
-- Before vs after depth panels: `qual/panel` epoch 0 (warm-start) vs later epochs, and `qual/test_panel`
-  in the wandb run above.
+## Results (run 24270397 — final, overlay-masked, 20 epochs, fp32, 1×H100)
+- wandb run: https://wandb.ai/ngmtue/rarp/runs/wm0jcm1b (name `endodac-rarp`)
+- **Best Validation photometric: 0.0615** → `outputs/rarp_depth/best.pth`
+- **Test photometric: 0.0181** (smoothness 0.0148)
+- pose_trans 0.0010→0.0028 finite throughout; no NaN, no skipped batches.
+- Before/after depth panels: `qual/panel` (epoch 0 warm-start vs later) + `qual/test_panel` in the run.
+  Depth maps now mask the console-GUI borders (black bars / banner / corner widgets) instead of reading
+  them as "near", so anatomy gets the full colour range.
 - best.pth verified GUI-compatible: `--self-test --ckpt outputs/rarp_depth/best.pth` → **389/389 keys, 0 missing**.
 
-### Note on the first attempt (run 24268262)
-The initial run used fp16 AMP and went `pose_trans=nan` in epoch 2 — the auto-mask then collapsed to the
-static-identity baseline and metrics froze. Fixed by training in fp32 (EndoDAC's own regime) + grad-norm
-clip 1.0 + a non-finite-batch guard. The numbers above are the fixed run.
+Note: the photometric proxy is NOT comparable across the overlay change — it now averages over anatomy-only
+pixels. The pre-overlay run (24269078) read 0.0605 val / 0.0173 test over the full frame incl. overlay.
+
+### Two issues found & fixed along the way
+1. **NaN divergence (run 24268262):** fp16 AMP sent `pose_trans=nan` in epoch 2, the auto-mask collapsed to
+   the static-identity baseline and metrics froze. Fixed: train fp32 (EndoDAC's regime) + grad-norm clip 1.0
+   + non-finite-batch guard.
+2. **Console-GUI overlay corrupting borders:** da Vinci/CMR overlays leaked into the loss/output. Fixed with
+   the per-clip temporal-static mask (see Method). The ATLAS GUI loader got the same mask as an online
+   rolling-buffer version (`gui/depth_estimator.py`, `MASK_OVERLAY`), so display is clean on all console types.
 
 ## Verification (run before declaring done)
 - `python scripts/finetune_depth.py --self-test` → **389/389 keys, 0 missing** (fresh build *and*
