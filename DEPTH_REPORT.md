@@ -19,9 +19,19 @@ consecutive frames per clip. We build (t−s, t, t+s) triplets with real camera 
 | Validation | 1 | 6 | 545 | 533 |
 | Test | 2 | 13 | 2668 | ~2.6k |
 
-Bottom UI-banner crop is exposed (`--bottom-crop-frac`, default 0); the circular vignette /
-black border is handled by a per-frame valid-mask (mean-RGB threshold) that excludes those
-pixels from the photometric loss — same idea as the GUI's viz normalization.
+**Console-GUI overlay masking.** The videos are heterogeneous console captures whose baked-in
+overlays are NOT anatomy and corrupt depth at the borders: full-bleed (Hugo), black L/R pillarbox +
+da Vinci Xi instrument banner (~70px), circular vignette, and CMR Versius corner logos/icons composited
+over full-bleed anatomy (no black bars). A single trick handles all of them: the overlay is **static
+across a clip** while anatomy moves, so a per-clip **temporal-variance mask** (valid = per-pixel std over
+~16 frames > `--overlay-std-thresh`) isolates anatomy. Validated on CMR-corner and Xi-banner clips
+(valid_frac ~0.5–0.78). Clips too static to trust (valid_frac<0.25) fall back to no mask. The mask gates
+the photometric loss, a masked edge-aware smoothness (no depth bleed across the banner edge), and the
+viz normalization. The mean-RGB dark mask still removes the black vignette/bars; `--bottom-crop-frac`
+remains available. Disable with `--no-overlay-mask`.
+
+> GUI note: the model output in overlay regions is unsupervised, so `gui/depth_estimator.py` should also
+> mask those pixels for display — its dark-mask catches black bars/banner but not bright CMR corner widgets.
 
 ## Method
 - **Train res:** `--image-shape 392 490` (multiples of 14). Decoupled from the GUI's
