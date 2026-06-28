@@ -44,11 +44,20 @@ pose rotation+translation stats, and a **fixed 8-frame Validation panel** render
 lowest **Validation photometric** proxy. SCARED forgetting-check skipped (SCARED not staged on
 Snellius). Stereo metric: N/A (data is monocular).
 
-## Results
-- wandb run: _<filled after launch>_
-- Best Validation photometric: _<filled>_ @ epoch _<n>_
-- Test photometric / smoothness: _<filled>_
-- Before vs after depth panels: see `qual/panel` (epoch 0 vs best) and `qual/test_panel` in wandb.
+## Results (run 24269078, 20 epochs, ~46 min on 1×H100, fp32)
+- wandb run: https://wandb.ai/ngmtue/rarp/runs/fb33zvkr (name `endodac-rarp`)
+- **Best Validation photometric: 0.0605 @ epoch 12** → `outputs/rarp_depth/best.pth`
+- **Test photometric: 0.0173** (smoothness 0.0160)
+- Trajectory: train_photo 0.0199→0.0134 (monotonic), val_photo 0.0659→0.0605 (plateaus after the
+  epoch-10 LR×0.1 step), pose_trans 0.0011→0.0028 (finite throughout — pose net learns real motion).
+- Before vs after depth panels: `qual/panel` epoch 0 (warm-start) vs later epochs, and `qual/test_panel`
+  in the wandb run above.
+- best.pth verified GUI-compatible: `--self-test --ckpt outputs/rarp_depth/best.pth` → **389/389 keys, 0 missing**.
+
+### Note on the first attempt (run 24268262)
+The initial run used fp16 AMP and went `pose_trans=nan` in epoch 2 — the auto-mask then collapsed to the
+static-identity baseline and metrics froze. Fixed by training in fp32 (EndoDAC's own regime) + grad-norm
+clip 1.0 + a non-finite-batch guard. The numbers above are the fixed run.
 
 ## Verification (run before declaring done)
 - `python scripts/finetune_depth.py --self-test` → **389/389 keys, 0 missing** (fresh build *and*
