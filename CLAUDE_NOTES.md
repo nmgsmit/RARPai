@@ -3,6 +3,22 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-06-28 — DEPTH: console-GUI overlay masking + NaN fix (run 24269078 → next run)
+- First real run diverged: fp16 AMP sent pose_trans→nan in epoch 2, automask collapsed to the static
+  baseline, metrics froze. FIX: train fp32 (no AMP, EndoDAC's regime) + grad-norm clip 1.0 (`--grad-clip`)
+  + skip non-finite batches. Stable run 24269078: best val_photo 0.0605 @ep12, test 0.0173.
+- RARPAtlas videos are HETEROGENEOUS console captures: full-bleed (Hugo), black L/R pillarbox + bottom
+  instrument banner (da Vinci Xi: "PROGRASP FORCEPS"…, ~70px), circular vignette, static corner logos/icons
+  (CMR Versius — NO black bars). Nick flagged these non-anatomical overlays corrupting the depth.
+- FIX: per-clip **temporal static-overlay mask** in `RARPTriplets` — overlay is baked-in & identical across
+  frames (low temporal std) while anatomy moves; valid = std>thresh. One mask/clip handles ALL overlay types
+  incl. bright widgets with no black bars. Validated on CMR-corner + Xi-banner clips (valid_frac ~0.69–0.78).
+  Flags: `--no-overlay-mask`, `--overlay-frames` (16), `--overlay-std-thresh` (6.0, on 0–255). Static clips
+  (valid_frac<0.25) fall back to no mask. Mask now gates BOTH photometric and (new) `smooth_loss_masked`, and
+  feeds the qual-panel viz normalization so depth maps ignore the banner/logos.
+- NOTE for GUI: model output in overlay regions is unsupervised → the GUI (`depth_estimator.py`) should also
+  mask those pixels for display; its dark-mask won't catch bright CMR corner widgets.
+
 ## 2026-06-28 — DEPTH workstream (EndoDAC fine-tune, separate from segmentation)
 - NEW: `scripts/finetune_depth.py` + `jobs/finetune_depth.sh` (gpu_h100). Self-supervised monocular
   depth fine-tune of EndoDAC on RARPAtlas. **Not segmentation**; does NOT use the RARP DINO teacher.

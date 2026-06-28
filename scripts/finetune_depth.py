@@ -56,7 +56,7 @@ import models.backbones as backbones          # noqa: E402
 import models.encoders as encoders            # noqa: E402
 import models.decoders as decoders            # noqa: E402
 from utils.layers import (                    # noqa: E402
-    SSIM, BackprojectDepth, Project3D, get_smooth_loss,
+    SSIM, BackprojectDepth, Project3D,
     disp_to_depth, transformation_from_parameters,
 )
 
@@ -85,7 +85,8 @@ class RARPTriplets(Dataset):
     and intrinsics. No ImageNet norm -- EndoDAC consumes raw [0,1]."""
 
     def __init__(self, split_dir, hw, k_norm, stride=1, bottom_crop_frac=0.0,
-                 augment=False, vignette_thresh=0.04):
+                 augment=False, vignette_thresh=0.04, mask_overlay=True,
+                 overlay_frames=16, overlay_std_thresh=6.0, overlay_min_valid=0.25):
         self.h, self.w = hw
         self.stride = stride
         self.bottom_crop_frac = bottom_crop_frac
@@ -100,14 +101,34 @@ class RARPTriplets(Dataset):
         self.K = torch.from_numpy(K)
         self.inv_K = torch.from_numpy(np.linalg.pinv(K))
 
-        # index every clip's frames, keep centers that have both neighbours
-        self.samples = []  # (frames[list[Path]], center_idx)
+        # index every clip's frames, keep centers that have both neighbours.
+        # Per clip, precompute a STATIC-OVERLAY mask: the da Vinci/CMR console GUI
+        # (black bars, instrument banner, corner logos/icons) is baked in and identical
+        # across frames, while anatomy moves -> low temporal std = overlay. One mask per
+        # clip handles every overlay type (incl. bright widgets on no-black-bar frames)
+        # without hardcoding geometry. Clips too static to trust fall back to no mask.
+        self.samples = []         # (frames[list[Path]], center_idx)
+        self.overlay = {}         # str(clip_dir) -> valid mask (1,H,W) float, or None
         clip_dirs = sorted(Path(split_dir).glob("*/*/clip_*/images"))
         for d in clip_dirs:
             frames = sorted(d.glob("frame_*.jpg")) or sorted(d.glob("frame_*.png"))
             for i in range(stride, len(frames) - stride):
                 self.samples.append((frames, i))
+            self.overlay[str(d)] = self._overlay_mask(
+                frames, overlay_frames, overlay_std_thresh, overlay_min_valid) \
+                if mask_overlay else None
         assert self.samples, f"no triplets found under {split_dir} (looked for */*/clip_*/images)"
+
+    def _overlay_mask(self, frames, n, thresh, min_valid):
+        if len(frames) < 3:
+            return None
+        idx = np.linspace(0, len(frames) - 1, min(n, len(frames))).astype(int)
+        stack = np.stack([np.asarray(self._load(frames[i]).convert("L"), np.float32)
+                          for i in idx])
+        valid = (stack.std(0) > thresh)            # moving = anatomy; static = overlay
+        if valid.mean() < min_valid:               # static clip -> temporal signal unreliable
+            return None
+        return torch.from_numpy(valid[None].astype(np.float32))
 
     def __len__(self):
         return len(self.samples)
@@ -138,6 +159,9 @@ class RARPTriplets(Dataset):
         valid = (out[("color", 0)].mean(0, keepdim=True) > self.vignette_thresh).float()
         if valid.mean() < 0.05:                        # frame is mostly black -> trust it all
             valid = torch.ones_like(valid)
+        ov = self.overlay.get(str(frames[0].parent))   # AND the static-overlay mask
+        if ov is not None:
+            valid = valid * ov
         out["valid"] = valid
         out["K"], out["inv_K"] = self.K, self.inv_K
         return out
@@ -149,6 +173,20 @@ def reprojection(pred, target, ssim):
     l1 = (pred - target).abs().mean(1, True)
     s = ssim(pred, target).mean(1, True)
     return 0.85 * s + 0.15 * l1
+
+
+def smooth_loss_masked(disp, img, valid):
+    """Edge-aware smoothness on mean-normalised disp, restricted to valid (non-overlay)
+    pixels so the baked GUI banner/bars don't bleed depth into nearby anatomy."""
+    nd = disp / (disp.mean([2, 3], keepdim=True) + 1e-7)
+    gx = (nd[:, :, :, :-1] - nd[:, :, :, 1:]).abs()
+    gy = (nd[:, :, :-1, :] - nd[:, :, 1:, :]).abs()
+    igx = (img[:, :, :, :-1] - img[:, :, :, 1:]).abs().mean(1, True)
+    igy = (img[:, :, :-1, :] - img[:, :, 1:, :]).abs().mean(1, True)
+    gx = gx * torch.exp(-igx) * valid[:, :, :, :-1]
+    gy = gy * torch.exp(-igy) * valid[:, :, :-1, :]
+    return gx.sum() / valid[:, :, :, :-1].sum().clamp(min=1) \
+        + gy.sum() / valid[:, :, :-1, :].sum().clamp(min=1)
 
 
 def predict_pose(pose_enc, pose_dec, img0, imgf, f):
@@ -191,8 +229,7 @@ def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, pro
 
     m = valid
     photo = (combined * m).sum() / m.sum().clamp(min=1)
-    norm_disp = disp / (disp.mean([2, 3], keepdim=True) + 1e-7)
-    smooth = get_smooth_loss(norm_disp, color[0])
+    smooth = smooth_loss_masked(disp, color[0], valid)
     loss = photo + smooth_w * smooth
 
     rot = torch.stack([t[0] for t in tstats]).mean()
@@ -345,6 +382,12 @@ def main():
     ap.add_argument("--frame-stride", type=int, default=1, help="triplet baseline in frames")
     ap.add_argument("--bottom-crop-frac", type=float, default=0.0,
                     help="crop this fraction off the bottom (UI banner) before resize")
+    ap.add_argument("--no-overlay-mask", action="store_true",
+                    help="disable per-clip temporal static-overlay (console GUI) masking")
+    ap.add_argument("--overlay-frames", type=int, default=16,
+                    help="frames per clip used to estimate the static-overlay mask")
+    ap.add_argument("--overlay-std-thresh", type=float, default=6.0,
+                    help="temporal std (0-255) below which a pixel is treated as overlay")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -389,13 +432,17 @@ def main():
 
     root = Path(args.data_root)
     k_norm = tuple(args.intrinsics)
-    print(f"[setup] hw={hw} K_norm={k_norm} stride={args.frame_stride} device={device}", flush=True)
+    ds_kw = dict(mask_overlay=not args.no_overlay_mask, overlay_frames=args.overlay_frames,
+                 overlay_std_thresh=args.overlay_std_thresh)
+    print(f"[setup] hw={hw} K_norm={k_norm} stride={args.frame_stride} "
+          f"overlay_mask={not args.no_overlay_mask} device={device}", flush=True)
 
     tr = DataLoader(
         RARPTriplets(root / "Train", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
-                     augment=not args.no_augment),
+                     augment=not args.no_augment, **ds_kw),
         args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True)
-    va_ds = RARPTriplets(root / "Validation", hw, k_norm, args.frame_stride, args.bottom_crop_frac)
+    va_ds = RARPTriplets(root / "Validation", hw, k_norm, args.frame_stride,
+                         args.bottom_crop_frac, **ds_kw)
     va = DataLoader(va_ds, args.batch_size, shuffle=False, num_workers=args.workers,
                     pin_memory=True, drop_last=True)
 
@@ -430,6 +477,8 @@ def main():
                            bottom_crop_frac=args.bottom_crop_frac, epochs=args.epochs,
                            batch_size=args.batch_size, lr=args.lr, smoothness=args.smoothness,
                            automask=not args.no_automask, augment=not args.no_augment,
+                           overlay_mask=not args.no_overlay_mask,
+                           overlay_std_thresh=args.overlay_std_thresh,
                            init=str(args.init), data_root=str(root)))
 
     outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
@@ -462,7 +511,7 @@ def main():
             wandb.run.summary["best_epoch"] = ep
 
     # final report numbers on Test (proxy only -- no depth GT)
-    te_ds = RARPTriplets(root / "Test", hw, k_norm, args.frame_stride, args.bottom_crop_frac)
+    te_ds = RARPTriplets(root / "Test", hw, k_norm, args.frame_stride, args.bottom_crop_frac, **ds_kw)
     te = DataLoader(te_ds, args.batch_size, shuffle=False, num_workers=args.workers, drop_last=True)
     depth_model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
     te_logs = run_epoch(te, depth_model, pose_enc, pose_dec, ssim, backproj, project,
