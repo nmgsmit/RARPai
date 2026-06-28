@@ -52,6 +52,7 @@ sys.path.insert(0, str(_ENDODAC))
 os.environ.setdefault("XFORMERS_DISABLED", "1")  # ViT-B uses plain MLP/attention fallbacks
 
 import models.endodac as endodac_pkg          # noqa: E402
+import models.backbones as backbones          # noqa: E402
 import models.encoders as encoders            # noqa: E402
 import models.decoders as decoders            # noqa: E402
 from utils.layers import (                    # noqa: E402
@@ -213,8 +214,21 @@ def _filter_load(module, ckpt_path, name):
           f"(missing={len(msg.missing_keys)})", flush=True)
 
 
+def make_endodac(image_shape):
+    """Build endodac with the EXACT GUI args. The residual blocks are pinned to the
+    backbone's input_size grid, so we inject input_size=image_shape into vit_base the
+    same way ATLAS's gui/depth_estimator.py does -- otherwise forward() reshapes to the
+    wrong (224,280) patch grid at any other resolution."""
+    orig = backbones.vits.vit_base
+    backbones.vits.vit_base = lambda **kw: orig(input_size=tuple(image_shape), **kw)
+    try:
+        return endodac_pkg.endodac(image_shape=tuple(image_shape), **GUI_ARGS)
+    finally:
+        backbones.vits.vit_base = orig
+
+
 def build_depth_model(image_shape, device):
-    model = endodac_pkg.endodac(image_shape=tuple(image_shape), **GUI_ARGS).to(device)
+    model = make_endodac(image_shape).to(device)
     # EndoDAC recipe: train LoRA adapters + encoder residual blocks + depth conv heads.
     for n, p in model.named_parameters():
         p.requires_grad = any(k in n for k in ("lora_", "residual_", "conv_depth_"))
@@ -273,7 +287,7 @@ def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, 
 def self_test(args, device):
     """Rebuild with the exact GUI args, save+reload a state_dict, assert the key contract."""
     h, w = (round14(args.image_shape[0]), round14(args.image_shape[1]))
-    model = endodac_pkg.endodac(image_shape=(h, w), **GUI_ARGS)
+    model = make_endodac((h, w))
     n_keys = len(model.state_dict())
     print(f"[self-test] built endodac{(h, w)} -> {n_keys} tensor keys")
 
