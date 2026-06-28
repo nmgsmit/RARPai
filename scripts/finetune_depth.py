@@ -1,0 +1,455 @@
+"""
+Self-supervised DEPTH fine-tuning of EndoDAC on our RARP videos.
+
+THIS IS DEPTH, NOT SEGMENTATION. Warm-starts from EndoDAC's released depth_model.pth
+(NOT the RARP DINO teacher). Trains only LoRA adapters + the depth head's residual/conv
+layers (EndoDAC's own recipe) + a small monocular pose net. Loss = Monodepth2-style
+photometric reprojection (0.85 SSIM + 0.15 L1) with auto-masking + edge-aware disparity
+smoothness, reusing EndoDAC's vendored loss primitives (utils/layers.py).
+
+The deliverable outputs/<run>/best.pth is a plain depth_model state_dict (encoder.* +
+depth_head.*, 389 tensors) that drops straight into ATLAS-Interactive's
+gui/depth_estimator.py. Run `--self-test` to assert the 389/389 key contract.
+
+Data: RARPAtlas is MONOCULAR 1080p YouTube clips (no stereo) laid out as
+  <split>/rarp/<video>/clip_*/images/frame_*.jpg
+with consecutive frames per clip -> we build (t-stride, t, t+stride) triplets that have
+real camera motion for the photometric loss.
+
+Real run (on Snellius, gpu_h100):
+    python scripts/finetune_depth.py \
+        --data-root ../data/RARPAtlas \
+        --init ../backbones/EndoDAC/depth_model.pth \
+        --pose-init-dir ../backbones/EndoDAC \
+        --out outputs/rarp_depth --run-name endodac-rarp
+
+ponytail: single-scale Monodepth2 photometric loss (disp upsampled to feed res), mono
+pose net only. EndoDAC's full AF-SfMLearner registration/transform/optical-flow refinement
+is dropped -- it's a quality enhancement on top of this core, add it back if specular /
+non-rigid artifacts show up in the qualitative panels.
+"""
+from __future__ import annotations
+import argparse
+import os
+import random
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from dotenv import load_dotenv
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+
+load_dotenv()
+
+# Vendored EndoDAC code (models/ + utils/). Insert at 0 so its `models`/`utils` namespace
+# packages win over anything else on the path (mirrors the GUI's sys.path hack).
+_ENDODAC = Path(__file__).resolve().parents[1] / "third_party" / "endodac"
+sys.path.insert(0, str(_ENDODAC))
+os.environ.setdefault("XFORMERS_DISABLED", "1")  # ViT-B uses plain MLP/attention fallbacks
+
+import models.endodac as endodac_pkg          # noqa: E402
+import models.encoders as encoders            # noqa: E402
+import models.decoders as decoders            # noqa: E402
+from utils.layers import (                    # noqa: E402
+    SSIM, BackprojectDepth, Project3D, get_smooth_loss,
+    disp_to_depth, transformation_from_parameters,
+)
+
+# EndoDAC / SCARED assumed intrinsics, NORMALISED by image size (fx, fy, cx, cy).
+# Override with --intrinsics for real da Vinci values.
+DEFAULT_K_NORM = (0.82, 1.02, 0.5, 0.5)
+
+GUI_ARGS = dict(backbone_size="base", r=4, lora_type="dvlora", pretrained_path=None,
+                residual_block_indexes=[2, 5, 8, 11], include_cls_token=True)
+
+
+def seed_everything(seed: int):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+
+def round14(x):
+    """ViT-B/14: spatial dims must be multiples of 14."""
+    return max(14, int(round(x / 14)) * 14)
+
+
+# --------------------------------------------------------------------------- data
+class RARPTriplets(Dataset):
+    """Consecutive-frame triplets from RARPAtlas clips. Returns raw [0,1] color frames
+    {-stride,0,+stride}, color-jittered copies for the networks, a vignette valid-mask,
+    and intrinsics. No ImageNet norm -- EndoDAC consumes raw [0,1]."""
+
+    def __init__(self, split_dir, hw, k_norm, stride=1, bottom_crop_frac=0.0,
+                 augment=False, vignette_thresh=0.04):
+        self.h, self.w = hw
+        self.stride = stride
+        self.bottom_crop_frac = bottom_crop_frac
+        self.augment = augment
+        self.vignette_thresh = vignette_thresh
+        self.to_tensor = transforms.ToTensor()
+        # K in pixels for this feed resolution
+        fx, fy, cx, cy = k_norm
+        K = np.array([[fx * self.w, 0, cx * self.w, 0],
+                      [0, fy * self.h, cy * self.h, 0],
+                      [0, 0, 1, 0], [0, 0, 0, 1]], dtype=np.float32)
+        self.K = torch.from_numpy(K)
+        self.inv_K = torch.from_numpy(np.linalg.pinv(K))
+
+        # index every clip's frames, keep centers that have both neighbours
+        self.samples = []  # (frames[list[Path]], center_idx)
+        clip_dirs = sorted(Path(split_dir).glob("*/*/clip_*/images"))
+        for d in clip_dirs:
+            frames = sorted(d.glob("frame_*.jpg")) or sorted(d.glob("frame_*.png"))
+            for i in range(stride, len(frames) - stride):
+                self.samples.append((frames, i))
+        assert self.samples, f"no triplets found under {split_dir} (looked for */*/clip_*/images)"
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load(self, path):
+        img = Image.open(path).convert("RGB")
+        if self.bottom_crop_frac > 0:                  # drop baked-in UI banner
+            W, H = img.size
+            img = img.crop((0, 0, W, int(H * (1 - self.bottom_crop_frac))))
+        return img.resize((self.w, self.h), Image.BILINEAR)
+
+    def __getitem__(self, idx):
+        frames, c = self.samples[idx]
+        offs = {-1: c - self.stride, 0: c, 1: c + self.stride}
+        raw = {f: self._load(frames[j]) for f, j in offs.items()}
+
+        if self.augment and random.random() < 0.5:     # same jitter for all 3 (network input)
+            cj = transforms.ColorJitter(0.2, 0.2, 0.2, 0.1)
+            aug = {f: cj(im) for f, im in raw.items()}
+        else:
+            aug = raw
+
+        out = {}
+        for f in (-1, 0, 1):
+            out[("color", f)] = self.to_tensor(raw[f])
+            out[("color_aug", f)] = self.to_tensor(aug[f])
+        # vignette/black-border mask from frame 0 (1 = valid tissue)
+        valid = (out[("color", 0)].mean(0, keepdim=True) > self.vignette_thresh).float()
+        if valid.mean() < 0.05:                        # frame is mostly black -> trust it all
+            valid = torch.ones_like(valid)
+        out["valid"] = valid
+        out["K"], out["inv_K"] = self.K, self.inv_K
+        return out
+
+
+# ------------------------------------------------------------------------- losses
+def reprojection(pred, target, ssim):
+    """0.85 SSIM + 0.15 L1, per-pixel (mean over channels)."""
+    l1 = (pred - target).abs().mean(1, True)
+    s = ssim(pred, target).mean(1, True)
+    return 0.85 * s + 0.15 * l1
+
+
+def predict_pose(pose_enc, pose_dec, img0, imgf, f):
+    """Relative camera transform frame0 -> frame f (Monodepth2 convention)."""
+    pair = [imgf, img0] if f < 0 else [img0, imgf]
+    axisangle, translation, _ = pose_dec([pose_enc(torch.cat(pair, 1))])
+    T = transformation_from_parameters(axisangle[:, 0], translation[:, 0], invert=(f < 0))
+    return T, axisangle[:, 0], translation[:, 0]
+
+
+def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, project,
+                     hw, min_depth, max_depth, smooth_w, automask=True):
+    """Returns (loss, logs). Single-scale Monodepth2 photometric + smoothness."""
+    h, w = hw
+    color = {f: batch[("color", f)] for f in (-1, 0, 1)}
+    aug = {f: batch[("color_aug", f)] for f in (-1, 0, 1)}
+    K, inv_K, valid = batch["K"], batch["inv_K"], batch["valid"]
+
+    disp = depth_model(aug[0])[("disp", 0)]
+    disp = F.interpolate(disp, hw, mode="bilinear", align_corners=False)
+    _, depth = disp_to_depth(disp, min_depth, max_depth)
+
+    reproj, ident, tstats = [], [], []
+    for f in (-1, 1):
+        T, ax, tr = predict_pose(pose_enc, pose_dec, aug[0], aug[f], f)
+        tstats.append((ax.norm(dim=-1).mean(), tr.norm(dim=-1).mean()))
+        cam_pts = backproj(depth, inv_K)
+        pix = project(cam_pts, K, T)
+        warped = F.grid_sample(color[f], pix, padding_mode="border", align_corners=True)
+        reproj.append(reprojection(warped, color[0], ssim))
+        ident.append(reprojection(color[f], color[0], ssim))   # identity = static-pixel baseline
+
+    reproj = torch.cat(reproj, 1).min(1, True)[0]
+    if automask:
+        ident = torch.cat(ident, 1).min(1, True)[0]
+        ident += 1e-5 * torch.randn_like(ident)                # break ties
+        combined = torch.min(reproj, ident)
+    else:
+        combined = reproj
+
+    m = valid
+    photo = (combined * m).sum() / m.sum().clamp(min=1)
+    norm_disp = disp / (disp.mean([2, 3], keepdim=True) + 1e-7)
+    smooth = get_smooth_loss(norm_disp, color[0])
+    loss = photo + smooth_w * smooth
+
+    rot = torch.stack([t[0] for t in tstats]).mean()
+    trans = torch.stack([t[1] for t in tstats]).mean()
+    logs = dict(loss=loss.item(), photo=photo.item(), smooth=smooth.item(),
+                pose_rot=rot.item(), pose_trans=trans.item())
+    return loss, logs
+
+
+# ---------------------------------------------------------------------- warm-start
+def _filter_load(module, ckpt_path, name):
+    sd = torch.load(ckpt_path, map_location="cpu")
+    if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
+        sd = sd["state_dict"]
+    mdict = module.state_dict()
+    keep = {k: v for k, v in sd.items() if k in mdict and v.shape == mdict[k].shape}
+    msg = module.load_state_dict(keep, strict=False)
+    print(f"[warm-start:{name}] loaded {len(keep)}/{len(mdict)} "
+          f"(missing={len(msg.missing_keys)})", flush=True)
+
+
+def build_depth_model(image_shape, device):
+    model = endodac_pkg.endodac(image_shape=tuple(image_shape), **GUI_ARGS).to(device)
+    # EndoDAC recipe: train LoRA adapters + encoder residual blocks + depth conv heads.
+    for n, p in model.named_parameters():
+        p.requires_grad = any(k in n for k in ("lora_", "residual_", "conv_depth_"))
+    return model
+
+
+# ----------------------------------------------------------------------- qualitative
+def colorize(disp, valid=None):
+    """disp HxW float -> magma uint8 HxW3, normalised over valid region (GUI-style)."""
+    import matplotlib.cm as cm
+    if valid is None:
+        valid = np.ones_like(disp, bool)
+    lo, hi = disp[valid].min(), np.percentile(disp[valid], 95)
+    out = np.clip((disp - lo) / (hi - lo + 1e-8), 0, 1)
+    out[~valid] = 0
+    return (cm.get_cmap("magma")(out)[:, :, :3] * 255).astype(np.uint8)
+
+
+@torch.no_grad()
+def qualitative_panel(depth_model, panel, hw, device, min_depth, max_depth):
+    """panel: list of (rgb_tensor[3,H,W], valid[1,H,W]). Returns one stacked uint8 image
+    [rgb | depth] per row -> wandb.Image-able array."""
+    depth_model.eval()
+    rows = []
+    for rgb, valid in panel:
+        x = rgb.unsqueeze(0).to(device)
+        disp = depth_model(x)[("disp", 0)]
+        disp = F.interpolate(disp, hw, mode="bilinear", align_corners=False)[0, 0].cpu().numpy()
+        v = valid[0].cpu().numpy() > 0.5
+        rgb_np = (rgb.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        rows.append(np.concatenate([rgb_np, colorize(disp, v)], axis=1))
+    return np.concatenate(rows, axis=0)
+
+
+# ---------------------------------------------------------------------------- train
+def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, opt,
+              scaler, device, args, hw, train=True):
+    depth_model.train(train); pose_enc.train(train); pose_dec.train(train)
+    agg = {}
+    for batch in loader:
+        batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                 for k, v in batch.items()}
+        with torch.set_grad_enabled(train), torch.amp.autocast(device, enabled=train):
+            loss, logs = photometric_step(
+                batch, depth_model, pose_enc, pose_dec, ssim, backproj, project, hw,
+                args.min_depth, args.max_depth, args.smoothness, automask=not args.no_automask)
+        if train:
+            opt.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(opt); scaler.update()
+        for k, v in logs.items():
+            agg[k] = agg.get(k, 0.0) + v
+    return {k: v / len(loader) for k, v in agg.items()}
+
+
+def self_test(args, device):
+    """Rebuild with the exact GUI args, save+reload a state_dict, assert the key contract."""
+    h, w = (round14(args.image_shape[0]), round14(args.image_shape[1]))
+    model = endodac_pkg.endodac(image_shape=(h, w), **GUI_ARGS)
+    n_keys = len(model.state_dict())
+    print(f"[self-test] built endodac{(h, w)} -> {n_keys} tensor keys")
+
+    ckpt = args.ckpt
+    if ckpt and Path(ckpt).exists():
+        sd = torch.load(ckpt, map_location="cpu")
+        src = f"checkpoint {ckpt}"
+    else:
+        tmp = Path(args.out) / "_selftest.pth"
+        tmp.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(model.state_dict(), tmp)
+        sd = torch.load(tmp, map_location="cpu"); tmp.unlink()
+        src = "fresh state_dict round-trip"
+
+    mdict = model.state_dict()
+    # mirror the GUI loader: keep only keys the model wants (drops height/width/use_stereo)
+    keep = {k: v for k, v in sd.items() if k in mdict}
+    msg = model.load_state_dict(keep, strict=False)
+    matched = len(keep)
+    assert matched == n_keys, f"{matched}/{n_keys} keys matched ({src})"
+    assert not msg.missing_keys, f"missing keys: {msg.missing_keys[:5]}"
+    print(f"[self-test] OK: {matched}/{n_keys} keys load from {src}, 0 missing "
+          f"-> GUI-compatible")
+    if n_keys != 389:
+        print(f"[self-test] WARNING: expected 389 keys, got {n_keys} "
+              f"(check backbone/lora args)")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-root", default="../data/RARPAtlas")
+    ap.add_argument("--init", default="../backbones/EndoDAC/depth_model.pth",
+                    help="EndoDAC released depth_model.pth to warm-start from")
+    ap.add_argument("--pose-init-dir", default="../backbones/EndoDAC",
+                    help="dir with pose.pth + pose_encoder.pth (optional warm-start)")
+    ap.add_argument("--out", default="outputs/rarp_depth")
+    ap.add_argument("--run-name", default="endodac-rarp")
+    ap.add_argument("--image-shape", type=int, nargs=2, default=[392, 490],
+                    help="train/inference res (H W), multiples of 14. Recorded for the GUI.")
+    ap.add_argument("--intrinsics", type=float, nargs=4, default=list(DEFAULT_K_NORM),
+                    metavar=("fx", "fy", "cx", "cy"),
+                    help="NORMALISED da Vinci intrinsics; default = EndoDAC/SCARED assumed K")
+    ap.add_argument("--frame-stride", type=int, default=1, help="triplet baseline in frames")
+    ap.add_argument("--bottom-crop-frac", type=float, default=0.0,
+                    help="crop this fraction off the bottom (UI banner) before resize")
+    ap.add_argument("--epochs", type=int, default=20)
+    ap.add_argument("--batch-size", type=int, default=8)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--smoothness", type=float, default=1e-3)
+    ap.add_argument("--min-depth", type=float, default=0.1)
+    ap.add_argument("--max-depth", type=float, default=150.0)
+    ap.add_argument("--no-automask", action="store_true")
+    ap.add_argument("--no-augment", action="store_true")
+    ap.add_argument("--panel-size", type=int, default=8, help="fixed qualitative frames")
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--self-test", action="store_true",
+                    help="assert the 389-key GUI contract and exit")
+    ap.add_argument("--ckpt", default=None, help="checkpoint for --self-test (default: fresh)")
+    ap.add_argument("--smoke", action="store_true", help="tiny synthetic fwd/bwd, no data")
+    args = ap.parse_args()
+    seed_everything(args.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    hw = (round14(args.image_shape[0]), round14(args.image_shape[1]))
+
+    if args.self_test:
+        self_test(args, device); return
+
+    if args.smoke:
+        m = build_depth_model(hw, device)
+        pe = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
+        pd = decoders.PoseDecoder(pe.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
+        ssim = SSIM().to(device)
+        bp = BackprojectDepth(2, *hw).to(device); pr = Project3D(2, *hw).to(device)
+        fx, fy, cx, cy = args.intrinsics
+        K = torch.tensor([[fx * hw[1], 0, cx * hw[1], 0], [0, fy * hw[0], cy * hw[0], 0],
+                          [0, 0, 1, 0], [0, 0, 0, 1]]).float().repeat(2, 1, 1).to(device)
+        batch = {("color", f): torch.rand(2, 3, *hw, device=device) for f in (-1, 0, 1)}
+        batch.update({("color_aug", f): torch.rand(2, 3, *hw, device=device) for f in (-1, 0, 1)})
+        batch.update(valid=torch.ones(2, 1, *hw, device=device), K=K, inv_K=torch.inverse(K))
+        loss, logs = photometric_step(batch, m, pe, pd, ssim, bp, pr, hw,
+                                      args.min_depth, args.max_depth, args.smoothness)
+        loss.backward()
+        print(f"[smoke] ok | hw={hw} loss={logs['loss']:.4f} device={device}")
+        return
+
+    root = Path(args.data_root)
+    k_norm = tuple(args.intrinsics)
+    print(f"[setup] hw={hw} K_norm={k_norm} stride={args.frame_stride} device={device}", flush=True)
+
+    tr = DataLoader(
+        RARPTriplets(root / "Train", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
+                     augment=not args.no_augment),
+        args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True)
+    va_ds = RARPTriplets(root / "Validation", hw, k_norm, args.frame_stride, args.bottom_crop_frac)
+    va = DataLoader(va_ds, args.batch_size, shuffle=False, num_workers=args.workers,
+                    pin_memory=True, drop_last=True)
+
+    # fixed qualitative panel (deterministic frames from Validation)
+    panel_idx = np.linspace(0, len(va_ds) - 1, args.panel_size).astype(int)
+    panel = [(va_ds[i][("color", 0)], va_ds[i]["valid"]) for i in panel_idx]
+
+    depth_model = build_depth_model(hw, device)
+    _filter_load(depth_model, args.init, "depth")
+    pose_enc = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
+    pose_dec = decoders.PoseDecoder(pose_enc.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
+    pid = Path(args.pose_init_dir)
+    if (pid / "pose_encoder.pth").exists():
+        _filter_load(pose_enc, pid / "pose_encoder.pth", "pose_enc")
+        _filter_load(pose_dec, pid / "pose.pth", "pose")
+
+    params = [p for p in depth_model.parameters() if p.requires_grad] \
+        + list(pose_enc.parameters()) + list(pose_dec.parameters())
+    n_train = sum(p.numel() for p in params)
+    print(f"[optim] Adam lr={args.lr} | trainable params={n_train/1e6:.2f}M", flush=True)
+    opt = torch.optim.Adam(params, lr=args.lr)
+    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=max(1, args.epochs // 2), gamma=0.1)
+    scaler = torch.amp.GradScaler(device)
+    ssim = SSIM().to(device)
+    backproj = BackprojectDepth(args.batch_size, *hw).to(device)
+    project = Project3D(args.batch_size, *hw).to(device)
+
+    import wandb
+    wandb.init(project=os.getenv("WANDB_PROJECT", "rarp"),
+               entity=os.getenv("WANDB_ENTITY", "nmgtue"), name=args.run_name,
+               config=dict(task="depth", model="endodac-base-dvlora-r4", image_shape=hw,
+                           intrinsics=k_norm, frame_stride=args.frame_stride,
+                           bottom_crop_frac=args.bottom_crop_frac, epochs=args.epochs,
+                           batch_size=args.batch_size, lr=args.lr, smoothness=args.smoothness,
+                           automask=not args.no_automask, augment=not args.no_augment,
+                           init=str(args.init), data_root=str(root)))
+
+    outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
+
+    # before-training qualitative panel
+    wandb.log({"qual/panel": wandb.Image(
+        qualitative_panel(depth_model, panel, hw, device, args.min_depth, args.max_depth),
+        caption="epoch 0 (warm-start, before RARP fine-tune)"), "epoch": 0})
+
+    best = float("inf")
+    for ep in range(1, args.epochs + 1):
+        tr_logs = run_epoch(tr, depth_model, pose_enc, pose_dec, ssim, backproj, project,
+                            opt, scaler, device, args, hw, train=True)
+        va_logs = run_epoch(va, depth_model, pose_enc, pose_dec, ssim, backproj, project,
+                            opt, scaler, device, args, hw, train=False)
+        sched.step()
+        lr = opt.param_groups[0]["lr"]
+        print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
+              f"val_photo={va_logs['photo']:.4f}  pose_trans={tr_logs['pose_trans']:.4f}",
+              flush=True)
+        panel_img = qualitative_panel(depth_model, panel, hw, device, args.min_depth, args.max_depth)
+        wandb.log({**{f"train/{k}": v for k, v in tr_logs.items()},
+                   **{f"val/{k}": v for k, v in va_logs.items()}, "lr": lr, "epoch": ep,
+                   "qual/panel": wandb.Image(panel_img, caption=f"epoch {ep} [rgb | depth]")})
+
+        if va_logs["photo"] < best:                    # select by Validation photometric proxy
+            best = va_logs["photo"]
+            torch.save(depth_model.state_dict(), outdir / "best.pth")  # 389-key GUI state_dict
+            wandb.run.summary["best_val_photo"] = best
+            wandb.run.summary["best_epoch"] = ep
+
+    # final report numbers on Test (proxy only -- no depth GT)
+    te_ds = RARPTriplets(root / "Test", hw, k_norm, args.frame_stride, args.bottom_crop_frac)
+    te = DataLoader(te_ds, args.batch_size, shuffle=False, num_workers=args.workers, drop_last=True)
+    depth_model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
+    te_logs = run_epoch(te, depth_model, pose_enc, pose_dec, ssim, backproj, project,
+                        opt, scaler, device, args, hw, train=False)
+    print(f"[test] photo={te_logs['photo']:.4f} smooth={te_logs['smooth']:.4f}", flush=True)
+    wandb.run.summary.update({f"test/{k}": v for k, v in te_logs.items()})
+    wandb.log({"qual/test_panel": wandb.Image(
+        qualitative_panel(depth_model, [(te_ds[i][("color", 0)], te_ds[i]["valid"])
+                          for i in np.linspace(0, len(te_ds) - 1, args.panel_size).astype(int)],
+                          hw, device, args.min_depth, args.max_depth), caption="Test [rgb | depth]")})
+    wandb.finish()
+    print(f"[done] best val_photo={best:.4f} -> {outdir/'best.pth'}")
+
+
+if __name__ == "__main__":
+    main()
