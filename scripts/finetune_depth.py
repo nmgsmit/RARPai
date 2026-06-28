@@ -238,13 +238,14 @@ def build_depth_model(image_shape, device):
 # ----------------------------------------------------------------------- qualitative
 def colorize(disp, valid=None):
     """disp HxW float -> magma uint8 HxW3, normalised over valid region (GUI-style)."""
-    import matplotlib.cm as cm
+    import matplotlib
     if valid is None:
         valid = np.ones_like(disp, bool)
     lo, hi = disp[valid].min(), np.percentile(disp[valid], 95)
     out = np.clip((disp - lo) / (hi - lo + 1e-8), 0, 1)
     out[~valid] = 0
-    return (cm.get_cmap("magma")(out)[:, :, :3] * 255).astype(np.uint8)
+    magma = matplotlib.colormaps["magma"]                 # mpl>=3.6 (cm.get_cmap removed in 3.11)
+    return (magma(out)[:, :, :3] * 255).astype(np.uint8)
 
 
 @torch.no_grad()
