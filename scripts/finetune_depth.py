@@ -266,23 +266,34 @@ def qualitative_panel(depth_model, panel, hw, device, min_depth, max_depth):
 
 # ---------------------------------------------------------------------------- train
 def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, opt,
-              scaler, device, args, hw, train=True):
+              device, args, hw, train=True):
+    # fp32 (no AMP): the pose net + grid_sample geometry overflow under fp16 autocast and
+    # send the whole run to NaN -- EndoDAC itself trains in fp32. Grad-clip for good measure.
     depth_model.train(train); pose_enc.train(train); pose_dec.train(train)
-    agg = {}
+    agg = {}; nb = 0; skipped = 0
     for batch in loader:
         batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                  for k, v in batch.items()}
-        with torch.set_grad_enabled(train), torch.amp.autocast(device, enabled=train):
+        with torch.set_grad_enabled(train):
             loss, logs = photometric_step(
                 batch, depth_model, pose_enc, pose_dec, ssim, backproj, project, hw,
                 args.min_depth, args.max_depth, args.smoothness, automask=not args.no_automask)
         if train:
+            if not torch.isfinite(loss):           # guard: never step on a NaN/Inf batch
+                skipped += 1
+                continue
             opt.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.step(opt); scaler.update()
+            loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for g in opt.param_groups for p in g["params"]], args.grad_clip)
+            opt.step()
         for k, v in logs.items():
             agg[k] = agg.get(k, 0.0) + v
-    return {k: v / len(loader) for k, v in agg.items()}
+        nb += 1
+    if skipped:
+        print(f"[warn] skipped {skipped} non-finite batches", flush=True)
+    return {k: v / max(nb, 1) for k, v in agg.items()}
 
 
 def self_test(args, device):
@@ -337,6 +348,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--grad-clip", type=float, default=1.0, help="max grad norm; 0 disables")
     ap.add_argument("--smoothness", type=float, default=1e-3)
     ap.add_argument("--min-depth", type=float, default=0.1)
     ap.add_argument("--max-depth", type=float, default=150.0)
@@ -406,7 +418,6 @@ def main():
     print(f"[optim] Adam lr={args.lr} | trainable params={n_train/1e6:.2f}M", flush=True)
     opt = torch.optim.Adam(params, lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=max(1, args.epochs // 2), gamma=0.1)
-    scaler = torch.amp.GradScaler(device)
     ssim = SSIM().to(device)
     backproj = BackprojectDepth(args.batch_size, *hw).to(device)
     project = Project3D(args.batch_size, *hw).to(device)
@@ -431,9 +442,9 @@ def main():
     best = float("inf")
     for ep in range(1, args.epochs + 1):
         tr_logs = run_epoch(tr, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                            opt, scaler, device, args, hw, train=True)
+                            opt, device, args, hw, train=True)
         va_logs = run_epoch(va, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                            opt, scaler, device, args, hw, train=False)
+                            opt, device, args, hw, train=False)
         sched.step()
         lr = opt.param_groups[0]["lr"]
         print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
@@ -455,7 +466,7 @@ def main():
     te = DataLoader(te_ds, args.batch_size, shuffle=False, num_workers=args.workers, drop_last=True)
     depth_model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
     te_logs = run_epoch(te, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                        opt, scaler, device, args, hw, train=False)
+                        opt, device, args, hw, train=False)
     print(f"[test] photo={te_logs['photo']:.4f} smooth={te_logs['smooth']:.4f}", flush=True)
     wandb.run.summary.update({f"test/{k}": v for k, v in te_logs.items()})
     wandb.log({"qual/test_panel": wandb.Image(
