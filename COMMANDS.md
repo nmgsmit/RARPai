@@ -17,6 +17,10 @@ sbatch jobs/finetune_depth.sh                                  # defaults (img 3
 sbatch jobs/finetune_depth.sh --epochs 30 --frame-stride 2     # wider motion baseline
 sbatch jobs/finetune_depth.sh --image-shape 448 560            # higher train res (mult of 14)
 sbatch jobs/finetune_depth.sh --intrinsics 0.9 1.2 0.5 0.5     # real da Vinci K (normalised)
+sbatch jobs/finetune_depth.sh --no-refine                      # plain Monodepth2 (no AF-SfMLearner)
+# frame-stride ablation (all with AF-SfMLearner refinement, default on):
+for s in 1 2 3; do sbatch jobs/finetune_depth.sh --frame-stride $s \
+    --out outputs/depth_s$s --run-name depth-refine-s$s; done
 # verify the GUI 389-key contract (no GPU/data needed):
 python scripts/finetune_depth.py --self-test
 python scripts/finetune_depth.py --self-test --ckpt outputs/rarp_depth/best.pth
