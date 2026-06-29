@@ -79,6 +79,12 @@ def round14(x):
     return max(14, int(round(x / 14)) * 14)
 
 
+def round32(x):
+    """ResNet pose/position/transform UNets downsample by 32, so the feed/reprojection
+    resolution must be a multiple of 32 for the skip connections to align."""
+    return max(32, int(round(x / 32)) * 32)
+
+
 # --------------------------------------------------------------------------- data
 class RARPTriplets(Dataset):
     """Consecutive-frame triplets from RARPAtlas clips. Returns raw [0,1] color frames
@@ -553,13 +559,18 @@ def main():
     args = ap.parse_args()
     seed_everything(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    hw = (round14(args.image_shape[0]), round14(args.image_shape[1]))
+    # depth model runs at a ÷14 res internally (recorded for the GUI); the data/pose/
+    # registration/reprojection geometry runs at a ÷32 feed res (UNet skip alignment).
+    # depth_model.forward interpolates its input to model_shape, so feeding feed-res frames
+    # is fine; we interpolate disp back to feed res for the loss.
+    model_shape = (round14(args.image_shape[0]), round14(args.image_shape[1]))
+    hw = (round32(args.image_shape[0]), round32(args.image_shape[1]))
 
     if args.self_test:
         self_test(args, device); return
 
     if args.smoke:
-        m = build_depth_model(hw, device)
+        m = build_depth_model(model_shape, device)
         pe = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
         pd = decoders.PoseDecoder(pe.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
         ssim = SSIM().to(device)
@@ -588,7 +599,8 @@ def main():
     k_norm = tuple(args.intrinsics)
     ds_kw = dict(mask_overlay=not args.no_overlay_mask, overlay_frames=args.overlay_frames,
                  overlay_std_thresh=args.overlay_std_thresh)
-    print(f"[setup] hw={hw} K_norm={k_norm} stride={args.frame_stride} "
+    print(f"[setup] model_shape={model_shape} feed_hw={hw} K_norm={k_norm} "
+          f"stride={args.frame_stride} refine={args.refine} "
           f"overlay_mask={not args.no_overlay_mask} device={device}", flush=True)
 
     tr = DataLoader(
@@ -604,7 +616,7 @@ def main():
     panel_idx = np.linspace(0, len(va_ds) - 1, args.panel_size).astype(int)
     panel = [(va_ds[i][("color", 0)], va_ds[i]["valid"]) for i in panel_idx]
 
-    depth_model = build_depth_model(hw, device)
+    depth_model = build_depth_model(model_shape, device)
     _filter_load(depth_model, args.init, "depth")
     pose_enc = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
     pose_dec = decoders.PoseDecoder(pose_enc.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
@@ -644,7 +656,8 @@ def main():
     import wandb
     wandb.init(project=os.getenv("WANDB_PROJECT", "rarp"),
                entity=os.getenv("WANDB_ENTITY", "nmgtue"), name=args.run_name,
-               config=dict(task="depth", model="endodac-base-dvlora-r4", image_shape=hw,
+               config=dict(task="depth", model="endodac-base-dvlora-r4",
+                           image_shape=model_shape, feed_shape=hw,
                            intrinsics=k_norm, frame_stride=args.frame_stride,
                            bottom_crop_frac=args.bottom_crop_frac, epochs=args.epochs,
                            batch_size=args.batch_size, lr=args.lr, smoothness=args.smoothness,

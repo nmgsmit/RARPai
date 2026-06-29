@@ -3,6 +3,26 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-06-29 — DEPTH: AF-SfMLearner refinement re-added + frame-stride ablation
+- `--refine` (default ON) restores EndoDAC's full self-supervision in `scripts/finetune_depth.py`:
+  Position net (ResnetEncoder n_in=2 + PositionDecoder, dense optical-flow registration + occlusion
+  mask via `get_occu_mask_backward`) and Transform net (ResnetEncoder + TransformDecoder, appearance
+  flow → illumination-corrected "refined" target). Two-stage per batch like the released trainer:
+  opt0 trains Position (lr 1e-4), opt trains depth-LoRA + pose + Transform (lr `--lr`). Losses:
+  registration (stage0) + smoothness; photometric vs refined + transform-constraint(0.01) +
+  transform-smoothness(0.01, `get_smooth_bright`) + masked disp-smoothness (stage1). Pose uses
+  EndoDAC's [f,0] pairing (no invert). `--no-refine` = the plain Monodepth2 path. Overlay/vignette
+  `valid` mask gates every term. Warm-start needs position*/transform*.pth in `~/backbones/EndoDAC`.
+- Weights uploaded to `~/backbones/EndoDAC`: + position.pth, position_encoder.pth, transform.pth,
+  transform_encoder.pth (intrinsics_head.pth NOT needed — we use fixed K, no learned intrinsics).
+- FRAME-STRIDE ablation: triplet baseline = `--frame-stride`. Run s∈{1,2,3} with refine, separate
+  `--out`/`--run-name`, compare Validation photometric + qual panels. Commands in COMMANDS.md.
+- Data for finetuning = Train split = 7 videos / 32 clips / 5300 frames. Heterogeneous console types
+  (Hugo, da Vinci Xi, CMR Versius) → diversity matters; more videos likely helps generalization more
+  than more frames/video (consecutive frames redundant). A video-count ablation is the way to confirm.
+- GUI: Nick renamed the loader CHECKPOINT to `depth_model_rarp_finetune.pth`, so the swap is now
+  `cp outputs/<run>/best.pth ../backbones/EndoDAC/depth_model_rarp_finetune.pth`.
+
 ## 2026-06-28 — DEPTH: console-GUI overlay masking + NaN fix (run 24269078 → next run)
 - First real run diverged: fp16 AMP sent pose_trans→nan in epoch 2, automask collapsed to the static
   baseline, metrics froze. FIX: train fp32 (no AMP, EndoDAC's regime) + grad-norm clip 1.0 (`--grad-clip`)
