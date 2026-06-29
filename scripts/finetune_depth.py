@@ -56,7 +56,8 @@ import models.backbones as backbones          # noqa: E402
 import models.encoders as encoders            # noqa: E402
 import models.decoders as decoders            # noqa: E402
 from utils.layers import (                    # noqa: E402
-    SSIM, BackprojectDepth, Project3D,
+    SSIM, BackprojectDepth, Project3D, SpatialTransformer,
+    get_occu_mask_backward, get_smooth_loss, get_smooth_bright,
     disp_to_depth, transformation_from_parameters,
 )
 
@@ -197,6 +198,106 @@ def predict_pose(pose_enc, pose_dec, img0, imgf, f):
     return T, axisangle[:, 0], translation[:, 0]
 
 
+# ----------------------------------------- AF-SfMLearner refinement (EndoDAC, optional)
+# EndoDAC's full self-supervision: a Position net (dense optical-flow registration +
+# occlusion mask) and a Transform net (appearance flow) that builds an illumination-
+# corrected "refined" target, so the photometric loss isn't fooled by the specular /
+# non-Lambertian lighting changes typical of endoscopy. Two-stage per batch like the
+# released trainer: optimise Position alone, then depth+pose+Transform.
+def build_refiner(hw, device, init_dir, warm=True):
+    R = {
+        "pos_enc": encoders.ResnetEncoder(18, False, num_input_images=2).to(device),
+        "trans_enc": encoders.ResnetEncoder(18, False, num_input_images=2).to(device),
+        "stn": SpatialTransformer(hw).to(device),
+        "occu": get_occu_mask_backward(hw).to(device),
+    }
+    R["pos"] = decoders.PositionDecoder(R["pos_enc"].num_ch_enc, scales=range(4)).to(device)
+    R["trans"] = decoders.TransformDecoder(R["trans_enc"].num_ch_enc, scales=range(4)).to(device)
+    if warm:
+        d = Path(init_dir)
+        for k, fn in [("pos_enc", "position_encoder.pth"), ("pos", "position.pth"),
+                      ("trans_enc", "transform_encoder.pth"), ("trans", "transform.pth")]:
+            if (d / fn).exists():
+                _filter_load(R[k], d / fn, k)
+    return R
+
+
+def _refine_predict(R, aug, color, f, hw):
+    """frame f -> 0: dense registration (warp), occlusion mask, appearance-refined target."""
+    pos = R["pos"](R["pos_enc"](torch.cat([aug[f], aug[0]], 1)))[("position", 0)]
+    pos_r = R["pos"](R["pos_enc"](torch.cat([aug[0], aug[f]], 1)))[("position", 0)]
+    pos = F.interpolate(pos, hw, mode="bilinear", align_corners=True)
+    pos_r = F.interpolate(pos_r, hw, mode="bilinear", align_corners=True)
+    registration = R["stn"](color[f], pos)
+    occu, _ = R["occu"](pos_r)
+    tr = R["trans"](R["trans_enc"](torch.cat([registration, color[0]], 1)))[("transform", 0)]
+    tr = F.interpolate(tr, hw, mode="bilinear", align_corners=True)
+    refined = torch.clamp(tr * occu.detach() + color[0], 0.0, 1.0)
+    return dict(position=pos, registration=registration, occu=occu, transform=tr, refined=refined)
+
+
+def position_loss(R, batch, hw, ssim, pos_smooth_w):
+    """Stage 0: train the Position net only (registration + flow smoothness)."""
+    aug = {f: batch[("color_aug", f)] for f in (-1, 0, 1)}
+    color = {f: batch[("color", f)] for f in (-1, 0, 1)}
+    valid = batch["valid"]
+    reg, smooth = 0.0, 0.0
+    for f in (-1, 1):
+        p = _refine_predict(R, aug, color, f, hw)
+        occu = p["occu"] * valid
+        reg = reg + (reprojection(p["registration"], p["refined"].detach(), ssim)
+                     * occu).sum() / occu.sum().clamp(min=1)
+        smooth = smooth + get_smooth_loss(p["position"], color[0])
+    return reg / 2.0 + pos_smooth_w * (smooth / 2.0)
+
+
+def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj, project,
+                      hw, min_depth, max_depth, w):
+    """Stage 1: depth + pose + Transform against the appearance-refined target."""
+    aug = {f: batch[("color_aug", f)] for f in (-1, 0, 1)}
+    color = {f: batch[("color", f)] for f in (-1, 0, 1)}
+    K, inv_K, valid = batch["K"], batch["inv_K"], batch["valid"]
+    disp = F.interpolate(depth_model(aug[0])[("disp", 0)], hw, mode="bilinear", align_corners=False)
+    _, depth = disp_to_depth(disp, min_depth, max_depth)
+    reproj, transf, cvt, tstats = 0.0, 0.0, 0.0, []
+    for f in (-1, 1):
+        p = _refine_predict(R, aug, color, f, hw)
+        occu = (p["occu"] * valid).detach()
+        ax, tr, _ = pose_dec([pose_enc(torch.cat([aug[f], aug[0]], 1))])  # EndoDAC: [f,0]
+        ax, tr = ax[:, 0], tr[:, 0]
+        tstats.append((ax.norm(dim=-1).mean(), tr.norm(dim=-1).mean()))
+        T = transformation_from_parameters(ax, tr)
+        pix = project(backproj(depth, inv_K), K, T)
+        warped = F.grid_sample(color[f], pix, padding_mode="border", align_corners=True)
+        reproj = reproj + (reprojection(warped, p["refined"], ssim)
+                           * occu).sum() / occu.sum().clamp(min=1)
+        transf = transf + ((p["refined"] - p["registration"].detach()).abs().mean(1, True)
+                           * occu).sum() / occu.sum().clamp(min=1)
+        cvt = cvt + get_smooth_bright(p["transform"], color[0], p["registration"].detach(), occu)
+    smooth = smooth_loss_masked(disp, color[0], valid)
+    loss = reproj / 2.0 + w["tc"] * (transf / 2.0) + w["ts"] * (cvt / 2.0) + w["ds"] * smooth
+    rot = torch.stack([t[0] for t in tstats]).mean()
+    trn = torch.stack([t[1] for t in tstats]).mean()
+    logs = dict(loss=loss.item(), photo=(reproj / 2).item(), smooth=smooth.item(),
+                transform=(transf / 2).item(), pose_rot=rot.item(), pose_trans=trn.item())
+    return loss, logs
+
+
+def _set_stage(R, pose_enc, pose_dec, depth_model, stage):
+    """stage 0 = train Position only; stage 1 = train depth(LoRA)+pose+Transform."""
+    for p in list(R["pos_enc"].parameters()) + list(R["pos"].parameters()):
+        p.requires_grad = (stage == 0)
+    for p in (list(R["trans_enc"].parameters()) + list(R["trans"].parameters())
+              + list(pose_enc.parameters()) + list(pose_dec.parameters())):
+        p.requires_grad = (stage == 1)
+    for n, p in depth_model.named_parameters():
+        p.requires_grad = (stage == 1) and any(k in n for k in ("lora_", "residual_", "conv_depth_"))
+    for m, on in [(R["pos_enc"], stage == 0), (R["pos"], stage == 0),
+                  (R["trans_enc"], stage == 1), (R["trans"], stage == 1),
+                  (pose_enc, stage == 1), (pose_dec, stage == 1), (depth_model, stage == 1)]:
+        m.train(on)
+
+
 def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, project,
                      hw, min_depth, max_depth, smooth_w, automask=True):
     """Returns (loss, logs). Single-scale Monodepth2 photometric + smoothness."""
@@ -333,6 +434,45 @@ def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, 
     return {k: v / max(nb, 1) for k, v in agg.items()}
 
 
+def _clip(opt, max_norm):
+    if max_norm > 0:
+        torch.nn.utils.clip_grad_norm_(
+            [p for g in opt.param_groups for p in g["params"]], max_norm)
+
+
+def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim,
+                     backproj, project, device, args, hw, w, train=True):
+    """AF-SfMLearner two-stage epoch: optimise Position (opt0), then depth+pose+Transform (opt)."""
+    agg = {}; nb = 0; skipped = 0
+    for batch in loader:
+        batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                 for k, v in batch.items()}
+        if train:
+            _set_stage(R, pose_enc, pose_dec, depth_model, 0)          # Position stage
+            loss0 = position_loss(R, batch, hw, ssim, w["ps"])
+            if torch.isfinite(loss0):
+                opt0.zero_grad(); loss0.backward(); _clip(opt0, args.grad_clip); opt0.step()
+            _set_stage(R, pose_enc, pose_dec, depth_model, 1)          # depth/pose/transform
+            loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
+                                           backproj, project, hw, args.min_depth, args.max_depth, w)
+            if not torch.isfinite(loss):
+                skipped += 1; continue
+            opt.zero_grad(); loss.backward(); _clip(opt, args.grad_clip); opt.step()
+        else:
+            for m in (R["pos_enc"], R["pos"], R["trans_enc"], R["trans"],
+                      pose_enc, pose_dec, depth_model):
+                m.eval()
+            with torch.no_grad():
+                loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
+                                               backproj, project, hw, args.min_depth, args.max_depth, w)
+        for k, v in logs.items():
+            agg[k] = agg.get(k, 0.0) + v
+        nb += 1
+    if skipped:
+        print(f"[warn] skipped {skipped} non-finite batches", flush=True)
+    return {k: v / max(nb, 1) for k, v in agg.items()}
+
+
 def self_test(args, device):
     """Rebuild with the exact GUI args, save+reload a state_dict, assert the key contract."""
     h, w = (round14(args.image_shape[0]), round14(args.image_shape[1]))
@@ -393,6 +533,12 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--grad-clip", type=float, default=1.0, help="max grad norm; 0 disables")
     ap.add_argument("--smoothness", type=float, default=1e-3)
+    ap.add_argument("--refine", action=argparse.BooleanOptionalAction, default=True,
+                    help="EndoDAC AF-SfMLearner refinement (Position+Transform nets); "
+                         "--no-refine for the plain Monodepth2 path")
+    ap.add_argument("--position-smoothness", type=float, default=1e-3)
+    ap.add_argument("--transform-constraint", type=float, default=0.01)
+    ap.add_argument("--transform-smoothness", type=float, default=0.01)
     ap.add_argument("--min-depth", type=float, default=0.1)
     ap.add_argument("--max-depth", type=float, default=150.0)
     ap.add_argument("--no-automask", action="store_true")
@@ -424,10 +570,18 @@ def main():
         batch = {("color", f): torch.rand(2, 3, *hw, device=device) for f in (-1, 0, 1)}
         batch.update({("color_aug", f): torch.rand(2, 3, *hw, device=device) for f in (-1, 0, 1)})
         batch.update(valid=torch.ones(2, 1, *hw, device=device), K=K, inv_K=torch.inverse(K))
-        loss, logs = photometric_step(batch, m, pe, pd, ssim, bp, pr, hw,
-                                      args.min_depth, args.max_depth, args.smoothness)
+        if args.refine:
+            R = build_refiner(hw, device, args.pose_init_dir, warm=False)
+            w = dict(ps=args.position_smoothness, tc=args.transform_constraint,
+                     ts=args.transform_smoothness, ds=args.smoothness)
+            position_loss(R, batch, hw, ssim, w["ps"]).backward()
+            loss, logs = refine_depth_step(batch, m, pe, pd, R, ssim, bp, pr, hw,
+                                           args.min_depth, args.max_depth, w)
+        else:
+            loss, logs = photometric_step(batch, m, pe, pd, ssim, bp, pr, hw,
+                                          args.min_depth, args.max_depth, args.smoothness)
         loss.backward()
-        print(f"[smoke] ok | hw={hw} loss={logs['loss']:.4f} device={device}")
+        print(f"[smoke] ok | hw={hw} refine={args.refine} loss={logs['loss']:.4f} device={device}")
         return
 
     root = Path(args.data_root)
@@ -459,15 +613,33 @@ def main():
         _filter_load(pose_enc, pid / "pose_encoder.pth", "pose_enc")
         _filter_load(pose_dec, pid / "pose.pth", "pose")
 
-    params = [p for p in depth_model.parameters() if p.requires_grad] \
-        + list(pose_enc.parameters()) + list(pose_dec.parameters())
+    R = opt0 = None
+    weights = dict(ps=args.position_smoothness, tc=args.transform_constraint,
+                   ts=args.transform_smoothness, ds=args.smoothness)
+    if args.refine:
+        R = build_refiner(hw, device, args.pose_init_dir)
+        opt0 = torch.optim.Adam(list(R["pos"].parameters()) + list(R["pos_enc"].parameters()), lr=1e-4)
+        depth_train = [p for p in depth_model.parameters() if p.requires_grad]
+        params = depth_train + list(pose_enc.parameters()) + list(pose_dec.parameters()) \
+            + list(R["trans"].parameters()) + list(R["trans_enc"].parameters())
+    else:
+        params = [p for p in depth_model.parameters() if p.requires_grad] \
+            + list(pose_enc.parameters()) + list(pose_dec.parameters())
     n_train = sum(p.numel() for p in params)
-    print(f"[optim] Adam lr={args.lr} | trainable params={n_train/1e6:.2f}M", flush=True)
+    print(f"[optim] Adam lr={args.lr} | refine={args.refine} | "
+          f"stage1 trainable params={n_train/1e6:.2f}M", flush=True)
     opt = torch.optim.Adam(params, lr=args.lr)
     sched = torch.optim.lr_scheduler.StepLR(opt, step_size=max(1, args.epochs // 2), gamma=0.1)
     ssim = SSIM().to(device)
     backproj = BackprojectDepth(args.batch_size, *hw).to(device)
     project = Project3D(args.batch_size, *hw).to(device)
+
+    def do_epoch(loader, train):
+        if args.refine:
+            return run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0,
+                                    ssim, backproj, project, device, args, hw, weights, train)
+        return run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project,
+                         opt, device, args, hw, train)
 
     import wandb
     wandb.init(project=os.getenv("WANDB_PROJECT", "rarp"),
@@ -478,7 +650,7 @@ def main():
                            batch_size=args.batch_size, lr=args.lr, smoothness=args.smoothness,
                            automask=not args.no_automask, augment=not args.no_augment,
                            overlay_mask=not args.no_overlay_mask,
-                           overlay_std_thresh=args.overlay_std_thresh,
+                           overlay_std_thresh=args.overlay_std_thresh, refine=args.refine,
                            init=str(args.init), data_root=str(root)))
 
     outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
@@ -490,10 +662,8 @@ def main():
 
     best = float("inf")
     for ep in range(1, args.epochs + 1):
-        tr_logs = run_epoch(tr, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                            opt, device, args, hw, train=True)
-        va_logs = run_epoch(va, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                            opt, device, args, hw, train=False)
+        tr_logs = do_epoch(tr, train=True)
+        va_logs = do_epoch(va, train=False)
         sched.step()
         lr = opt.param_groups[0]["lr"]
         print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
@@ -514,8 +684,7 @@ def main():
     te_ds = RARPTriplets(root / "Test", hw, k_norm, args.frame_stride, args.bottom_crop_frac, **ds_kw)
     te = DataLoader(te_ds, args.batch_size, shuffle=False, num_workers=args.workers, drop_last=True)
     depth_model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
-    te_logs = run_epoch(te, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                        opt, device, args, hw, train=False)
+    te_logs = do_epoch(te, train=False)
     print(f"[test] photo={te_logs['photo']:.4f} smooth={te_logs['smooth']:.4f}", flush=True)
     wandb.run.summary.update({f"test/{k}": v for k, v in te_logs.items()})
     wandb.log({"qual/test_panel": wandb.Image(
