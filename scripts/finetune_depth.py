@@ -93,10 +93,12 @@ class RARPTriplets(Dataset):
 
     def __init__(self, split_dir, hw, k_norm, stride=1, bottom_crop_frac=0.0,
                  augment=False, vignette_thresh=0.04, mask_overlay=True,
-                 overlay_frames=16, overlay_std_thresh=6.0, overlay_min_valid=0.25):
+                 overlay_frames=16, overlay_std_thresh=6.0, overlay_min_valid=0.25,
+                 side_crop_frac=0.0):
         self.h, self.w = hw
         self.stride = stride
         self.bottom_crop_frac = bottom_crop_frac
+        self.side_crop_frac = side_crop_frac      # crop this frac off EACH of left & right
         self.augment = augment
         self.vignette_thresh = vignette_thresh
         self.to_tensor = transforms.ToTensor()
@@ -142,9 +144,10 @@ class RARPTriplets(Dataset):
 
     def _load(self, path):
         img = Image.open(path).convert("RGB")
-        if self.bottom_crop_frac > 0:                  # drop baked-in UI banner
+        s, b = self.side_crop_frac, self.bottom_crop_frac
+        if s > 0 or b > 0:                             # crop baked-in overlay (L/R bars + banner)
             W, H = img.size
-            img = img.crop((0, 0, W, int(H * (1 - self.bottom_crop_frac))))
+            img = img.crop((int(W * s), 0, int(W * (1 - s)), int(H * (1 - b))))
         return img.resize((self.w, self.h), Image.BILINEAR)
 
     def __getitem__(self, idx):
@@ -528,6 +531,8 @@ def main():
     ap.add_argument("--frame-stride", type=int, default=1, help="triplet baseline in frames")
     ap.add_argument("--bottom-crop-frac", type=float, default=0.0,
                     help="crop this fraction off the bottom (UI banner) before resize")
+    ap.add_argument("--side-crop-frac", type=float, default=0.0,
+                    help="crop this fraction off EACH of left & right (L/R console bars)")
     ap.add_argument("--no-overlay-mask", action="store_true",
                     help="disable per-clip temporal static-overlay (console GUI) masking")
     ap.add_argument("--overlay-frames", type=int, default=16,
@@ -598,7 +603,7 @@ def main():
     root = Path(args.data_root)
     k_norm = tuple(args.intrinsics)
     ds_kw = dict(mask_overlay=not args.no_overlay_mask, overlay_frames=args.overlay_frames,
-                 overlay_std_thresh=args.overlay_std_thresh)
+                 overlay_std_thresh=args.overlay_std_thresh, side_crop_frac=args.side_crop_frac)
     print(f"[setup] model_shape={model_shape} feed_hw={hw} K_norm={k_norm} "
           f"stride={args.frame_stride} refine={args.refine} "
           f"overlay_mask={not args.no_overlay_mask} device={device}", flush=True)
@@ -659,7 +664,8 @@ def main():
                config=dict(task="depth", model="endodac-base-dvlora-r4",
                            image_shape=model_shape, feed_shape=hw,
                            intrinsics=k_norm, frame_stride=args.frame_stride,
-                           bottom_crop_frac=args.bottom_crop_frac, epochs=args.epochs,
+                           bottom_crop_frac=args.bottom_crop_frac,
+                           side_crop_frac=args.side_crop_frac, epochs=args.epochs,
                            batch_size=args.batch_size, lr=args.lr, smoothness=args.smoothness,
                            automask=not args.no_automask, augment=not args.no_augment,
                            overlay_mask=not args.no_overlay_mask,
