@@ -738,10 +738,12 @@ def main():
         else:
             sm, _, svis = res
             print("[scared] " + "  ".join(f"{k}={v:.4f}" for k, v in sm.items()), flush=True)
+            logd = {f"scared/{k}": v for k, v in sm.items()}     # LOG (not just summary) so the
+            if svis:                                             # metrics show as scalars, not only
+                logd["scared/overlays"] = wandb.Image(           # in the run-summary table
+                    np.concatenate(svis, axis=0), caption="SCARED [rgb | pred | gt]")
+            wandb.log(logd)
             wandb.run.summary.update({f"scared/{k}": v for k, v in sm.items()})
-            if svis:
-                wandb.log({"scared/overlays": wandb.Image(
-                    np.concatenate(svis, axis=0), caption="SCARED [rgb | pred | gt]")})
     wandb.finish()
     print(f"[done] best val_photo={best:.4f} -> {outdir/'best.pth'}")
 
