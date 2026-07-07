@@ -555,6 +555,11 @@ def main():
     ap.add_argument("--no-automask", action="store_true")
     ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--panel-size", type=int, default=8, help="fixed qualitative frames")
+    ap.add_argument("--scared-dir", default="../data/SCARED/stereo_gt",
+                    help="calibrated-stereo SCARED GT (frames/ + gt_depths.npz) for the "
+                         "end-of-training metric eval; build with scripts/export_scared_stereo_gt.py")
+    ap.add_argument("--no-scared", action="store_true",
+                    help="skip the SCARED metric eval at the end of training")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--self-test", action="store_true",
@@ -710,6 +715,24 @@ def main():
         qualitative_panel(depth_model, [(te_ds[i][("color", 0)], te_ds[i]["valid"])
                           for i in np.linspace(0, len(te_ds) - 1, args.panel_size).astype(int)],
                           hw, device, args.min_depth, args.max_depth), caption="Test [rgb | depth]")})
+
+    # SCARED metric eval on the SELECTED best model (real GT, unlike the photometric proxy above).
+    # Uses the same crop as training so a crop-trained model is scored fairly. Skipped if GT absent.
+    if not args.no_scared:
+        from eval_scared import run_scared_eval                 # lazy: avoids import cycle
+        res = run_scared_eval(depth_model, args.scared_dir, model_shape, device,
+                              args.min_depth, args.max_depth,
+                              side_crop=args.side_crop_frac, bottom_crop=args.bottom_crop_frac)
+        if res is None:
+            print(f"[scared] skipped -- no GT at {args.scared_dir} "
+                  f"(build it: scripts/export_scared_stereo_gt.py)", flush=True)
+        else:
+            sm, _, svis = res
+            print("[scared] " + "  ".join(f"{k}={v:.4f}" for k, v in sm.items()), flush=True)
+            wandb.run.summary.update({f"scared/{k}": v for k, v in sm.items()})
+            if svis:
+                wandb.log({"scared/overlays": wandb.Image(
+                    np.concatenate(svis, axis=0), caption="SCARED [rgb | pred | gt]")})
     wandb.finish()
     print(f"[done] best val_photo={best:.4f} -> {outdir/'best.pth'}")
 
