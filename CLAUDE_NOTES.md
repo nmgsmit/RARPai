@@ -15,6 +15,11 @@ sessions don't re-derive them. Keep entries one or two lines.
   exploiting bigger baselines would need a stability fix (lower lr / warm-up / stronger pose init), not just stride.
 - SCARED metrics were going only to `wandb.run.summary` in finetune (overlay via `wandb.log`), so runs
   showed the image but no metric scalar — fixed to `wandb.log` the metrics too; backfilled umc-s1-short via API.
+- REFINE ablation (stride 1, short, identical seed/data): EndoDAC+AF-SfMLearner (`umc-s1-short`) BEATS plain
+  EndoDAC (`umc-s1-norefine`) on all 7 SCARED metrics — abs_rel 0.228 vs 0.283 (-19%), rmse 17.8 vs 23.1,
+  a1 .547 vs .496. ⇒ keep `--refine` on UMC (earns its ~2x compute). Caveat: norefine has LOWER scale-ratio
+  std (43 vs 107) — more globally-consistent scale — but per-frame median scaling hides that and refine still
+  wins accuracy; relevant later for the fixed-scale metric (SUL) step, not for SCARED ranking.
 
 ## 2026-07-07 — DEPTH: SCARED staged + sweep flips the stride verdict + wired into training
 - SCARED *test* release (ds8/9) uploaded to `../data/SCARED/test_dataset_{8,9}.zip` = 10 keyframes,
