@@ -3,6 +3,19 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-07-07 — DEPTH: switched to UMCdissectionimg + stride 1 (wide strides degenerate here)
+- Depth training data switched RARPAtlas -> `../data/UMCdissectionvid/UMCdissectionimg` (real target
+  domain, 71 videos/46k frames; Nick moved HD snapshots into the vid folder, HD->img). `--sample-frac`
+  subsamples redundant triplet centers (5-10 fps) to keep runs tractable; `jobs/finetune_depth_umc.sh`.
+- Credit-friendly SHORT stride screen (`--epochs 10 --sample-frac 0.1`, chained 1-GPU, `jobs/sweep_umc_stride.sh`):
+  s1 SCARED abs_rel **0.228** (a1 .547, rmse 17.8) — already ≈ best RARPAtlas run. s3 **DEGENERATED**
+  (pose_trans collapsed 0.0004->0.0002 instead of growing ~3x, 9 non-finite batches skipped, val_photo
+  spuriously low = degenerate shortcut). Cancelled s3+s5. ⇒ the RARPAtlas "bigger stride better" trend
+  does NOT transfer to UMC (5-10 fps -> wide strides span too much/erratic motion). **Use stride 1 on UMC**;
+  exploiting bigger baselines would need a stability fix (lower lr / warm-up / stronger pose init), not just stride.
+- SCARED metrics were going only to `wandb.run.summary` in finetune (overlay via `wandb.log`), so runs
+  showed the image but no metric scalar — fixed to `wandb.log` the metrics too; backfilled umc-s1-short via API.
+
 ## 2026-07-07 — DEPTH: SCARED staged + sweep flips the stride verdict + wired into training
 - SCARED *test* release (ds8/9) uploaded to `../data/SCARED/test_dataset_{8,9}.zip` = 10 keyframes,
   each only `{Left,Right}_Image.png` + `rgb.mp4` + `endoscope_calibration.yaml`. **No structured-light
