@@ -94,7 +94,7 @@ class RARPTriplets(Dataset):
     def __init__(self, split_dir, hw, k_norm, stride=1, bottom_crop_frac=0.0,
                  augment=False, vignette_thresh=0.04, mask_overlay=True,
                  overlay_frames=16, overlay_std_thresh=6.0, overlay_min_valid=0.25,
-                 side_crop_frac=0.0):
+                 side_crop_frac=0.0, sample_frac=1.0):
         self.h, self.w = hw
         self.stride = stride
         self.bottom_crop_frac = bottom_crop_frac
@@ -127,6 +127,12 @@ class RARPTriplets(Dataset):
                 frames, overlay_frames, overlay_std_thresh, overlay_min_valid) \
                 if mask_overlay else None
         assert self.samples, f"no triplets found under {split_dir} (looked for */*/clip_*/images)"
+        # Frames sampled at 5-10 fps are highly redundant -> subsample triplet CENTERS (not frames:
+        # each kept sample is still a real (t-s,t,t+s) triplet). Keeps every clip/video represented,
+        # cuts epoch time proportionally. Fixed seed -> reproducible, stable across runs.
+        if sample_frac < 1.0:
+            keep = max(1, int(round(len(self.samples) * sample_frac)))
+            self.samples = random.Random(1234).sample(self.samples, keep)
 
     def _overlay_mask(self, frames, n, thresh, min_valid):
         if len(frames) < 3:
@@ -529,6 +535,9 @@ def main():
                     metavar=("fx", "fy", "cx", "cy"),
                     help="NORMALISED da Vinci intrinsics; default = EndoDAC/SCARED assumed K")
     ap.add_argument("--frame-stride", type=int, default=1, help="triplet baseline in frames")
+    ap.add_argument("--sample-frac", type=float, default=1.0,
+                    help="keep this fraction of TRAIN triplet centers (seeded). For dense HD dumps "
+                         "like UMCdissectionHD (46k redundant frames) use e.g. 0.15 to cut epoch time.")
     ap.add_argument("--bottom-crop-frac", type=float, default=0.0,
                     help="crop this fraction off the bottom (UI banner) before resize")
     ap.add_argument("--side-crop-frac", type=float, default=0.0,
@@ -615,7 +624,7 @@ def main():
 
     tr = DataLoader(
         RARPTriplets(root / "Train", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
-                     augment=not args.no_augment, **ds_kw),
+                     augment=not args.no_augment, sample_frac=args.sample_frac, **ds_kw),
         args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True)
     va_ds = RARPTriplets(root / "Validation", hw, k_norm, args.frame_stride,
                          args.bottom_crop_frac, **ds_kw)
