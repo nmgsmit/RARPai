@@ -19,12 +19,12 @@ source venv/bin/activate
 # triplet centers (~7k) so a refine run is ~3h not ~16h. SCARED metric eval auto-runs at the end.
 # Override via "$@" (e.g. --frame-stride 2 --sample-frac 0.1).
 python scripts/finetune_depth.py \
-    --data-root ../data/UMCdissectionHD \
+    --data-root ../data/UMCdissectionvid/UMCdissectionimg \
     --init ../backbones/EndoDAC/depth_model.pth \
     --pose-init-dir ../backbones/EndoDAC \
     --out outputs/umc_dissection_depth \
     --run-name endodac-umc-dissection \
     --image-shape 392 490 \
-    --sample-frac 0.15 \
+    --sample-frac 0.3 \
     --epochs 20 \
     "$@"
