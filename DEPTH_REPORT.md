@@ -99,8 +99,30 @@ stage), **grad-norm clip 1.0**, StepLR (×0.1 at half), non-finite-batch guard, 
 wandb project `rarp` / entity `nmgtue`. Logged per epoch: photometric/SSIM/smoothness, LR,
 pose rotation+translation stats, and a **fixed 8-frame Validation panel** rendered as
 `[rgb | magma-depth]` (plus a before-training panel and a final Test panel). Model selection =
-lowest **Validation photometric** proxy. SCARED forgetting-check skipped (SCARED not staged on
-Snellius). Stereo metric: N/A (data is monocular).
+lowest **Validation photometric** proxy. **SCARED metric eval** (real GT) now runs on the selected
+`best.pth` at the end of every training run and logs `scared/abs_rel…a3` to the same wandb run
+(`scripts/eval_scared.py`, default on, `--no-scared` to skip) — see the SCARED section below.
+
+### SCARED metric benchmark (zero-shot, calibrated-stereo GT, N=10)
+The challenge *test* release (ds8/9) ships no structured-light GT, so `scripts/export_scared_stereo_gt.py`
+builds metric depth (mm) from the keyframe **stereo pair** (rectify → SGBM → reproject; baseline ≈4.35 mm).
+Self-supervised depth is scale-free → per-frame **median scaling** then the 7 Monodepth2 metrics. This is
+**zero-shot** (trained on RARP, never on porcine SCARED) and stereo-derived, so numbers are *not* row-comparable
+to in-domain SOTA (abs_rel ≈0.05); report as cross-dataset generalization.
+
+| ckpt | abs_rel↓ | rmse↓(mm) | a1↑ | RARP val_photo↓ |
+|---|---:|---:|---:|---:|
+| **depth_s3** | **0.230** | 22.2 | **0.668** | 0.1192 |
+| depth_s1 | 0.254 | 22.2 | 0.622 | 0.0766 |
+| depth_s2 | 0.254 | 23.4 | 0.653 | 0.1023 |
+| depth_crop | 0.314 | 26.5 | 0.573 | 0.0760 |
+| rarp_depth | 0.349 | 29.7 | 0.453 | 0.0615 |
+
+**Key finding — the metrics disagree.** The RARP photometric proxy ranks stride **1 best / 3 worst**; SCARED
+metric GT ranks stride **3 best** (monotonic s1→s3 on abs_rel, a1, rmse_log). The proxy is confounded across
+strides (a larger baseline mechanically raises the residual, §Ablations), so **SCARED overturns the
+stride-1 selection**: for metric depth accuracy prefer **depth_s3** (and try s4/s5). `depth_crop`'s
+proxy-"preferred" status does not hold on GT.
 
 ## Results (run 24270397 — final, overlay-masked, 20 epochs, fp32, 1×H100)
 - wandb run: https://wandb.ai/ngmtue/rarp/runs/wm0jcm1b (name `endodac-rarp`)

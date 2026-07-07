@@ -3,6 +3,38 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-07-07 — DEPTH: SCARED staged + sweep flips the stride verdict + wired into training
+- SCARED *test* release (ds8/9) uploaded to `../data/SCARED/test_dataset_{8,9}.zip` = 10 keyframes,
+  each only `{Left,Right}_Image.png` + `rgb.mp4` + `endoscope_calibration.yaml`. **No structured-light
+  GT** (withheld from the challenge test set). So `scripts/export_scared_stereo_gt.py` builds METRIC
+  GT from the stereo pair: cv2 stereoRectify → SGBM → reprojectImageTo3D, Z=depth(mm). Output
+  `../data/SCARED/stereo_gt/{frames/, gt_depths.npz}`. Depth medians 30–116 mm (sane), valid 69–84%.
+  Baseline |T|≈4.35 mm, fx≈1024 px. It's calibrated-stereo pseudo-GT (Hamlyn-style), not struct-light.
+- SWEEP (`jobs/eval_scared_sweep.sh`, all depth ckpts, same GT), abs_rel / a1 zero-shot N=10:
+  depth_s3 0.230/0.668 · depth_s1 0.254/0.622 · depth_s2 0.254/0.653 · depth_crop 0.314/0.573 ·
+  rarp_depth 0.349/0.453. **The stride ranking FLIPS vs the RARP photometric proxy**: proxy said
+  s1 best / s3 worst; SCARED says s3 BEST (monotonic s1→s3 on abs_rel, a1, rmse_log). Confirms the
+  report's warning that photometric ≠ comparable across strides (bigger baseline mechanically raises
+  the residual). ⇒ don't select depth models by the photometric proxy across strides; s3 is best,
+  worth an s4/s5. depth_crop's RARP "preferred" status does NOT hold on metric GT.
+- WIRED: `finetune_depth.py` now runs `eval_scared.run_scared_eval` on the selected best.pth at end of
+  training (default on, `--no-scared` off, `--scared-dir`), logs `scared/*` to the run, same crop as
+  training. `eval_scared.py` refactored: `_eval_pairs` + `run_scared_eval` + `--side/--bottom-crop-frac`.
+
+## 2026-07-06 — DEPTH: SCARED benchmark eval (absolute GT metrics)
+- `scripts/eval_scared.py` + `jobs/eval_scared.sh`: evaluate a trained `best.pth` on SCARED, the
+  structured-light GT benchmark used by AF-SfM/EndoDAC → numbers comparable to those papers. Reuses
+  finetune_depth's `build_depth_model`/`_filter_load`/`round14`/`colorize`/`disp_to_depth` + vendored
+  `compute_errors` (no reimpl). Self-supervised depth is scale-ambiguous → per-frame MEDIAN SCALING,
+  then 7 Monodepth2 metrics (abs_rel..a3), clamp band 1e-3..150 mm. wandb: metrics to summary+log,
+  scale-ratio median/std, `[rgb|pred|gt]` overlay images. `--smoke` = numpy metric self-check (no GPU).
+- GT input: `--gt-npz` = (N,H,W) mm depth maps (key "data"), produced by AF-SfM `export_gt_depth.py`
+  from raw SCARED point-cloud tiffs. Frames via `--rgb-dir` (sorted ↔ npz order; script prints
+  first/last pairing to eyeball) or `--list` file. NOT reimplementing the exporter (needs raw layout).
+- SCARED is license-gated (Intuitive EULA, EndoVis'19 sub-challenge) — cannot be wget'd. Nick must
+  sign the agreement, download dataset_8/9 test keyframes, run the AF-SfM exporter, then drop
+  `test_left/` + `gt_depths.npz` under `../data/SCARED/` on Snellius. Then `sbatch jobs/eval_scared.sh`.
+
 ## 2026-06-29 — DEPTH: AF-SfMLearner refinement re-added + frame-stride ablation
 - `--refine` (default ON) restores EndoDAC's full self-supervision in `scripts/finetune_depth.py`:
   Position net (ResnetEncoder n_in=2 + PositionDecoder, dense optical-flow registration + occlusion
