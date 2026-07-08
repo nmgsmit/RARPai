@@ -14,6 +14,11 @@ sessions don't re-derive them. Keep entries one or two lines.
   `umc_s1_scaredsel`: A = `--side-crop-frac 0.15` (black bars off → ~4:5). B = anatomy crop
   `--side 0.24 --top 0.037 --bottom 0.222` → 999x801 (~4:5, 40px top / 240px bottom kills GUI
   banner). Tests whether crop-to-anatomy beats full frame + temporal overlay mask.
+- `crop_adjust_intrinsics()`: crops now AUTO-adjust K (fx/=1-2·side, fy/=1-top-bot, principal
+  point re-referenced to the crop). A cy-only fix is incoherent — the same transform rescales
+  fx/fy (crop narrows FOV). A → fx 0.82→1.17. B → fx 1.58, fy 1.38, cy 0.5→0.625. Base K
+  (0.82,1.02,0.5,0.5) treated as full-frame; only affects the training reprojection, not SCARED
+  eval (median-scaled, K-free).
 
 ## 2026-07-07 — DEPTH: switched to UMCdissectionimg + stride 1 (wide strides degenerate here)
 - Depth training data switched RARPAtlas -> `../data/UMCdissectionvid/UMCdissectionimg` (real target

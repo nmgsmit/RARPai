@@ -85,6 +85,27 @@ def round32(x):
     return max(32, int(round(x / 32)) * 32)
 
 
+def crop_adjust_intrinsics(k_norm, side_frac, top_frac, bottom_frac):
+    """NORMALISED intrinsics (relative to the FULL frame) -> intrinsics correct for the cropped
+    view. Cropping keeps the focal length in pixels but shrinks the frame used to normalise it
+    (narrower FOV) and shifts the principal point. Purely fractional, so no native size needed:
+    fx/=kept_width_frac, fy/=kept_height_frac, and (cx,cy) re-referenced to the crop origin.
+    side_frac is cropped off EACH of L/R (symmetric -> cx stays centered); top/bottom off T/B."""
+    fx, fy, cx, cy = k_norm
+    wr = 1.0 - 2.0 * side_frac                 # kept width fraction
+    hr = 1.0 - top_frac - bottom_frac          # kept height fraction
+    return (fx / wr, fy / hr, (cx - side_frac) / wr, (cy - top_frac) / hr)
+
+
+def _selfcheck_crop_intrinsics():
+    k = (0.82, 1.02, 0.5, 0.5)
+    assert crop_adjust_intrinsics(k, 0, 0, 0) == k                       # identity crop
+    fx, fy, cx, cy = crop_adjust_intrinsics(k, 0.24, 0.037, 0.222)       # Run B
+    assert abs(cx - 0.5) < 1e-9                                          # symmetric side -> centered
+    assert cy > 0.5 and fx > 0.82 and fy > 1.02                          # narrows FOV, shifts PP down
+    assert abs(fx - 0.82 / 0.52) < 1e-6 and abs(cy - 0.463 / 0.741) < 1e-6
+
+
 # --------------------------------------------------------------------------- data
 class RARPTriplets(Dataset):
     """Consecutive-frame triplets from RARPAtlas clips. Returns raw [0,1] color frames
@@ -592,6 +613,7 @@ def main():
         self_test(args, device); return
 
     if args.smoke:
+        _selfcheck_crop_intrinsics()
         m = build_depth_model(model_shape, device)
         pe = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
         pd = decoders.PoseDecoder(pe.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
@@ -618,7 +640,14 @@ def main():
         return
 
     root = Path(args.data_root)
-    k_norm = tuple(args.intrinsics)
+    # Intrinsics are given relative to the FULL frame; a crop narrows the FOV and shifts the
+    # principal point, so adjust K to the cropped view (else the reprojection geometry is wrong).
+    k_full = tuple(args.intrinsics)
+    k_norm = crop_adjust_intrinsics(k_full, args.side_crop_frac, args.top_crop_frac,
+                                    args.bottom_crop_frac)
+    if k_norm != k_full:
+        print(f"[intrinsics] crop-adjusted {tuple(round(x, 4) for x in k_full)} -> "
+              f"{tuple(round(x, 4) for x in k_norm)}", flush=True)
     ds_kw = dict(mask_overlay=not args.no_overlay_mask, overlay_frames=args.overlay_frames,
                  overlay_std_thresh=args.overlay_std_thresh, side_crop_frac=args.side_crop_frac,
                  top_crop_frac=args.top_crop_frac)
