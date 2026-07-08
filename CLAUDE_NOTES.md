@@ -10,8 +10,12 @@ sessions don't re-derive them. Keep entries one or two lines.
   (`_flag_outliers`), writes `outputs/<run>/suspected_gui.csv` (path,score,thr), logs a top-8 montage
   + counts to wandb, and trains on a `Subset` excluding them. Triplet centers are interior to a clip
   so video cuts don't false-trigger. Gated (default off) → the 3 running crop runs are unaffected.
-  Dataset now also returns `out["path"]`. 4th run `endodac-umc-s1-dropgui` = full-frame baseline
-  (+black-bar 0.15) + --drop-gui, comparable to `umc_s1_scaredsel`.
+  Dataset now also returns `out["path"]`.
+- FINAL crop/GUI experiment = **3 runs, all bars-off (side 0.15) + correct K + overlay-mask ON**
+  (the standalone full-frame-with-bars baseline was dropped as redundant — bars off is the new
+  normal): **A** `umc_s1_cropLR` = bars off only (BASELINE); **B** `umc_s1_cropanat` = bars off +
+  anatomy crop (spatial GUI removal); **dropgui** `umc_s1_dropgui` = A + `--drop-gui` (frame-level
+  GUI removal). B-vs-A isolates cropping, dropgui-vs-A isolates frame-dropping.
 
 ## 2026-07-08 — DEPTH: SCARED-metric checkpoint selection + top-crop + crop A/B experiment
 - `finetune_depth.py` now selects `best.pth` by per-epoch SCARED `abs_rel` (real GT), not the
