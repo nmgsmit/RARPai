@@ -693,24 +693,46 @@ def main():
         qualitative_panel(depth_model, panel, hw, device, args.min_depth, args.max_depth),
         caption="epoch 0 (warm-start, before RARP fine-tune)"), "epoch": 0})
 
+    # Per-epoch SCARED eval drives checkpoint selection: the photometric proxy rewards
+    # texture-copying and can improve while real geometry degrades, so select best.pth by
+    # SCARED abs_rel (real GT, median-scaled). Falls back to val_photo when GT is absent.
+    from eval_scared import run_scared_eval                     # lazy: avoids import cycle
+
+    def eval_scared_now():
+        if args.no_scared:
+            return None
+        return run_scared_eval(depth_model, args.scared_dir, model_shape, device,
+                               args.min_depth, args.max_depth,
+                               side_crop=args.side_crop_frac, bottom_crop=args.bottom_crop_frac)
+
     best = float("inf")
+    sel_name = "val_photo"                                      # updated to scared_abs_rel if GT present
     for ep in range(1, args.epochs + 1):
         tr_logs = do_epoch(tr, train=True)
         va_logs = do_epoch(va, train=False)
         sched.step()
         lr = opt.param_groups[0]["lr"]
-        print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
-              f"val_photo={va_logs['photo']:.4f}  pose_trans={tr_logs['pose_trans']:.4f}",
-              flush=True)
-        panel_img = qualitative_panel(depth_model, panel, hw, device, args.min_depth, args.max_depth)
-        wandb.log({**{f"train/{k}": v for k, v in tr_logs.items()},
-                   **{f"val/{k}": v for k, v in va_logs.items()}, "lr": lr, "epoch": ep,
-                   "qual/panel": wandb.Image(panel_img, caption=f"epoch {ep} [rgb | depth]")})
 
-        if va_logs["photo"] < best:                    # select by Validation photometric proxy
-            best = va_logs["photo"]
+        sres = eval_scared_now()                               # (metrics, ratios, vis) or None
+        logd = {**{f"train/{k}": v for k, v in tr_logs.items()},
+                **{f"val/{k}": v for k, v in va_logs.items()}, "lr": lr, "epoch": ep}
+        if sres is not None:
+            sm, _, _ = sres
+            logd.update({f"scared/{k}": v for k, v in sm.items()})
+            score, sel_name = sm["abs_rel"], "scared_abs_rel"
+        else:
+            score = va_logs["photo"]                           # no GT -> proxy selection
+        print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
+              f"val_photo={va_logs['photo']:.4f}  {sel_name}={score:.4f}  "
+              f"pose_trans={tr_logs['pose_trans']:.4f}", flush=True)
+        panel_img = qualitative_panel(depth_model, panel, hw, device, args.min_depth, args.max_depth)
+        logd["qual/panel"] = wandb.Image(panel_img, caption=f"epoch {ep} [rgb | depth]")
+        wandb.log(logd)
+
+        if score < best:                                       # select by SCARED abs_rel (or proxy)
+            best = score
             torch.save(depth_model.state_dict(), outdir / "best.pth")  # 389-key GUI state_dict
-            wandb.run.summary["best_val_photo"] = best
+            wandb.run.summary[f"best_{sel_name}"] = best
             wandb.run.summary["best_epoch"] = ep
 
     # final report numbers on Test (proxy only -- no depth GT)
@@ -728,7 +750,6 @@ def main():
     # SCARED metric eval on the SELECTED best model (real GT, unlike the photometric proxy above).
     # Uses the same crop as training so a crop-trained model is scored fairly. Skipped if GT absent.
     if not args.no_scared:
-        from eval_scared import run_scared_eval                 # lazy: avoids import cycle
         res = run_scared_eval(depth_model, args.scared_dir, model_shape, device,
                               args.min_depth, args.max_depth,
                               side_crop=args.side_crop_frac, bottom_crop=args.bottom_crop_frac)
@@ -745,7 +766,7 @@ def main():
             wandb.log(logd)
             wandb.run.summary.update({f"scared/{k}": v for k, v in sm.items()})
     wandb.finish()
-    print(f"[done] best val_photo={best:.4f} -> {outdir/'best.pth'}")
+    print(f"[done] best {sel_name}={best:.4f} -> {outdir/'best.pth'}")
 
 
 if __name__ == "__main__":
