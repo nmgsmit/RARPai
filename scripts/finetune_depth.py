@@ -136,7 +136,8 @@ class RARPTriplets(Dataset):
     def __init__(self, split_dir, hw, k_norm, stride=1, bottom_crop_frac=0.0,
                  augment=False, vignette_thresh=0.04, mask_overlay=True,
                  overlay_frames=16, overlay_std_thresh=6.0, overlay_min_valid=0.25,
-                 side_crop_frac=0.0, top_crop_frac=0.0, sample_frac=1.0):
+                 side_crop_frac=0.0, top_crop_frac=0.0, sample_frac=1.0,
+                 motion_top_frac=1.0):
         self.h, self.w = hw
         self.stride = stride
         self.bottom_crop_frac = bottom_crop_frac
@@ -176,8 +177,27 @@ class RARPTriplets(Dataset):
         if sample_frac < 1.0:
             keep = max(1, int(round(len(self.samples) * sample_frac)))
             self.samples = random.Random(1234).sample(self.samples, keep)
+        # MOTION FILTER: UMC clips are mostly a STATIC scope watching moving tools -- zero-parallax
+        # triplets carry no depth signal, and automask then leaves only the (rigid-warp-violating)
+        # tool pixels in the loss, which actively corrupts depth. Keep only the top fraction of
+        # triplets by whole-frame motion. Median |frame diff| is robust to tools (minority of
+        # pixels moving) and high only when the WHOLE frame shifts = real camera motion.
+        if motion_top_frac < 1.0 and len(self.samples) > 1:
+            scores = [self._motion_score(frames, c) for frames, c in self.samples]
+            order = np.argsort(scores)[::-1]                       # most camera motion first
+            keep = max(1, int(round(len(self.samples) * motion_top_frac)))
+            cut = scores[order[keep - 1]]
+            self.samples = [self.samples[i] for i in order[:keep]]
+            q = np.percentile(scores, [25, 50, 75])
+            print(f"[motion] kept {keep}/{len(order)} triplets (cutoff={cut:.2f}; "
+                  f"p25/50/75={q[0]:.2f}/{q[1]:.2f}/{q[2]:.2f})", flush=True)
 
-    def _overlay_mask(self, frames, n, thresh, min_valid):
+    def _motion_score(self, frames, c):
+        """Median per-pixel |diff| between center and +stride frame on a small grayscale thumb
+        (same crop as training). ~0 for a static scope even with tools moving."""
+        a = np.asarray(self._load_raw(frames[c]).convert("L").resize((120, 96)), np.float32)
+        b = np.asarray(self._load_raw(frames[c + self.stride]).convert("L").resize((120, 96)), np.float32)
+        return float(np.median(np.abs(a - b)))
         if len(frames) < 3:
             return None
         idx = np.linspace(0, len(frames) - 1, min(n, len(frames))).astype(int)
@@ -191,13 +211,16 @@ class RARPTriplets(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _load(self, path):
+    def _load_raw(self, path):
         img = Image.open(path).convert("RGB")
         s, b, t = self.side_crop_frac, self.bottom_crop_frac, self.top_crop_frac
         if s > 0 or b > 0 or t > 0:                    # crop baked-in overlay (L/R bars + top/bottom banner)
             W, H = img.size
             img = img.crop((int(W * s), int(H * t), int(W * (1 - s)), int(H * (1 - b))))
-        return img.resize((self.w, self.h), Image.BILINEAR)
+        return img
+
+    def _load(self, path):
+        return self._load_raw(path).resize((self.w, self.h), Image.BILINEAR)
 
     def __getitem__(self, idx):
         frames, c = self.samples[idx]
@@ -246,6 +269,17 @@ def smooth_loss_masked(disp, img, valid):
     gy = gy * torch.exp(-igy) * valid[:, :, :-1, :]
     return gx.sum() / valid[:, :, :, :-1].sum().clamp(min=1) \
         + gy.sum() / valid[:, :, :-1, :].sum().clamp(min=1)
+
+
+def anchor_loss(disp, teacher, aug0, valid, hw):
+    """L1 log-disparity drift from the FROZEN warm-start teacher. The pretrained EndoDAC already
+    knows geometry (tools, depth ordering); near-static UMC clips give the photometric loss almost
+    no parallax signal to preserve it, so anchor the student to the teacher's geometry while the
+    photometric term adapts appearance."""
+    with torch.no_grad():
+        dt = F.interpolate(teacher(aug0)[("disp", 0)], hw, mode="bilinear", align_corners=False)
+    a = (disp.clamp_min(1e-6).log() - dt.clamp_min(1e-6).log()).abs()
+    return (a * valid).sum() / valid.sum().clamp(min=1)
 
 
 def predict_pose(pose_enc, pose_dec, img0, imgf, f):
@@ -310,7 +344,7 @@ def position_loss(R, batch, hw, ssim, pos_smooth_w):
 
 
 def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj, project,
-                      hw, min_depth, max_depth, w):
+                      hw, min_depth, max_depth, w, anchor=None):
     """Stage 1: depth + pose + Transform against the appearance-refined target."""
     aug = {f: batch[("color_aug", f)] for f in (-1, 0, 1)}
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -338,6 +372,11 @@ def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj,
     trn = torch.stack([t[1] for t in tstats]).mean()
     logs = dict(loss=loss.item(), photo=(reproj / 2).item(), smooth=smooth.item(),
                 transform=(transf / 2).item(), pose_rot=rot.item(), pose_trans=trn.item())
+    if anchor is not None:
+        teacher, aw = anchor
+        a = anchor_loss(disp, teacher, aug[0], valid, hw)
+        loss = loss + aw * a
+        logs["anchor"] = a.item(); logs["loss"] = loss.item()
     return loss, logs
 
 
@@ -357,7 +396,7 @@ def _set_stage(R, pose_enc, pose_dec, depth_model, stage):
 
 
 def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                     hw, min_depth, max_depth, smooth_w, automask=True):
+                     hw, min_depth, max_depth, smooth_w, automask=True, anchor=None):
     """Returns (loss, logs). Single-scale Monodepth2 photometric + smoothness."""
     h, w = hw
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -395,6 +434,11 @@ def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, pro
     trans = torch.stack([t[1] for t in tstats]).mean()
     logs = dict(loss=loss.item(), photo=photo.item(), smooth=smooth.item(),
                 pose_rot=rot.item(), pose_trans=trans.item())
+    if anchor is not None:
+        teacher, aw = anchor
+        a = anchor_loss(disp, teacher, aug[0], valid, hw)
+        loss = loss + aw * a
+        logs["anchor"] = a.item(); logs["loss"] = loss.item()
     return loss, logs
 
 
@@ -462,7 +506,7 @@ def qualitative_panel(depth_model, panel, hw, device, min_depth, max_depth):
 
 # ---------------------------------------------------------------------------- train
 def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, opt,
-              device, args, hw, train=True):
+              device, args, hw, train=True, anchor=None):
     # fp32 (no AMP): the pose net + grid_sample geometry overflow under fp16 autocast and
     # send the whole run to NaN -- EndoDAC itself trains in fp32. Grad-clip for good measure.
     depth_model.train(train); pose_enc.train(train); pose_dec.train(train)
@@ -473,7 +517,8 @@ def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, 
         with torch.set_grad_enabled(train):
             loss, logs = photometric_step(
                 batch, depth_model, pose_enc, pose_dec, ssim, backproj, project, hw,
-                args.min_depth, args.max_depth, args.smoothness, automask=not args.no_automask)
+                args.min_depth, args.max_depth, args.smoothness,
+                automask=not args.no_automask, anchor=anchor)
         if train:
             if not torch.isfinite(loss):           # guard: never step on a NaN/Inf batch
                 skipped += 1
@@ -499,7 +544,7 @@ def _clip(opt, max_norm):
 
 
 def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim,
-                     backproj, project, device, args, hw, w, train=True):
+                     backproj, project, device, args, hw, w, train=True, anchor=None):
     """AF-SfMLearner two-stage epoch: optimise Position (opt0), then depth+pose+Transform (opt)."""
     agg = {}; nb = 0; skipped = 0
     for batch in loader:
@@ -512,7 +557,8 @@ def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim
                 opt0.zero_grad(); loss0.backward(); _clip(opt0, args.grad_clip); opt0.step()
             _set_stage(R, pose_enc, pose_dec, depth_model, 1)          # depth/pose/transform
             loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
-                                           backproj, project, hw, args.min_depth, args.max_depth, w)
+                                           backproj, project, hw, args.min_depth, args.max_depth,
+                                           w, anchor=anchor)
             if not torch.isfinite(loss):
                 skipped += 1; continue
             opt.zero_grad(); loss.backward(); _clip(opt, args.grad_clip); opt.step()
@@ -522,7 +568,8 @@ def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim
                 m.eval()
             with torch.no_grad():
                 loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
-                                               backproj, project, hw, args.min_depth, args.max_depth, w)
+                                               backproj, project, hw, args.min_depth, args.max_depth,
+                                               w, anchor=anchor)
         for k, v in logs.items():
             agg[k] = agg.get(k, 0.0) + v
         nb += 1
@@ -611,6 +658,14 @@ def main():
     ap.add_argument("--transform-smoothness", type=float, default=0.01)
     ap.add_argument("--min-depth", type=float, default=0.1)
     ap.add_argument("--max-depth", type=float, default=150.0)
+    ap.add_argument("--motion-top-frac", type=float, default=1.0,
+                    help="keep only this fraction of TRAIN triplets, ranked by whole-frame motion "
+                         "(median |frame diff|). Static-scope triplets have no parallax signal and "
+                         "corrupt depth via the automask; try 0.5 on UMC")
+    ap.add_argument("--anchor-w", type=float, default=0.0,
+                    help="weight of the L1 log-disp anchor to the FROZEN warm-start model; "
+                         "preserves pretrained geometry (tool depth) while adapting appearance. "
+                         "0 disables; try 0.3")
     ap.add_argument("--no-automask", action="store_true")
     ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--panel-size", type=int, default=8, help="fixed qualitative frames")
@@ -684,7 +739,8 @@ def main():
           f"overlay_mask={not args.no_overlay_mask} device={device}", flush=True)
 
     tr_ds = RARPTriplets(root / "Train", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
-                         augment=not args.no_augment, sample_frac=args.sample_frac, **ds_kw)
+                         augment=not args.no_augment, sample_frac=args.sample_frac,
+                         motion_top_frac=args.motion_top_frac, **ds_kw)
     tr = DataLoader(tr_ds, args.batch_size, shuffle=True, num_workers=args.workers,
                     pin_memory=True, drop_last=True)
     va_ds = RARPTriplets(root / "Validation", hw, k_norm, args.frame_stride,
@@ -698,6 +754,13 @@ def main():
 
     depth_model = build_depth_model(model_shape, device)
     _filter_load(depth_model, args.init, "depth")
+    anchor = None
+    if args.anchor_w > 0:                          # frozen warm-start copy = geometry teacher
+        import copy
+        teacher = copy.deepcopy(depth_model).eval()
+        for p in teacher.parameters():
+            p.requires_grad = False
+        anchor = (teacher, args.anchor_w)
     pose_enc = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
     pose_dec = decoders.PoseDecoder(pose_enc.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
     pid = Path(args.pose_init_dir)
@@ -729,9 +792,10 @@ def main():
     def do_epoch(loader, train):
         if args.refine:
             return run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0,
-                                    ssim, backproj, project, device, args, hw, weights, train)
+                                    ssim, backproj, project, device, args, hw, weights, train,
+                                    anchor=anchor)
         return run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                         opt, device, args, hw, train)
+                         opt, device, args, hw, train, anchor=anchor)
 
     import wandb
     wandb.init(project=os.getenv("WANDB_PROJECT", "rarp"),
@@ -746,6 +810,7 @@ def main():
                            automask=not args.no_automask, augment=not args.no_augment,
                            overlay_mask=not args.no_overlay_mask,
                            overlay_std_thresh=args.overlay_std_thresh, refine=args.refine,
+                           motion_top_frac=args.motion_top_frac, anchor_w=args.anchor_w,
                            init=str(args.init), data_root=str(root)))
 
     outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
@@ -836,10 +901,12 @@ def main():
         else:
             sm, _, svis = res
             print("[scared] " + "  ".join(f"{k}={v:.4f}" for k, v in sm.items()), flush=True)
-            logd = {f"scared/{k}": v for k, v in sm.items()}     # LOG (not just summary) so the
-            if svis:                                             # metrics show as scalars, not only
-                logd["scared/overlays"] = wandb.Image(           # in the run-summary table
-                    np.concatenate(svis, axis=0), caption="SCARED [rgb | pred | gt]")
+            # scared_best/* (NOT scared/*): this re-scores the reloaded best.pth, so appending it
+            # to the per-epoch scared/ curve would fake a late "recovery" at step epochs+1.
+            logd = {f"scared_best/{k}": v for k, v in sm.items()}
+            if svis:
+                logd["scared_best/overlays"] = wandb.Image(
+                    np.concatenate(svis, axis=0), caption="SCARED best.pth [rgb | pred | gt]")
             wandb.log(logd)
             wandb.run.summary.update({f"scared/{k}": v for k, v in sm.items()})
     wandb.finish()

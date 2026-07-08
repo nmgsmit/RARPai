@@ -3,6 +3,23 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-07-08 — DEPTH: diagnosed why finetuning DEGRADES (static scope) + motion filter & teacher anchor
+- Nick's qualitative check: epoch 0 best on UMC too; trained models show anatomy structure
+  crisply but WRONG depth (robot arm depth lost, prostate/urethra "come closer") = texture-copy +
+  geometry collapse. Mechanism: UMC scope is mostly STATIC (pose_trans ~0.001) -> no parallax ->
+  photometric loss carries no depth signal; automask then keeps only the MOVING-TOOL pixels in the
+  loss (rigid warp can't explain them) -> gradient actively corrupts tool depth; edge-aware
+  smoothness paints image edges into disp ("structures visible" = bad sign, not progress).
+- Fixes (both flags in finetune_depth.py): `--motion-top-frac F` keeps top-F of TRAIN triplets by
+  whole-frame motion (median |frame diff| on cropped grayscale thumbs — median robust to tools,
+  high only for real camera motion; Monodepth2 static-frame filtering, adapted). `--anchor-w W`
+  adds L1 log-disp anchor to a FROZEN deepcopy of the warm-start model (preserves pretrained
+  geometry while photometric adapts appearance). Val loss includes the anchor term when on.
+- Final best.pth re-score now logs under `scared_best/*` (was appending to `scared/*`, faking a
+  late "recovery" at step epochs+1 — the "epoch 11/12 improves" artifact Nick spotted).
+- Runs: `endodac-umc-botcrop-motion` (motion 0.5, lr 1e-4 = isolates data fix vs completed botcrop)
+  and `endodac-umc-botcrop-anchor` (motion 0.5 + anchor 0.3). Both botcrop geometry, 8 ep, sf 0.1.
+
 ## 2026-07-08 — DEPTH: --drop-gui screens transient GUI/overlay frames out of training
 - `--drop-gui` (+`--gui-z`, default 5): before training, one warm-start no-grad pass computes each
   sample's per-sample photometric error (`scan_gui_frames`). A GUI overlay isn't in the 3D scene →
