@@ -55,20 +55,21 @@ def load_gt(path):
     return obj
 
 
-def _crop(img, g, side, bottom):
-    """Crop side-frac off each of L/R and bottom-frac off the bottom, on BOTH the PIL image and
-    the (H,W) GT array identically (they're pixel-aligned) so a crop-trained model is eval'd fairly."""
-    if side <= 0 and bottom <= 0:
+def _crop(img, g, side, bottom, top=0.0):
+    """Crop side-frac off each of L/R, top-frac off the top, bottom-frac off the bottom, on BOTH
+    the PIL image and the (H,W) GT array identically (pixel-aligned) so a crop-trained model is
+    eval'd fairly."""
+    if side <= 0 and bottom <= 0 and top <= 0:
         return img, g
     W, H = img.size
-    img = img.crop((int(W * side), 0, int(W * (1 - side)), int(H * (1 - bottom))))
+    img = img.crop((int(W * side), int(H * top), int(W * (1 - side)), int(H * (1 - bottom))))
     gh, gw = g.shape[:2]
-    g = g[0:int(gh * (1 - bottom)), int(gw * side):int(gw * (1 - side))]
+    g = g[int(gh * top):int(gh * (1 - bottom)), int(gw * side):int(gw * (1 - side))]
     return img, g
 
 
 def _eval_pairs(model, frames, gt, image_shape, device, min_depth, max_depth,
-                num_vis=8, side_crop=0.0, bottom_crop=0.0):
+                num_vis=8, side_crop=0.0, bottom_crop=0.0, top_crop=0.0):
     """Core loop: per frame -> pred depth, median-scale to GT, compute_errors. Returns
     (mean_errors[7], ratios[N], vis[list of [rgb|pred|gt] uint8 rows])."""
     mh, mw = round14(image_shape[0]), round14(image_shape[1])
@@ -78,7 +79,7 @@ def _eval_pairs(model, frames, gt, image_shape, device, min_depth, max_depth,
     for fp, g in zip(frames, gt):
         g = np.asarray(g, np.float32)
         img = Image.open(fp).convert("RGB")
-        img, g = _crop(img, g, side_crop, bottom_crop)
+        img, g = _crop(img, g, side_crop, bottom_crop, top_crop)
         feed = to_tensor(img.resize((mw, mh), Image.BILINEAR)).unsqueeze(0).to(device)
         with torch.no_grad():
             disp = model(feed)[("disp", 0)]
@@ -106,7 +107,7 @@ def _eval_pairs(model, frames, gt, image_shape, device, min_depth, max_depth,
 
 
 def run_scared_eval(model, scared_dir, image_shape, device, min_depth=0.1, max_depth=150.0,
-                    num_vis=8, side_crop=0.0, bottom_crop=0.0):
+                    num_vis=8, side_crop=0.0, bottom_crop=0.0, top_crop=0.0):
     """Convenience wrapper for the fixed exporter layout <dir>/{frames/, gt_depths.npz}.
     Returns (metrics dict incl scale-ratio, ratios, vis) or None if GT not present."""
     scared_dir = Path(scared_dir)
@@ -118,8 +119,8 @@ def run_scared_eval(model, scared_dir, image_shape, device, min_depth=0.1, max_d
     if len(frames) != len(gt):
         print(f"[scared] pairing mismatch {len(frames)} frames vs {len(gt)} GT -- skipping")
         return None
-    mean_errors, ratios, vis = _eval_pairs(model, frames, gt, image_shape, device,
-                                           min_depth, max_depth, num_vis, side_crop, bottom_crop)
+    mean_errors, ratios, vis = _eval_pairs(model, frames, gt, image_shape, device, min_depth,
+                                           max_depth, num_vis, side_crop, bottom_crop, top_crop)
     metrics = dict(zip(METRIC_NAMES, mean_errors.tolist()))
     metrics["scale_ratio_median"] = float(np.median(ratios))
     metrics["scale_ratio_std"] = float(np.std(ratios))
@@ -145,6 +146,7 @@ def main():
     ap.add_argument("--side-crop-frac", type=float, default=0.0,
                     help="crop this frac off EACH of L/R (match a crop-trained model, e.g. depth_crop)")
     ap.add_argument("--bottom-crop-frac", type=float, default=0.0, help="crop this frac off the bottom")
+    ap.add_argument("--top-crop-frac", type=float, default=0.0, help="crop this frac off the top")
     ap.add_argument("--min-depth", type=float, default=0.1)   # disp_to_depth range (scale absorbed
     ap.add_argument("--max-depth", type=float, default=150.0) #   by median scaling; kept for parity)
     ap.add_argument("--run-name", default="endodac-scared")
@@ -177,7 +179,8 @@ def main():
 
     mean_errors, ratios, vis = _eval_pairs(model, frames, gt, args.image_shape, device,
                                            args.min_depth, args.max_depth, args.num_vis,
-                                           args.side_crop_frac, args.bottom_crop_frac)
+                                           args.side_crop_frac, args.bottom_crop_frac,
+                                           args.top_crop_frac)
     metrics = dict(zip(METRIC_NAMES, mean_errors.tolist()))
     print("\n  " + " ".join(f"{n:>9}" for n in METRIC_NAMES))
     print("  " + " ".join(f"{v:9.4f}" for v in mean_errors))

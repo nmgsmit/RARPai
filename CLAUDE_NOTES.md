@@ -3,6 +3,18 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-07-08 — DEPTH: SCARED-metric checkpoint selection + top-crop + crop A/B experiment
+- `finetune_depth.py` now selects `best.pth` by per-epoch SCARED `abs_rel` (real GT), not the
+  `val_photo` proxy (falls back to val_photo when no SCARED GT). Photometric proxy rewards
+  texture-copying and can improve while geometry degrades.
+- Added `--top-crop-frac` (threaded through `eval_scared._crop`/`_eval_pairs`/`run_scared_eval`
+  too, so train & SCARED eval crop identically). UMCdissection frames are 1920x1080, pillarboxed
+  with ~288px BLACK bars L/R (top/bottom ~3px). Content ≈1344x1080 ≈ 4:5 already.
+- Crop A/B experiment (both stride1, epochs10, sample-frac0.1, refine on) vs full-image baseline
+  `umc_s1_scaredsel`: A = `--side-crop-frac 0.15` (black bars off → ~4:5). B = anatomy crop
+  `--side 0.24 --top 0.037 --bottom 0.222` → 999x801 (~4:5, 40px top / 240px bottom kills GUI
+  banner). Tests whether crop-to-anatomy beats full frame + temporal overlay mask.
+
 ## 2026-07-07 — DEPTH: switched to UMCdissectionimg + stride 1 (wide strides degenerate here)
 - Depth training data switched RARPAtlas -> `../data/UMCdissectionvid/UMCdissectionimg` (real target
   domain, 71 videos/46k frames; Nick moved HD snapshots into the vid folder, HD->img). `--sample-frac`
