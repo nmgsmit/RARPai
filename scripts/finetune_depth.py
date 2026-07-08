@@ -40,7 +40,7 @@ import torch
 import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 
 load_dotenv()
@@ -213,6 +213,7 @@ class RARPTriplets(Dataset):
             valid = valid * ov
         out["valid"] = valid
         out["K"], out["inv_K"] = self.K, self.inv_K
+        out["path"] = str(frames[c])          # center-frame path (for --drop-gui logging)
         return out
 
 
@@ -450,6 +451,54 @@ def qualitative_panel(depth_model, panel, hw, device, min_depth, max_depth):
     return np.concatenate(rows, axis=0)
 
 
+# ------------------------------------------------------------------- GUI-frame screen
+@torch.no_grad()
+def scan_gui_frames(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project,
+                    device, min_depth, max_depth, hw, z):
+    """One warm-start no-grad pass -> per-sample photometric error. A GUI/overlay is not part of
+    the 3D scene, so it can't be reprojected from the neighbour frames -> a large, persistent
+    photometric outlier on exactly the frames that carry it (the "metric jump"). Flags samples
+    whose error exceeds median + z*1.4826*MAD (robust, so a handful of outliers don't move the
+    bar). Triplet centers are interior to a clip, so video start/end cuts don't spike this.
+    Returns (flagged[(path, score)] sorted worst-first, stats dict)."""
+    depth_model.eval(); pose_enc.eval(); pose_dec.eval()
+    paths, scores = [], []
+    for batch in loader:
+        bt = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+              for k, v in batch.items()}
+        color = {f: bt[("color", f)] for f in (-1, 0, 1)}
+        aug = {f: bt[("color_aug", f)] for f in (-1, 0, 1)}
+        K, inv_K, valid = bt["K"], bt["inv_K"], bt["valid"]
+        disp = F.interpolate(depth_model(aug[0])[("disp", 0)], hw, mode="bilinear", align_corners=False)
+        _, depth = disp_to_depth(disp, min_depth, max_depth)
+        reproj = []
+        for f in (-1, 1):
+            T, _, _ = predict_pose(pose_enc, pose_dec, aug[0], aug[f], f)
+            pix = project(backproj(depth, inv_K), K, T)
+            warped = F.grid_sample(color[f], pix, padding_mode="border", align_corners=True)
+            reproj.append(reprojection(warped, color[0], ssim))
+        combined = torch.cat(reproj, 1).min(1, True)[0]              # best-of-neighbours, per pixel
+        ps = (combined * valid).flatten(1).sum(1) / valid.flatten(1).sum(1).clamp(min=1)
+        scores.extend(ps.cpu().tolist()); paths.extend(bt["path"])
+    return _flag_outliers(paths, scores, z)
+
+
+def _flag_outliers(paths, scores, z):
+    """Robust upper-tail outliers: flag scores above median + z*1.4826*MAD. Returns
+    (flagged[(path, score)] worst-first, stats)."""
+    s = np.array(scores)
+    med = float(np.median(s)); mad = float(np.median(np.abs(s - med)))
+    thr = med + z * 1.4826 * mad
+    flagged = sorted(((p, sc) for p, sc in zip(paths, scores) if sc > thr), key=lambda t: -t[1])
+    return flagged, dict(median=med, mad=mad, thr=float(thr), n=len(scores), n_flagged=len(flagged))
+
+
+def _selfcheck_flag_outliers():
+    flagged, st = _flag_outliers([str(i) for i in range(102)], [1.0] * 100 + [9.0, 10.0], 5.0)
+    assert st["n_flagged"] == 2 and flagged[0][0] == "101"          # 2 outliers, worst-first
+    assert _flag_outliers([str(i) for i in range(50)], [1.0] * 50, 5.0)[1]["n_flagged"] == 0
+
+
 # ---------------------------------------------------------------------------- train
 def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, opt,
               device, args, hw, train=True):
@@ -601,6 +650,12 @@ def main():
     ap.add_argument("--transform-smoothness", type=float, default=0.01)
     ap.add_argument("--min-depth", type=float, default=0.1)
     ap.add_argument("--max-depth", type=float, default=150.0)
+    ap.add_argument("--drop-gui", action="store_true",
+                    help="before training, flag frames whose warm-start per-sample photometric error "
+                         "is a robust outlier (a transient GUI/overlay can't be reprojected), skip them "
+                         "in training, and write outputs/<run>/suspected_gui.csv for inspection")
+    ap.add_argument("--gui-z", type=float, default=5.0,
+                    help="robust z: flag frames above median + z*1.4826*MAD of per-sample photo error")
     ap.add_argument("--no-automask", action="store_true")
     ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--panel-size", type=int, default=8, help="fixed qualitative frames")
@@ -629,7 +684,7 @@ def main():
         self_test(args, device); return
 
     if args.smoke:
-        _selfcheck_crop_intrinsics()
+        _selfcheck_crop_intrinsics(); _selfcheck_flag_outliers()
         m = build_depth_model(model_shape, device)
         pe = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
         pd = decoders.PoseDecoder(pe.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
@@ -673,10 +728,10 @@ def main():
           f"stride={args.frame_stride} refine={args.refine} "
           f"overlay_mask={not args.no_overlay_mask} device={device}", flush=True)
 
-    tr = DataLoader(
-        RARPTriplets(root / "Train", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
-                     augment=not args.no_augment, sample_frac=args.sample_frac, **ds_kw),
-        args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=True)
+    tr_ds = RARPTriplets(root / "Train", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
+                         augment=not args.no_augment, sample_frac=args.sample_frac, **ds_kw)
+    tr = DataLoader(tr_ds, args.batch_size, shuffle=True, num_workers=args.workers,
+                    pin_memory=True, drop_last=True)
     va_ds = RARPTriplets(root / "Validation", hw, k_norm, args.frame_stride,
                          args.bottom_crop_frac, **ds_kw)
     va = DataLoader(va_ds, args.batch_size, shuffle=False, num_workers=args.workers,
@@ -739,6 +794,33 @@ def main():
                            init=str(args.init), data_root=str(root)))
 
     outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
+
+    # --drop-gui: screen out suspected-GUI frames at warm-start (photometric outliers) before
+    # training, and dump the list for inspection. Deterministic (augment off during the scan).
+    if args.drop_gui:
+        was_aug = tr_ds.augment; tr_ds.augment = False
+        scan_loader = DataLoader(tr_ds, args.batch_size, shuffle=False,
+                                 num_workers=args.workers, drop_last=True)
+        flagged, st = scan_gui_frames(scan_loader, depth_model, pose_enc, pose_dec, ssim,
+                                      backproj, project, device, args.min_depth, args.max_depth,
+                                      hw, args.gui_z)
+        tr_ds.augment = was_aug
+        flag_set = {p for p, _ in flagged}
+        (outdir / "suspected_gui.csv").write_text(
+            "path,score,threshold\n" + "".join(f"{p},{sc:.6f},{st['thr']:.6f}\n" for p, sc in flagged))
+        kept = [i for i, (frames, c) in enumerate(tr_ds.samples) if str(frames[c]) not in flag_set]
+        print(f"[drop-gui] flagged {st['n_flagged']}/{st['n']} samples (thr={st['thr']:.4f} "
+              f"med={st['median']:.4f} mad={st['mad']:.4f}) -> {outdir/'suspected_gui.csv'}; "
+              f"training on {len(kept)}", flush=True)
+        if flagged:                                              # montage of worst offenders for wandb
+            thumbs = [np.asarray(Image.open(p).convert("RGB").resize((320, 256)), np.uint8)
+                      for p, _ in flagged[:8]]
+            wandb.log({"drop_gui/flagged": wandb.Image(
+                np.concatenate(thumbs, axis=1),
+                caption=f"{st['n_flagged']} suspected-GUI frames (top {len(thumbs)} by score)")})
+        wandb.run.summary.update({f"drop_gui/{k}": v for k, v in st.items()})
+        tr = DataLoader(Subset(tr_ds, kept), args.batch_size, shuffle=True,
+                        num_workers=args.workers, pin_memory=True, drop_last=True)
 
     # before-training qualitative panel
     wandb.log({"qual/panel": wandb.Image(

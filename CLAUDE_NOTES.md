@@ -3,6 +3,16 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-07-08 — DEPTH: --drop-gui screens transient GUI/overlay frames out of training
+- `--drop-gui` (+`--gui-z`, default 5): before training, one warm-start no-grad pass computes each
+  sample's per-sample photometric error (`scan_gui_frames`). A GUI overlay isn't in the 3D scene →
+  can't be reprojected from neighbours → large robust outlier. Flags samples > median+z·1.4826·MAD
+  (`_flag_outliers`), writes `outputs/<run>/suspected_gui.csv` (path,score,thr), logs a top-8 montage
+  + counts to wandb, and trains on a `Subset` excluding them. Triplet centers are interior to a clip
+  so video cuts don't false-trigger. Gated (default off) → the 3 running crop runs are unaffected.
+  Dataset now also returns `out["path"]`. 4th run `endodac-umc-s1-dropgui` = full-frame baseline
+  (+black-bar 0.15) + --drop-gui, comparable to `umc_s1_scaredsel`.
+
 ## 2026-07-08 — DEPTH: SCARED-metric checkpoint selection + top-crop + crop A/B experiment
 - `finetune_depth.py` now selects `best.pth` by per-epoch SCARED `abs_rel` (real GT), not the
   `val_photo` proxy (falls back to val_photo when no SCARED GT). Photometric proxy rewards
