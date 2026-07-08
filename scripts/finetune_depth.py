@@ -85,25 +85,36 @@ def round32(x):
     return max(32, int(round(x / 32)) * 32)
 
 
-def crop_adjust_intrinsics(k_norm, side_frac, top_frac, bottom_frac):
-    """NORMALISED intrinsics (relative to the FULL frame) -> intrinsics correct for the cropped
-    view. Cropping keeps the focal length in pixels but shrinks the frame used to normalise it
-    (narrower FOV) and shifts the principal point. Purely fractional, so no native size needed:
-    fx/=kept_width_frac, fy/=kept_height_frac, and (cx,cy) re-referenced to the crop origin.
-    side_frac is cropped off EACH of L/R (symmetric -> cx stays centered); top/bottom off T/B."""
+def crop_adjust_intrinsics(k_norm, side_frac, top_frac, bottom_frac, bar_side=0.0):
+    """Return NORMALISED intrinsics correct for the cropped+fed view.
+
+    k_norm is normalised relative to the CALIBRATED CONTENT region -- e.g. the SCARED 4:5 view.
+    In pillarboxed video that content sits inside the raw frame minus black bars (`bar_side` off
+    EACH of L/R; SCARED's 0.82/1.02 is a 4:5 calib, so bar_side=0.15 on a 1920x1080 UMC frame).
+    The video fed is the RAW frame cropped by (side/top/bottom)_frac. Cropping keeps the focal
+    length in pixels (narrower FOV) and shifts the principal point. All fractional -> no pixel
+    size needed. bar_side=0 recovers the plain full-frame-relative behaviour.
+    """
     fx, fy, cx, cy = k_norm
-    wr = 1.0 - 2.0 * side_frac                 # kept width fraction
-    hr = 1.0 - top_frac - bottom_frac          # kept height fraction
-    return (fx / wr, fy / hr, (cx - side_frac) / wr, (cy - top_frac) / hr)
+    wc = 1.0 - 2.0 * bar_side                       # content width as a fraction of the raw frame
+    Fx, Fy = fx * wc, fy                            # focal, re-normalised to the RAW frame
+    Px, Py = bar_side + cx * wc, cy                 # principal point, raw-frame-normalised
+    wcrop = 1.0 - 2.0 * side_frac                   # kept width fraction of the raw frame
+    hcrop = 1.0 - top_frac - bottom_frac            # kept height fraction
+    return (Fx / wcrop, Fy / hcrop, (Px - side_frac) / wcrop, (Py - top_frac) / hcrop)
 
 
 def _selfcheck_crop_intrinsics():
     k = (0.82, 1.02, 0.5, 0.5)
-    assert crop_adjust_intrinsics(k, 0, 0, 0) == k                       # identity crop
-    fx, fy, cx, cy = crop_adjust_intrinsics(k, 0.24, 0.037, 0.222)       # Run B
-    assert abs(cx - 0.5) < 1e-9                                          # symmetric side -> centered
-    assert cy > 0.5 and fx > 0.82 and fy > 1.02                          # narrows FOV, shifts PP down
-    assert abs(fx - 0.82 / 0.52) < 1e-6 and abs(cy - 0.463 / 0.741) < 1e-6
+    assert crop_adjust_intrinsics(k, 0, 0, 0) == k                       # identity, no bars
+    # UMC 4:5 calib inside a 1920x1080 (bar_side=0.15) frame:
+    base = crop_adjust_intrinsics(k, 0, 0, 0, bar_side=0.15)             # full frame fed
+    assert abs(base[0] - 0.82 * 0.70) < 1e-6 and abs(base[1] - 1.02) < 1e-6  # fx shrinks to ~0.574
+    runA = crop_adjust_intrinsics(k, 0.15, 0, 0, bar_side=0.15)          # crop off exactly the bars
+    assert all(abs(a - b) < 1e-6 for a, b in zip(runA, k))              # -> recovers the 4:5 base K
+    fx, fy, cx, cy = crop_adjust_intrinsics(k, 0.24, 0.037, 0.222, bar_side=0.15)  # Run B
+    assert abs(cx - 0.5) < 1e-9 and cy > 0.5                            # symmetric side; PP shifts down
+    assert abs(fx - 0.574 / 0.52) < 1e-3 and abs(fy - 1.02 / 0.741) < 1e-3
 
 
 # --------------------------------------------------------------------------- data
@@ -566,6 +577,11 @@ def main():
                     help="crop this fraction off EACH of left & right (L/R console bars)")
     ap.add_argument("--top-crop-frac", type=float, default=0.0,
                     help="crop this fraction off the top (GUI header) before resize")
+    ap.add_argument("--black-bar-frac", type=float, default=0.0,
+                    help="black pillarbox bar width as a fraction of EACH of L/R of the raw frame. "
+                         "The base --intrinsics are calibrated for the CONTENT inside the bars "
+                         "(SCARED's 0.82/1.02 is 4:5 -> use 0.15 on 1920x1080 UMC video). Lets the "
+                         "reprojection K stay correct whether or not a run crops the bars off.")
     ap.add_argument("--no-overlay-mask", action="store_true",
                     help="disable per-clip temporal static-overlay (console GUI) masking")
     ap.add_argument("--overlay-frames", type=int, default=16,
@@ -640,14 +656,16 @@ def main():
         return
 
     root = Path(args.data_root)
-    # Intrinsics are given relative to the FULL frame; a crop narrows the FOV and shifts the
-    # principal point, so adjust K to the cropped view (else the reprojection geometry is wrong).
+    # Base --intrinsics are calibrated for the 4:5 CONTENT region (SCARED). A crop narrows the FOV
+    # and shifts the principal point, and pillarbox black bars mean the content is only part of the
+    # raw frame -- adjust K for both so the reprojection geometry matches the pixels actually fed.
     k_full = tuple(args.intrinsics)
     k_norm = crop_adjust_intrinsics(k_full, args.side_crop_frac, args.top_crop_frac,
-                                    args.bottom_crop_frac)
+                                    args.bottom_crop_frac, bar_side=args.black_bar_frac)
     if k_norm != k_full:
-        print(f"[intrinsics] crop-adjusted {tuple(round(x, 4) for x in k_full)} -> "
-              f"{tuple(round(x, 4) for x in k_norm)}", flush=True)
+        print(f"[intrinsics] content-K {tuple(round(x, 4) for x in k_full)} "
+              f"(bar_side={args.black_bar_frac}) -> fed-K {tuple(round(x, 4) for x in k_norm)}",
+              flush=True)
     ds_kw = dict(mask_overlay=not args.no_overlay_mask, overlay_frames=args.overlay_frames,
                  overlay_std_thresh=args.overlay_std_thresh, side_crop_frac=args.side_crop_frac,
                  top_crop_frac=args.top_crop_frac)
