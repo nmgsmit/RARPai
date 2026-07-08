@@ -16,6 +16,12 @@ sessions don't re-derive them. Keep entries one or two lines.
   normal): **A** `umc_s1_cropLR` = bars off only (BASELINE); **B** `umc_s1_cropanat` = bars off +
   anatomy crop (spatial GUI removal); **dropgui** `umc_s1_dropgui` = A + `--drop-gui` (frame-level
   GUI removal). B-vs-A isolates cropping, dropgui-vs-A isolates frame-dropping.
+- 4th run `umc_s1_dropgui_botcrop` (`--side 0.1712 --bottom 0.0648 --drop-gui`): crops the
+  ALWAYS-present bottom-70px GUI banner AND frame-drops novel transient GUIs (belt+suspenders).
+  Bottom-70 makes the region wider than 4:5, so sides trim a touch more to restore exact 4:5
+  (1263x1010) → isotropic resize to the 4:5 feed, no anatomy squash. Auto fed-K (0.873,1.091,0.5,
+  0.535); cy shifts up from the bottom crop. (4:5 crop isn't strictly required — per-axis K also
+  corrects an anisotropic resize — but keeping ~4:5 avoids feeding squashed anatomy.)
 
 ## 2026-07-08 — DEPTH: SCARED-metric checkpoint selection + top-crop + crop A/B experiment
 - `finetune_depth.py` now selects `best.pth` by per-epoch SCARED `abs_rel` (real GT), not the
