@@ -198,6 +198,8 @@ class RARPTriplets(Dataset):
         a = np.asarray(self._load_raw(frames[c]).convert("L").resize((120, 96)), np.float32)
         b = np.asarray(self._load_raw(frames[c + self.stride]).convert("L").resize((120, 96)), np.float32)
         return float(np.median(np.abs(a - b)))
+
+    def _overlay_mask(self, frames, n, thresh, min_valid):
         if len(frames) < 3:
             return None
         idx = np.linspace(0, len(frames) - 1, min(n, len(frames))).astype(int)
