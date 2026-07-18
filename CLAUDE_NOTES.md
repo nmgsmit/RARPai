@@ -3,6 +3,25 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-07-18 — GUI template matching: `data/templates/` for overlay detection
+- `gui_mask.py` loads GUI templates via `load_templates(template_dir)` → all `.png` files in a dir,
+  sorted by filename. Put your cropped template images in `data/templates/` (e.g., instrument icons,
+  GUI elements from `gui_lines.ipynb`). Usage: `mask = gui_mask(frame, templates=load_templates("data/templates"))`.
+  Fixed geometry (hardcoded da Vinci Xi bottom bar + tab) runs first; template matching in a band
+  above it catches transient widgets (thresholdable via `thresh`, `search_band`). `roi_bottom=N`
+  crops to the bottom N px before matching (~1.2x faster).
+- TRIED AND DROPPED: colour-based detection of the #F5C83A hazard bar (gold/black striped L that
+  hugs the LEFT/RIGHT edge of the CONTENT region, not the frame — 1920x1080 frames are pillarboxed
+  to ~1344 wide). Colour alone is useless: fatty tissue is the same gold (142k px/frame). Adding a
+  content-edge restriction + a "contains black stripes" test did separate it (bars 0.10-0.15 dark
+  frac vs tissue <=0.044 at dark_level 45), but a bbox-fill test proved crop-dependent and the whole
+  thing stayed heuristic. Reverted to plain template matching per Nick. If revisited: recognise the
+  "1"/"2" endpoint glyphs (fixed ~15x20 cream-on-dark labels, matched at 0.92-1.00, and always at
+  the content edge x=308) and synthesise the L between them — far more robust than colour.
+- CAUTION: the GUI_segmentation overlay run OVERWROTE the source frames in place (green on GUI), so
+  those originals are gone. `SUL_cut` / `Stump_ruler` are still clean. Write overlays to a separate
+  output dir in future.
+
 ## 2026-07-08 — DEPTH: diagnosed why finetuning DEGRADES (static scope) + motion filter & teacher anchor
 - Nick's qualitative check: epoch 0 best on UMC too; trained models show anatomy structure
   crisply but WRONG depth (robot arm depth lost, prostate/urethra "come closer") = texture-copy +
@@ -186,3 +205,49 @@ sessions don't re-derive them. Keep entries one or two lines.
 - GPU training partition is `gpu_h100 --gpus-per-node=1`; `genoa` is CPU-only (overlays/viz).
 - RESOLVED: encoder lives in `../backbones` (Nick confirmed `../checkpoints` was a slip); trained ckpts -> `outputs/`.
 - Jobs pass `"$@"` through to the python script, so hyperparams are overridable at submit time.
+
+## 2026-07-10 — Learned camera intrinsics (EndoDAC IntrinsicsHead)
+- Until now K was FIXED for a whole run: built once in `RARPTriplets.__init__` from `--intrinsics`
+  (after `crop_adjust_intrinsics`) and handed back unchanged with every batch. Never a parameter.
+- EndoDAC's `IntrinsicsHead` was vendored (`third_party/endodac/models/decoders/intrinsics_decoder.py`)
+  but never imported. It's now wired in and **on by default**; `--no-learn-intrinsics` restores the
+  old fixed-K behaviour. K is predicted per frame-pair from the pose-encoder bottleneck.
+- `build_khead()` bias-initialises the head so it *starts* at the crop-adjusted `k_norm`. The vendored
+  convs are `bias=False` and the stock init lands at fx~1.19*W (vs da Vinci ~0.82) — miles from where
+  the pretrained depth weights expect to be. We swap in biased convs, zero the weights, set the bias to
+  the inverse of the head's own parameterisation (`f=(softplus(z)+0.5)*size`, `c=(z+0.5)*size`). Weights
+  still get gradients, so K is free to move off the calibrated start.
+- Consequence of that parameterisation: normalised fx,fy are FLOORED at 0.5. `build_khead` asserts.
+  A very aggressive side-crop can push fx below that -> assert fires, use `--no-learn-intrinsics`.
+- No warm-start for the head: a released checkpoint's K belongs to its camera+crop, and its bias-free
+  convs would half-load over our init. Saved to `outputs/<run>/intrinsics_head.pth` alongside `best.pth`.
+- Logged to wandb as `train/k_fx`,`k_fy`,`k_cx`,`k_cy` (normalised). WATCH THESE: focal length is only
+  identifiable from camera ROTATION (the rotational flow field depends on K but not on depth). Pure
+  translation leaves fx and the global depth scale degenerate. Near-static UMC clips -> expect drift.
+- SCARED eval is unaffected (depth model only, median-scaled), so learned K shapes the training signal,
+  not the metric. A wrong fx hides under median scaling; a wrong fx/fy ratio or principal point does not.
+
+## 2026-07-18 — GUI mask: paired markers, connector bars, video masking
+- `load_templates()` now returns `{stem: image}` instead of a list — the *names* matter.
+  `gui_mask()` still accepts a plain list; only the dict form enables the connector logic.
+- `temp04`/`temp5`/`temp7` are the small end-caps of the hazard-stripe bars. When exactly two of
+  one name survive filtering, a `CONNECT_WIDTH+2*CONNECT_PAD` (=21 px) bar is drawn between them,
+  or an **L** if they are off-axis by more than `CONNECT_ALIGN_TOL`. `_elbow()` puts the corner at
+  whichever candidate is furthest from frame centre — the bar wraps the nearest screen corner, so a
+  fixed horizontal-then-vertical rule bends the wrong way in half the corners.
+- False-positive filtering, in order: cluster dedupe -> on an inset line -> not already inside the
+  fixed boxes -> has a partner within one bar length (`PAIR_MAX_DIST`, path distance so Ls count).
+  On the sample frame that takes `temp5` from 18 raw matches to the 2 real ones.
+- `EDGE_INSETS = (24, 39, 79)` are measured from `_content_box()`, i.e. **content-relative**, not
+  frame-relative — the footage is pillarboxed (~287 px of black on the left at 1920 wide) and
+  frame-relative offsets would be wrong on any differently cropped clip. Same class of bug as the
+  SCARED crop. The insets come from ONE annotated frame; widen them if a clip masks nothing.
+- Per-template `THRESH_OVERRIDE` (`temp04` 0.6, `temp5` 0.7, `temp7` 0.8): the big box templates
+  (`temp4`/`temp05`, 334 px wide) never score above ~0.45 and currently never fire — likely need
+  re-cropping. `temp5` at 0.5 explodes to 31 tissue matches, hence the per-template values.
+- `scripts/mask_video.py` + `jobs/mask_video.sh` (genoa, CPU): blacks out the GUI over a video,
+  frames masked in a `multiprocessing.Pool`, decode/write sequential. 1587 frames @1080p =
+  **58 s on 32 cores** vs ~19 min single-process. Note a single genoa core is SLOWER than a laptop
+  core — the win is entirely the pool, so always pass `--cpus-per-task`.
+- `PAIR_MAX_DIST`, `EDGE_INSETS` and `MARKER_PAD` are absolute pixels at 1920x1080; they do not
+  scale with frame size the way `fixed_gui_mask()` does.
