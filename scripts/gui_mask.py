@@ -52,7 +52,14 @@ CONNECT_TEMPLATES = ("temp04", "temp5", "temp7")   # these come in pairs joined 
 CONNECT_WIDTH = 15                       # px thickness of the drawn connector
 CONNECT_PAD = 3                          # px extra on each side — 15 alone leaves the bar edges showing
 CONNECT_ALIGN_TOL = 20                   # px: closer than this on an axis = straight bar, else L
-THRESH_OVERRIDE = {"temp04": 0.6, "temp5": 0.7, "temp7": 0.8}   # these never reach the default
+# Measured on RARP_voorbeeld_A: real paired cue markers score 0.705-0.828, isolated
+# false positives 0.703-0.727 -- the bands overlap, so no threshold separates the
+# two on score alone. These are tuned for recall, on the assumption the caller
+# rejects the leftovers some other way.
+# NOTE: cut_cue_clips no longer relies on these. It validates a marker pair by
+# counting bar segments between the markers (see cue_span there), which does
+# separate cues from popup lettering. These values still drive mask_video.py.
+THRESH_OVERRIDE = {"temp04": 0.60, "temp5": 0.65, "temp7": 0.75}
 # The connector markers only ever sit on a few lines inset from the *content* edge (measured:
 # 24 px from the left, 39 and 79 px from the bottom). Anything off those lines is a false match.
 EDGE_INSETS = (24, 39, 79)
@@ -127,7 +134,7 @@ def _connect(m, p0, p1):
     m |= line.astype(bool)
 
 
-def gui_mask(bgr, templates=None, thresh=0.7, search_band=None, scale=True, roi_bottom=None):
+def gui_mask(bgr, templates=None, thresh=0.70, search_band=None, scale=True, roi_bottom=None):
     """Detect GUI: fixed geometry + template matching in a band above the overlay.
 
     Args:
@@ -184,6 +191,10 @@ def gui_mask(bgr, templates=None, thresh=0.7, search_band=None, scale=True, roi_
                 hits = [(x, y) for x, y in hits
                         if not fixed[min(band_top + y + th // 2, H - 1), min(x + tw // 2, W - 1)]]
                 hits = _paired(hits)
+                # A bar has exactly two ends. Extra hits used to skip _connect below
+                # (it needs len == 2), leaving the bar itself unmasked -- so rank by
+                # match score and keep the two most confident.
+                hits = sorted(hits, key=lambda h: -res[h[1], h[0]])[:2]
             pad = MARKER_PAD if name in CONNECT_TEMPLATES else 0
             for x, y in hits:
                 # Translate match coords back to full-frame space

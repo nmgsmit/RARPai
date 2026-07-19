@@ -4,6 +4,11 @@ data/processed/
 *.mp4
 *.avi
 
+# Derived clip output and sweep caches (regenerate with scripts/cut_cue_clips.py)
+data/clips/
+data/clips_*/
+data/sweep_cache/
+
 # Models & checkpoints
 models/checkpoints/
 *.pth
