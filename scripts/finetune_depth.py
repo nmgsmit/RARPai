@@ -37,6 +37,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from dotenv import load_dotenv
 from PIL import Image
@@ -287,9 +288,62 @@ def anchor_loss(disp, teacher, aug0, valid, hw):
 def predict_pose(pose_enc, pose_dec, img0, imgf, f):
     """Relative camera transform frame0 -> frame f (Monodepth2 convention)."""
     pair = [imgf, img0] if f < 0 else [img0, imgf]
-    axisangle, translation, _ = pose_dec([pose_enc(torch.cat(pair, 1))])
+    feats = pose_enc(torch.cat(pair, 1))
+    axisangle, translation, _ = pose_dec([feats])
     T = transformation_from_parameters(axisangle[:, 0], translation[:, 0], invert=(f < 0))
-    return T, axisangle[:, 0], translation[:, 0]
+    return T, axisangle[:, 0], translation[:, 0], feats
+
+
+def predict_K(khead, feats, hw):
+    """EndoDAC's self-supervised intrinsics: predict K (pixels, 4x4) from the pose-encoder
+    bottleneck instead of using the calibrated --intrinsics. Only constrained by the
+    photometric loss, so it needs real parallax to be identifiable."""
+    K = khead(feats[-1], hw[1], hw[0])
+    return K, torch.inverse(K)
+
+
+def _k_logs(K, hw):
+    h, w = hw
+    K = K.detach().mean(0)
+    return dict(k_fx=(K[0, 0] / w).item(), k_fy=(K[1, 1] / h).item(),
+                k_cx=(K[0, 2] / w).item(), k_cy=(K[1, 2] / h).item())
+
+
+def build_khead(pose_enc, k_norm, device):
+    """EndoDAC's IntrinsicsHead, bias-initialised to predict the calibrated (crop-adjusted) K.
+
+    Stock init sits at fx~1.19*W, far from the da Vinci ~0.82 the pretrained depth weights were
+    trained under. The vendored convs are bias-free, so swap in biased ones and zero the weights:
+    output starts constant at k_norm, but grads still reach the weights, so K is free to move.
+    head parameterisation: f = (softplus(z) + 0.5) * size, c = (z + 0.5) * size."""
+    khead = decoders.IntrinsicsHead(pose_enc.num_ch_enc).to(device)
+    fx, fy, cx, cy = k_norm
+    assert fx > 0.5 and fy > 0.5, (
+        f"IntrinsicsHead floors the normalised focal at 0.5 (softplus+0.5); got fx={fx}, fy={fy}. "
+        "A crop this aggressive can't be represented -- widen it or pass --no-learn-intrinsics.")
+    inv_softplus = lambda y: float(np.log(np.expm1(y)))
+    for name, z in [("focal_length_conv", [inv_softplus(fx - 0.5), inv_softplus(fy - 0.5)]),
+                    ("offsets_conv", [cx - 0.5, cy - 0.5])]:
+        old = getattr(khead, name)
+        conv = nn.Conv2d(old.in_channels, old.out_channels, 1).to(device)   # bias=True
+        nn.init.zeros_(conv.weight)
+        with torch.no_grad():
+            conv.bias.copy_(torch.tensor(z, dtype=torch.float32))
+        setattr(khead, name, conv)
+    return khead
+
+
+def _selfcheck_khead_init():
+    """The head must *start* at the calibrated K, and its params must stay trainable."""
+    enc = encoders.ResnetEncoder(18, False, num_input_images=2)
+    k = (0.82, 1.02, 0.5, 0.5)
+    kh = build_khead(enc, k, "cpu")
+    hw = (64, 80)
+    K = kh(torch.randn(2, enc.num_ch_enc[-1], 4, 5), hw[1], hw[0])
+    got = _k_logs(K, hw)
+    assert all(abs(got[f"k_{n}"] - v) < 1e-5 for n, v in zip("fx fy cx cy".split(), k)), got
+    K.sum().backward()
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in kh.parameters())
 
 
 # ----------------------------------------- AF-SfMLearner refinement (EndoDAC, optional)
@@ -346,7 +400,7 @@ def position_loss(R, batch, hw, ssim, pos_smooth_w):
 
 
 def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj, project,
-                      hw, min_depth, max_depth, w, anchor=None):
+                      hw, min_depth, max_depth, w, anchor=None, khead=None):
     """Stage 1: depth + pose + Transform against the appearance-refined target."""
     aug = {f: batch[("color_aug", f)] for f in (-1, 0, 1)}
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -357,10 +411,13 @@ def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj,
     for f in (-1, 1):
         p = _refine_predict(R, aug, color, f, hw)
         occu = (p["occu"] * valid).detach()
-        ax, tr, _ = pose_dec([pose_enc(torch.cat([aug[f], aug[0]], 1))])  # EndoDAC: [f,0]
+        feats = pose_enc(torch.cat([aug[f], aug[0]], 1))                  # EndoDAC: [f,0]
+        ax, tr, _ = pose_dec([feats])
         ax, tr = ax[:, 0], tr[:, 0]
         tstats.append((ax.norm(dim=-1).mean(), tr.norm(dim=-1).mean()))
         T = transformation_from_parameters(ax, tr)
+        if khead is not None:
+            K, inv_K = predict_K(khead, feats, hw)
         pix = project(backproj(depth, inv_K), K, T)
         warped = F.grid_sample(color[f], pix, padding_mode="border", align_corners=True)
         reproj = reproj + (reprojection(warped, p["refined"], ssim)
@@ -374,6 +431,8 @@ def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj,
     trn = torch.stack([t[1] for t in tstats]).mean()
     logs = dict(loss=loss.item(), photo=(reproj / 2).item(), smooth=smooth.item(),
                 transform=(transf / 2).item(), pose_rot=rot.item(), pose_trans=trn.item())
+    if khead is not None:
+        logs.update(_k_logs(K, hw))
     if anchor is not None:
         teacher, aw = anchor
         a = anchor_loss(disp, teacher, aug[0], valid, hw)
@@ -382,12 +441,13 @@ def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj,
     return loss, logs
 
 
-def _set_stage(R, pose_enc, pose_dec, depth_model, stage):
-    """stage 0 = train Position only; stage 1 = train depth(LoRA)+pose+Transform."""
+def _set_stage(R, pose_enc, pose_dec, depth_model, stage, khead=None):
+    """stage 0 = train Position only; stage 1 = train depth(LoRA)+pose+Transform(+intrinsics)."""
     for p in list(R["pos_enc"].parameters()) + list(R["pos"].parameters()):
         p.requires_grad = (stage == 0)
     for p in (list(R["trans_enc"].parameters()) + list(R["trans"].parameters())
-              + list(pose_enc.parameters()) + list(pose_dec.parameters())):
+              + list(pose_enc.parameters()) + list(pose_dec.parameters())
+              + (list(khead.parameters()) if khead is not None else [])):
         p.requires_grad = (stage == 1)
     for n, p in depth_model.named_parameters():
         p.requires_grad = (stage == 1) and any(k in n for k in ("lora_", "residual_", "conv_depth_"))
@@ -398,7 +458,7 @@ def _set_stage(R, pose_enc, pose_dec, depth_model, stage):
 
 
 def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                     hw, min_depth, max_depth, smooth_w, automask=True, anchor=None):
+                     hw, min_depth, max_depth, smooth_w, automask=True, anchor=None, khead=None):
     """Returns (loss, logs). Single-scale Monodepth2 photometric + smoothness."""
     h, w = hw
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -411,8 +471,10 @@ def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, pro
 
     reproj, ident, tstats = [], [], []
     for f in (-1, 1):
-        T, ax, tr = predict_pose(pose_enc, pose_dec, aug[0], aug[f], f)
+        T, ax, tr, feats = predict_pose(pose_enc, pose_dec, aug[0], aug[f], f)
         tstats.append((ax.norm(dim=-1).mean(), tr.norm(dim=-1).mean()))
+        if khead is not None:
+            K, inv_K = predict_K(khead, feats, hw)
         cam_pts = backproj(depth, inv_K)
         pix = project(cam_pts, K, T)
         warped = F.grid_sample(color[f], pix, padding_mode="border", align_corners=True)
@@ -436,6 +498,8 @@ def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, pro
     trans = torch.stack([t[1] for t in tstats]).mean()
     logs = dict(loss=loss.item(), photo=photo.item(), smooth=smooth.item(),
                 pose_rot=rot.item(), pose_trans=trans.item())
+    if khead is not None:
+        logs.update(_k_logs(K, hw))
     if anchor is not None:
         teacher, aw = anchor
         a = anchor_loss(disp, teacher, aug[0], valid, hw)
@@ -508,10 +572,12 @@ def qualitative_panel(depth_model, panel, hw, device, min_depth, max_depth):
 
 # ---------------------------------------------------------------------------- train
 def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, opt,
-              device, args, hw, train=True, anchor=None):
+              device, args, hw, train=True, anchor=None, khead=None):
     # fp32 (no AMP): the pose net + grid_sample geometry overflow under fp16 autocast and
     # send the whole run to NaN -- EndoDAC itself trains in fp32. Grad-clip for good measure.
     depth_model.train(train); pose_enc.train(train); pose_dec.train(train)
+    if khead is not None:
+        khead.train(train)
     agg = {}; nb = 0; skipped = 0
     for batch in loader:
         batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
@@ -520,7 +586,7 @@ def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, 
             loss, logs = photometric_step(
                 batch, depth_model, pose_enc, pose_dec, ssim, backproj, project, hw,
                 args.min_depth, args.max_depth, args.smoothness,
-                automask=not args.no_automask, anchor=anchor)
+                automask=not args.no_automask, anchor=anchor, khead=khead)
         if train:
             if not torch.isfinite(loss):           # guard: never step on a NaN/Inf batch
                 skipped += 1
@@ -546,32 +612,32 @@ def _clip(opt, max_norm):
 
 
 def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim,
-                     backproj, project, device, args, hw, w, train=True, anchor=None):
+                     backproj, project, device, args, hw, w, train=True, anchor=None, khead=None):
     """AF-SfMLearner two-stage epoch: optimise Position (opt0), then depth+pose+Transform (opt)."""
     agg = {}; nb = 0; skipped = 0
     for batch in loader:
         batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                  for k, v in batch.items()}
         if train:
-            _set_stage(R, pose_enc, pose_dec, depth_model, 0)          # Position stage
+            _set_stage(R, pose_enc, pose_dec, depth_model, 0, khead)   # Position stage
             loss0 = position_loss(R, batch, hw, ssim, w["ps"])
             if torch.isfinite(loss0):
                 opt0.zero_grad(); loss0.backward(); _clip(opt0, args.grad_clip); opt0.step()
-            _set_stage(R, pose_enc, pose_dec, depth_model, 1)          # depth/pose/transform
+            _set_stage(R, pose_enc, pose_dec, depth_model, 1, khead)   # depth/pose/transform
             loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
                                            backproj, project, hw, args.min_depth, args.max_depth,
-                                           w, anchor=anchor)
+                                           w, anchor=anchor, khead=khead)
             if not torch.isfinite(loss):
                 skipped += 1; continue
             opt.zero_grad(); loss.backward(); _clip(opt, args.grad_clip); opt.step()
         else:
             for m in (R["pos_enc"], R["pos"], R["trans_enc"], R["trans"],
-                      pose_enc, pose_dec, depth_model):
+                      pose_enc, pose_dec, depth_model) + ((khead,) if khead is not None else ()):
                 m.eval()
             with torch.no_grad():
                 loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
                                                backproj, project, hw, args.min_depth, args.max_depth,
-                                               w, anchor=anchor)
+                                               w, anchor=anchor, khead=khead)
         for k, v in logs.items():
             agg[k] = agg.get(k, 0.0) + v
         nb += 1
@@ -626,6 +692,11 @@ def main():
     ap.add_argument("--intrinsics", type=float, nargs=4, default=list(DEFAULT_K_NORM),
                     metavar=("fx", "fy", "cx", "cy"),
                     help="NORMALISED da Vinci intrinsics; default = EndoDAC/SCARED assumed K")
+    ap.add_argument("--no-learn-intrinsics", action="store_true",
+                    help="freeze K at --intrinsics. Default is EndoDAC's IntrinsicsHead: K is "
+                         "predicted per batch from the pose bottleneck, initialised at the "
+                         "(crop-adjusted) --intrinsics and refined by the photometric loss. "
+                         "Identifiability needs camera rotation; watch train/k_fx for drift.")
     ap.add_argument("--frame-stride", type=int, default=1, help="triplet baseline in frames")
     ap.add_argument("--sample-frac", type=float, default=1.0,
                     help="keep this fraction of TRAIN triplet centers (seeded). For dense HD dumps "
@@ -697,6 +768,7 @@ def main():
 
     if args.smoke:
         _selfcheck_crop_intrinsics()
+        _selfcheck_khead_init()
         m = build_depth_model(model_shape, device)
         pe = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
         pd = decoders.PoseDecoder(pe.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
@@ -708,17 +780,22 @@ def main():
         batch = {("color", f): torch.rand(2, 3, *hw, device=device) for f in (-1, 0, 1)}
         batch.update({("color_aug", f): torch.rand(2, 3, *hw, device=device) for f in (-1, 0, 1)})
         batch.update(valid=torch.ones(2, 1, *hw, device=device), K=K, inv_K=torch.inverse(K))
+        kh = None if args.no_learn_intrinsics else build_khead(pe, args.intrinsics, device)
         if args.refine:
             R = build_refiner(hw, device, args.pose_init_dir, warm=False)
             w = dict(ps=args.position_smoothness, tc=args.transform_constraint,
                      ts=args.transform_smoothness, ds=args.smoothness)
             position_loss(R, batch, hw, ssim, w["ps"]).backward()
             loss, logs = refine_depth_step(batch, m, pe, pd, R, ssim, bp, pr, hw,
-                                           args.min_depth, args.max_depth, w)
+                                           args.min_depth, args.max_depth, w, khead=kh)
         else:
             loss, logs = photometric_step(batch, m, pe, pd, ssim, bp, pr, hw,
-                                          args.min_depth, args.max_depth, args.smoothness)
+                                          args.min_depth, args.max_depth, args.smoothness, khead=kh)
         loss.backward()
+        if kh is not None:                      # K must be learnable, not a detached constant
+            assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in kh.parameters())
+            print(f"[smoke] K (norm, at init = --intrinsics) = "
+                  f"{ {k: round(v, 3) for k, v in logs.items() if k.startswith('k_')} }")
         print(f"[smoke] ok | hw={hw} refine={args.refine} loss={logs['loss']:.4f} device={device}")
         return
 
@@ -737,6 +814,7 @@ def main():
                  overlay_std_thresh=args.overlay_std_thresh, side_crop_frac=args.side_crop_frac,
                  top_crop_frac=args.top_crop_frac)
     print(f"[setup] model_shape={model_shape} feed_hw={hw} K_norm={k_norm} "
+          f"learn_K={not args.no_learn_intrinsics} "
           f"stride={args.frame_stride} refine={args.refine} "
           f"overlay_mask={not args.no_overlay_mask} device={device}", flush=True)
 
@@ -769,6 +847,9 @@ def main():
     if (pid / "pose_encoder.pth").exists():
         _filter_load(pose_enc, pid / "pose_encoder.pth", "pose_enc")
         _filter_load(pose_dec, pid / "pose.pth", "pose")
+    # No warm-start for the K head: a released checkpoint's K is for *its* camera/crop, and its
+    # bias-free convs would half-load over our calibrated init. Start at k_norm, learn from there.
+    khead = None if args.no_learn_intrinsics else build_khead(pose_enc, k_norm, device)
 
     R = opt0 = None
     weights = dict(ps=args.position_smoothness, tc=args.transform_constraint,
@@ -782,6 +863,8 @@ def main():
     else:
         params = [p for p in depth_model.parameters() if p.requires_grad] \
             + list(pose_enc.parameters()) + list(pose_dec.parameters())
+    if khead is not None:
+        params = params + list(khead.parameters())
     n_train = sum(p.numel() for p in params)
     print(f"[optim] Adam lr={args.lr} | refine={args.refine} | "
           f"stage1 trainable params={n_train/1e6:.2f}M", flush=True)
@@ -795,16 +878,17 @@ def main():
         if args.refine:
             return run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0,
                                     ssim, backproj, project, device, args, hw, weights, train,
-                                    anchor=anchor)
+                                    anchor=anchor, khead=khead)
         return run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                         opt, device, args, hw, train, anchor=anchor)
+                         opt, device, args, hw, train, anchor=anchor, khead=khead)
 
     import wandb
     wandb.init(project=os.getenv("WANDB_PROJECT", "rarp"),
                entity=os.getenv("WANDB_ENTITY", "nmgtue"), name=args.run_name,
                config=dict(task="depth", model="endodac-base-dvlora-r4",
                            image_shape=model_shape, feed_shape=hw,
-                           intrinsics=k_norm, frame_stride=args.frame_stride,
+                           intrinsics=k_norm, learn_intrinsics=not args.no_learn_intrinsics,
+                           frame_stride=args.frame_stride,
                            bottom_crop_frac=args.bottom_crop_frac,
                            side_crop_frac=args.side_crop_frac,
                            top_crop_frac=args.top_crop_frac, epochs=args.epochs,
@@ -875,6 +959,8 @@ def main():
         if score < best:                                       # select by SCARED abs_rel (or proxy)
             best = score
             torch.save(depth_model.state_dict(), outdir / "best.pth")  # 389-key GUI state_dict
+            if khead is not None:
+                torch.save(khead.state_dict(), outdir / "intrinsics_head.pth")
             wandb.run.summary[f"best_{sel_name}"] = best
             wandb.run.summary["best_epoch"] = ep
 

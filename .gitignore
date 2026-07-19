@@ -7,6 +7,7 @@ data/processed/
 # Derived clip output and sweep caches (regenerate with scripts/cut_cue_clips.py)
 data/clips/
 data/clips_*/
+data/cue_ds/
 data/sweep_cache/
 
 # Models & checkpoints
