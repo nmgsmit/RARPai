@@ -349,7 +349,9 @@ def _selfcheck_khead_init():
     got = _k_logs(K, hw)
     assert all(abs(got[f"k_{n}"] - v) < 1e-5 for n, v in zip("fx fy cx cy".split(), k)), got
     K.sum().backward()
-    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in kh.parameters())
+    # only the two convs the forward actually calls; `convs_suqeeze` is dead in the vendored head
+    live = list(kh.focal_length_conv.parameters()) + list(kh.offsets_conv.parameters())
+    assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in live)
 
 
 # ----------------------------------------- AF-SfMLearner refinement (EndoDAC, optional)
