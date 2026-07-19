@@ -18,7 +18,8 @@ source venv/bin/activate
 # console videos where a da Vinci "move cue" bar is up -- instruments parked, so the camera moves
 # over a (near) static scene, which is exactly the rigid-scene assumption the photometric loss makes.
 # GUI + cue bar are blacked out at cut time and drop out via the vignette/overlay valid mask.
-# Small dataset (few thousand frames) -> more epochs than the UMC runs, no --sample-frac.
+# Small dataset (2709 frames / 109 clips) -> no --sample-frac. 10 epochs: this is a convergence
+# check, and the val curve's shape is readable in the first few epochs.
 # Split: Train 5 videos / Validation 749c8234 / Test RARP_092. Override via "$@".
 python scripts/finetune_depth.py \
     --data-root ../data/CueClips \
@@ -27,6 +28,6 @@ python scripts/finetune_depth.py \
     --out outputs/cue_depth \
     --run-name endodac-cue \
     --image-shape 392 490 \
-    --epochs 30 \
+    --epochs 10 \
     --frame-stride 5 \
     "$@"
