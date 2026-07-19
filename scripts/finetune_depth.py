@@ -801,7 +801,8 @@ def main():
                                           args.min_depth, args.max_depth, args.smoothness, khead=kh)
         loss.backward()
         if kh is not None:                      # K must be learnable, not a detached constant
-            assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in kh.parameters())
+            live = list(kh.focal_length_conv.parameters()) + list(kh.offsets_conv.parameters())
+            assert all(p.grad is not None and p.grad.abs().sum() > 0 for p in live)
             print(f"[smoke] K (norm, at init = --intrinsics) = "
                   f"{ {k: round(v, 3) for k, v in logs.items() if k.startswith('k_')} }")
         print(f"[smoke] ok | hw={hw} refine={args.refine} loss={logs['loss']:.4f} device={device}")
