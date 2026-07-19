@@ -315,8 +315,14 @@ def build_khead(pose_enc, k_norm, device):
     Stock init sits at fx~1.19*W, far from the da Vinci ~0.82 the pretrained depth weights were
     trained under. The vendored convs are bias-free, so swap in biased ones and zero the weights:
     output starts constant at k_norm, but grads still reach the weights, so K is free to move.
-    head parameterisation: f = (softplus(z) + 0.5) * size, c = (z + 0.5) * size."""
+    head parameterisation: f = (softplus(z) + 0.5) * size, c = (z + 0.5) * size.
+
+    The replacement convs are sized to num_ch_enc[-1], NOT to the conv they replace: the vendored
+    forward pools the encoder bottleneck straight into focal_length_conv and never applies its own
+    `convs_suqeeze`, so the stock 256-channel convs cannot run at all on ResNet18's 512-ch
+    bottleneck. Sizing to what the head is actually fed makes the dead squeeze layer irrelevant."""
     khead = decoders.IntrinsicsHead(pose_enc.num_ch_enc).to(device)
+    n_in = pose_enc.num_ch_enc[-1]
     fx, fy, cx, cy = k_norm
     assert fx > 0.5 and fy > 0.5, (
         f"IntrinsicsHead floors the normalised focal at 0.5 (softplus+0.5); got fx={fx}, fy={fy}. "
@@ -325,7 +331,7 @@ def build_khead(pose_enc, k_norm, device):
     for name, z in [("focal_length_conv", [inv_softplus(fx - 0.5), inv_softplus(fy - 0.5)]),
                     ("offsets_conv", [cx - 0.5, cy - 0.5])]:
         old = getattr(khead, name)
-        conv = nn.Conv2d(old.in_channels, old.out_channels, 1).to(device)   # bias=True
+        conv = nn.Conv2d(n_in, old.out_channels, 1).to(device)              # bias=True
         nn.init.zeros_(conv.weight)
         with torch.no_grad():
             conv.bias.copy_(torch.tensor(z, dtype=torch.float32))
