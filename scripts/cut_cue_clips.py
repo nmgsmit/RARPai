@@ -200,7 +200,29 @@ def cue_mask(shape, span):
     return m
 
 
-def black_gui(frame, panels, markers, bars, box, m_thr, b_thr, min_bars, dilate):
+def band_mask(shape, mk, br, box, m_thr, b_thr):
+    """Whole search band blacked out as soon as ONE match lands in it.
+
+    cue_span only masks between two VALIDATED markers, so a bar whose second
+    marker scored under threshold keeps its tail visible -- a false negative that
+    leaks GUI pixels into the clip. A cue never occupies anything but these bands,
+    so blacking the entire band on a single hit trades masked area (which the
+    valid mask simply drops) for never missing part of a bar.
+    """
+    m = np.zeros(shape[:2], bool)
+    hits = ([(q[0], q[1]) for q in mk if q[2] >= m_thr] +
+            [(q[0], q[1]) for q in br if q[2] >= b_thr])
+    if not hits:
+        return m
+    for _, _, sl in cue_bands(box):
+        rows, cols = sl
+        if any(cols.start <= x < cols.stop and rows.start <= y < rows.stop for x, y in hits):
+            m[sl] = True
+    return m
+
+
+def black_gui(frame, panels, markers, bars, box, m_thr, b_thr, min_bars, dilate,
+              bands=False):
     """Black out every GUI element in place: fixed HUD, popup panels, cue bar.
 
     Black rather than inpaint because finetune_depth's `valid` mask is
@@ -220,7 +242,10 @@ def black_gui(frame, panels, markers, bars, box, m_thr, b_thr, min_bars, dilate)
     """
     mk, br = collect_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), markers, bars, box)
     m = (gui_mask(frame, panels) |
-         cue_mask(frame.shape, cue_span(mk, br, m_thr, b_thr, min_bars))).astype(np.uint8)
+         cue_mask(frame.shape, cue_span(mk, br, m_thr, b_thr, min_bars)))
+    if bands:
+        m = m | band_mask(frame.shape, mk, br, box, m_thr, b_thr)
+    m = m.astype(np.uint8)
     if dilate > 0:
         m = cv2.dilate(m, np.ones((2 * dilate + 1,) * 2, np.uint8))
     frame[m.astype(bool)] = 0
@@ -295,7 +320,8 @@ def _cut_clip(job):
             break
         if _W["panels"] is not None:
             frame = black_gui(frame, _W["panels"], _W["markers"], _W["bars"], _W["box"],
-                              _W["m_thr"], _W["b_thr"], _W["min_bars"], _W["dilate"])
+                              _W["m_thr"], _W["b_thr"], _W["min_bars"], _W["dilate"],
+                              _W["bands"])
         vw.write(frame)
         if imgdir:
             cv2.imwrite(os.path.join(imgdir, f"frame_{j:06d}.jpg"), frame,
@@ -332,6 +358,9 @@ def main():
                    help="skip clips shorter than this many frames (padding included)")
     p.add_argument("--gap", type=int, default=3, help="merge runs this many frames apart")
     p.add_argument("--mask-gui", action="store_true", help="black out the GUI in clips")
+    p.add_argument("--band-mask", action="store_true",
+                   help="black the WHOLE search band on a single match; no partial bars, more "
+                        "masked area (needs --mask-gui)")
     p.add_argument("--dilate", type=int, default=3,
                    help="px to grow the GUI mask; covers the bilinear-resize rim")
     p.add_argument("--frames", action="store_true",
@@ -381,7 +410,8 @@ def main():
                   # the pillarbox is static per video -> measure once, not per frame
                   box=content_box(cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)),
                   m_thr=args.marker_thresh, b_thr=args.bar_thresh, min_bars=args.min_bars,
-                  panels=panels, dilate=args.dilate, fps=fps, wh=(w, h), outdir=outdir,
+                  panels=panels, dilate=args.dilate, bands=args.band_mask,
+                  fps=fps, wh=(w, h), outdir=outdir,
                   stem=stem,
                   framedir=os.path.join(args.out, stem, "cues") if args.frames else None)
 
