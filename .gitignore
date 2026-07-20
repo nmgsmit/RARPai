@@ -38,3 +38,6 @@ outputs/
 
 # Secrets
 .env
+# Cue inspection dumps (masked frames from clinical video - never commit)
+data/cue_inspect/
+data/cue_check/

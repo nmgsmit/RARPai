@@ -251,3 +251,65 @@ sessions don't re-derive them. Keep entries one or two lines.
   core — the win is entirely the pool, so always pass `--cpus-per-task`.
 - `PAIR_MAX_DIST`, `EDGE_INSETS` and `MARKER_PAD` are absolute pixels at 1920x1080; they do not
   scale with frame size the way `fixed_gui_mask()` does.
+
+## Template rename (2026-07-20)
+
+All templates now live under `data/templates/`, named for what they are instead of `tempNN`:
+
+- `data/templates/*.png` — **popup panels only** (7): `popup_visualiseer_{dim,lit}`,
+  `popup_voer_op_{dim,lit}`, `popup_beweeg_greep_{a,b}`, `popup_visualiseer_beweeg`.
+  Dutch console text; `dim`/`lit` are the greyed and highlighted states of the same dialog.
+- `data/templates/Move_Que/*.png` — the cue bar: `marker_{1,2,4}` (digit end-caps, the digit
+  IS the arm number) and `bar_{gray,yellow}_{h,v}` (stripe segments).
+
+Marker/bar split is now **by `bar_` prefix** (`BAR_PREFIX` in `cut_cue_clips.py`), not a hardcoded
+name tuple, so adding a stripe template no longer needs a code edit. `CONNECT_TEMPLATES` and
+`THRESH_OVERRIDE` in `gui_mask.py` were renamed to match; the old `temp04`/`temp5`/`temp7` in the
+notes above are `marker_4`/`marker_1`/`marker_2`.
+
+Because the cue templates moved into a subdirectory, `load_templates("data/templates")` (non-recursive)
+now returns popups only — so `gui_mask`'s connector machinery (`_paired`/`_connect`) never fires for
+`mask_video.py` anymore. It is effectively dead code pending a decision on that script.
+
+## Cue detection: single-digit inference (2026-07-20)
+
+A bar whose second digit scored under threshold used to mask **nothing** - `cue_span` needs a
+validated PAIR. Now a lone digit infers its bar (`cue_paths` in `cut_cue_clips.py`):
+
+- **Direction** = the side of the digit holding the longer stripe run. `stripe_dir` scores all four.
+- **Run** = CONTIGUOUS chain butted against the digit (`_run_len`): starts within `STRIPE_GAP_MAX`
+  (50 px = 2 blocks, so one unmatched block bridges), never skips more. Counting every stripe
+  within 350 px instead let 3 tissue matches 250 px away validate a phantom bar.
+- **Distinct blocks only** (`STRIPE_MIN_SEP` 20 px). `_peaks` runs NMS *per template*, so the four
+  `bar_*` templates all fire on one physical block; that block counted four times. Applied to
+  `bars_between` too - the pair path had the same inflation.
+- **Length** = fixed nominal `BAR_LEN` 340 px, since the console always draws the full bar.
+  `walk_ring` walks the content box's inset perimeter ring and turns the corner when the edge runs
+  out, so **L bars now work** - previously `bars_between` scored them 0 and they were rejected
+  outright. Verified on 43bf7ef9 f3885 (a real L, both legs masked).
+- **Mask clipped to the bands** (`ring_mask`). A cue only ever rides the ring, so anything the thick
+  line spills outside it is tissue no cue could have covered.
+
+### Threshold: HIGH, not low - this was measured the wrong way round first
+
+Instinct says lower `--bar-thresh` to "see more of the bar". Measured on 43bf7ef9 f200/f205, which
+contain a real bar:
+
+| thr | distinct blocks ON the bar | raw matches elsewhere |
+|-----|---------------------------|----------------------|
+| 0.95 | 9-10 | **0** |
+| 0.90 | 10 | 2-5 |
+| 0.70 | 11 | 109-142 |
+
+The stripe templates separate cleanly at the TOP of their range. Dropping to 0.70 buys ~1 extra
+block and ~140 tissue matches. **Bright yellow anatomy with dark red veins reads as a yellow/black
+hazard stripe** - that is what produced the phantom bar on 43bf7ef9 f175, where zooming into the raw
+pixels shows no bar at all. Inference therefore uses the same `--bar-thresh` as the pair path.
+
+Caution for anyone eyeballing overlays: a red mask drawn over tissue looks exactly like a red mask
+drawn over a bar. Verify against the UNMASKED crop, not the overlay - that mistake cost a round trip
+here.
+
+Defaults now `--min-bars 4`, `--bar-thresh 0.90`, `--pad-after 0`. Over 10 videos at stride 5:
+769 pair hits, 41 inferred, 14326 clear. Every inferred hit spot-checked against raw pixels was a
+real bar.

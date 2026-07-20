@@ -3,7 +3,7 @@
 
 A cue is a striped bar with a digit marker at each end. Matching only the digits
 also fires on popup-dialog lettering, so a pair is accepted only when enough
-BAR SEGMENT templates (GrayBar/GraybarV/YellowH/YellowV) sit on the line between
+BAR SEGMENT templates (bar_*.png) sit on the line between
 the two markers. Digit thresholds go low (catch every cue), bar thresholds
 higher (the segments are distinctive).
 
@@ -30,7 +30,7 @@ import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cut_cue_clips import (  # noqa: E402
-    BAR_TEMPLATES, collect_frame, content_box, frame_has_cue, runs,
+    BAR_PREFIX, collect_frame, content_box, frame_has_cue, runs,
 )
 
 
@@ -64,13 +64,13 @@ def collect(path, markers, bars, workers):
 
     with ThreadPool(max(1, workers)) as pool:
         parts = pool.map(do, jobs)
-    return n, {i: (mk, br) for part in parts for i, mk, br in part}
+    return n, {i: (mk, br) for part in parts for i, mk, br in part}, box
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--videos", nargs="+", required=True)
-    p.add_argument("--templates", default="data/Move_Que")
+    p.add_argument("--templates", default="data/templates/Move_Que")
     p.add_argument("--cache", default="data/sweep_cache")
     p.add_argument("--workers", type=int, default=os.cpu_count())
     p.add_argument("--pad-after", type=int, default=2)
@@ -81,15 +81,15 @@ def main():
                    default=[0.50, 0.55, 0.60, 0.65])
     p.add_argument("--bar-thresh", nargs="+", type=float,
                    default=[0.60, 0.70, 0.80])
-    p.add_argument("--min-bars", nargs="+", type=int, default=[2])
+    p.add_argument("--min-bars", nargs="+", type=int, default=[3])
     p.add_argument("--recollect", action="store_true")
     args = p.parse_args()
 
     cv2.setNumThreads(1)
     allt = {os.path.splitext(os.path.basename(f))[0]: cv2.imread(f, cv2.IMREAD_GRAYSCALE)
             for f in sorted(glob.glob(os.path.join(args.templates, "*.png")))}
-    markers = {k: v for k, v in allt.items() if k not in BAR_TEMPLATES}
-    bars = {k: v for k, v in allt.items() if k in BAR_TEMPLATES}
+    markers = {k: v for k, v in allt.items() if not k.startswith(BAR_PREFIX)}
+    bars = {k: v for k, v in allt.items() if k.startswith(BAR_PREFIX)}
     print(f"markers: {sorted(markers)}\nbars   : {sorted(bars)}")
     os.makedirs(args.cache, exist_ok=True)
 
@@ -99,14 +99,17 @@ def main():
         cf = os.path.join(args.cache, stem + ".pkl")
         if os.path.exists(cf) and not args.recollect:
             with open(cf, "rb") as fh:
-                data[stem] = pickle.load(fh)
-            print(f"cached  {stem[:40]:42s} {data[stem][0]} frames")
-            continue
+                hit = pickle.load(fh)
+            if len(hit) == 3:          # older caches predate the stored content box
+                data[stem] = hit
+                print(f"cached  {stem[:40]:42s} {hit[0]} frames")
+                continue
+            print(f"stale   {stem[:40]:42s} (no content box) -> recollecting")
         t0 = time.time()
-        n, cand = collect(path, markers, bars, args.workers)
+        n, cand, box = collect(path, markers, bars, args.workers)
         with open(cf, "wb") as fh:
-            pickle.dump((n, cand), fh)
-        data[stem] = (n, cand)
+            pickle.dump((n, cand, box), fh)
+        data[stem] = (n, cand, box)
         print(f"collect {stem[:40]:42s} {n} frames in {time.time() - t0:.0f}s")
 
     print(f"\n{'m_thr':>6} {'b_thr':>6} {'minbar':>6} {'clips':>6} "
@@ -116,8 +119,8 @@ def main():
         for bt in args.bar_thresh:
             for mb in args.min_bars:
                 tot_clips = bad = worst = 0
-                for stem, (n, cand) in data.items():
-                    flags = [frame_has_cue(*cand.get(i, ([], [])), mt, bt, mb)
+                for stem, (n, cand, box) in data.items():
+                    flags = [frame_has_cue(*cand.get(i, ([], [])), box, mt, bt, mb)
                              for i in range(n)]
                     spans = runs(flags, args.pad_before, args.pad_after, n,
                                  args.min_clip, args.gap)

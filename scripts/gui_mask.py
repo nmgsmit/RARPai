@@ -48,7 +48,8 @@ def fixed_gui_mask(shape, scale=True):
     return m
 
 
-CONNECT_TEMPLATES = ("temp04", "temp5", "temp7")   # these come in pairs joined by a thin line
+CONNECT_TEMPLATES = ("marker_1", "marker_2", "marker_4")   # digit end-caps, joined in pairs
+                                                           # by a thin line
 CONNECT_WIDTH = 15                       # px thickness of the drawn connector
 CONNECT_PAD = 3                          # px extra on each side — 15 alone leaves the bar edges showing
 CONNECT_ALIGN_TOL = 20                   # px: closer than this on an axis = straight bar, else L
@@ -59,13 +60,14 @@ CONNECT_ALIGN_TOL = 20                   # px: closer than this on an axis = str
 # NOTE: cut_cue_clips no longer relies on these. It validates a marker pair by
 # counting bar segments between the markers (see cue_span there), which does
 # separate cues from popup lettering. These values still drive mask_video.py.
-THRESH_OVERRIDE = {"temp04": 0.60, "temp5": 0.65, "temp7": 0.75}
+THRESH_OVERRIDE = {"marker_4": 0.60, "marker_1": 0.65, "marker_2": 0.75}
 # The connector markers only ever sit on a few lines inset from the *content* edge (measured:
 # 24 px from the left, 39 and 79 px from the bottom). Anything off those lines is a false match.
 EDGE_INSETS = (24, 39, 79)
 EDGE_TOL = 6
 # A marker is only real if it has a partner within one bar length. The bar templates
-# (temp4/temp05) are 334 px wide; an L pair wraps a corner, so measure along the path.
+# (the 334 px-wide popup panels) set the scale; an L pair wraps a corner, so measure
+# along the path.
 PAIR_MAX_DIST = 334 + 20
 MARKER_PAD = 5           # px grown around each connector-marker box; the template crop sits tight
 
@@ -231,7 +233,7 @@ def load_templates(template_dir):
         template_dir: Path or str to a directory of template images
 
     Returns:
-        {stem: grayscale uint8 image}, e.g. {"temp5": ...}. Names matter:
+        {stem: grayscale uint8 image}, e.g. {"marker_1": ...}. Names matter:
         see CONNECT_TEMPLATES.
     """
     if not template_dir:
@@ -251,21 +253,21 @@ if __name__ == "__main__":
     frame = np.zeros((400, 600, 3), np.uint8)
     frame[row + 2:row + 8, 102:108] = 255
     frame[row + 2:row + 8, 402:408] = 255
-    m = gui_mask(frame, {"temp7": tpl}, search_band=300)
+    m = gui_mask(frame, {"marker_2": tpl}, search_band=300)
     assert m[row + 5, 250], "straight bar missing between aligned pair"
 
     # a match off every inset line is a false positive and must be dropped
     frame = np.zeros((400, 600, 3), np.uint8)
     frame[row + 2:row + 8, 102:108] = 255
     frame[202:208, 302:308] = 255        # mid-frame, on no line
-    m = gui_mask(frame, {"temp7": tpl}, search_band=300)
+    m = gui_mask(frame, {"marker_2": tpl}, search_band=300)
     assert not m[205, 305], "off-line false positive was not filtered"
 
     # on the line, but too far apart to be one bar -> both dropped
     frame = np.zeros((400, 600, 3), np.uint8)
     frame[row + 2:row + 8, 22:28] = 255
     frame[row + 2:row + 8, 562:568] = 255
-    m = gui_mask(frame, {"temp7": tpl}, search_band=300)
+    m = gui_mask(frame, {"marker_2": tpl}, search_band=300)
     assert not m[row + 5, 25] and not m[row + 5, 300], "unpaired hits were not dropped"
 
     # off-axis pair -> L bending away from centre, in each of the four corners
@@ -282,7 +284,7 @@ if __name__ == "__main__":
     frame = np.zeros((400, 600, 3), np.uint8)
     frame[up + 2:up + 8, 102:108] = 255
     frame[row + 2:row + 8, 402:408] = 255
-    m = gui_mask(frame, {"temp7": tpl}, search_band=340)
+    m = gui_mask(frame, {"marker_2": tpl}, search_band=340)
     assert m[row - 10, 105] and m[row + 5, 250], "L connector missing between off-axis pair"
     assert not m[up + 5, 405], "elbow bent toward frame centre instead of away"
     print("ok")
