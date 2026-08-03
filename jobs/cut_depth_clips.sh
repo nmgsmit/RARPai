@@ -16,11 +16,11 @@ module load 2023
 module load Python/3.11.3-GCCcore-12.3.0
 source venv/bin/activate
 
-STAGING=../data/depth_clips_staging
-DEST=../data/depth_clips
+STAGING=../data/depth_ruler_staging
+DEST=../data/depth_ruler
 
 python scripts/cut_cue_clips.py \
-    --videos "/home/nsmit2/data/UMCdissectionvid/*.mp4" \
+    --videos "/home/nsmit2/data/UMCrulervid/*.mp4" \
     --out "$STAGING" \
     --mask-gui \
     --frames \
@@ -30,7 +30,7 @@ python scripts/cut_cue_clips.py \
 
 # Split copied from the existing UMC dataset so val/test hold the SAME videos as the
 # run we are comparing against; otherwise "more data helped" is unfalsifiable.
-python scripts/assemble_depth_clips.py \
-    --src "$STAGING" \
-    --dst "$DEST" \
-    --split-ref ../data/UMCdissectionvid/UMCdissectionimg
+#python scripts/assemble_depth_clips.py \
+#    --src "$STAGING" \
+#    --dst "$DEST" \
+#    --split-ref ../data/UMCdissectionvid/UMCdissectionimg
