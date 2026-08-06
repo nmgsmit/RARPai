@@ -21,13 +21,17 @@ SRC="${1:?usage: mask_dir.sh <src-dir> <dst-dir>}"
 DST="${2:?usage: mask_dir.sh <src-dir> <dst-dir>}"
 mkdir -p "$DST"
 
-shopt -s nullglob nocaseglob
-for f in "$SRC"/*.mp4 "$SRC"/*.mov "$SRC"/*.avi "$SRC"/*.mkv; do
-    out="$DST/$(basename "${f%.*}").mp4"
+# Recursive: raw-videos holds one subdir of clips per segment, so mirror the tree
+# under DST rather than flattening (clip_001.mp4 repeats across subdirs).
+find "$SRC" -type f \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' -o -iname '*.mkv' \) \
+    | sort | while read -r f; do
+    rel="${f#"$SRC"/}"
+    out="$DST/${rel%.*}.mp4"
     if [ -s "$out" ]; then
         echo "skip $out"
         continue
     fi
+    mkdir -p "$(dirname "$out")"
     echo "=== $f -> $out"
     python scripts/mask_video.py "$f" "$out" "${SLURM_CPUS_PER_TASK:-1}" --crop
 done

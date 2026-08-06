@@ -38,15 +38,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
     ap.add_argument("--checkpoint", default="outputs/rarp_finetune/best.pth")
-    ap.add_argument("--num-classes", type=int, required=True)
+    ap.add_argument("--num-classes", type=int, default=0, help="0 = auto-detect from checkpoint")
     ap.add_argument("--out", default="outputs/rarp_seg/overlay.mp4")
     ap.add_argument("--img-size", type=int, default=512)
     ap.add_argument("--alpha", type=float, default=0.5)
     args = ap.parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = MetaFormerFPN(num_classes=args.num_classes, pretrained="ImageNet", pretrained_weights=None)
-    model.load_state_dict(torch.load(args.checkpoint, map_location="cpu", weights_only=True))
+    sd = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    nc = args.num_classes or sd["FPN.segmentation_head.0.bias"].shape[0]
+    print(f"[checkpoint] num_classes={nc}")
+    model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None)
+    model.load_state_dict(sd)
     model.to(device).eval()
     print(f"[loaded] {args.checkpoint} | device={device}")
 
