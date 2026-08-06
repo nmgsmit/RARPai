@@ -8,7 +8,7 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
-# Mask + cut the da Vinci GUI out of every video in a directory.
+# Black out the da Vinci GUI in every video in a directory. Frame size is kept.
 #   sbatch jobs/mask_dir.sh <src-dir> <dst-dir>
 # CPU-only (template matching). Already-written outputs are skipped, so a job
 # that hits the walltime can just be resubmitted.
@@ -33,5 +33,5 @@ find "$SRC" -type f \( -iname '*.mp4' -o -iname '*.mov' -o -iname '*.avi' -o -in
     fi
     mkdir -p "$(dirname "$out")"
     echo "=== $f -> $out"
-    python scripts/mask_video.py "$f" "$out" "${SLURM_CPUS_PER_TASK:-1}" --crop
+    python scripts/mask_video.py "$f" "$out" "${SLURM_CPUS_PER_TASK:-1}"
 done

@@ -1,9 +1,6 @@
 """Black out the da Vinci GUI in a video.
 
-    python scripts/mask_video.py in.mp4 out.mp4 [workers] [--crop]
-
-With --crop the bottom GUI bar is cut off the frame instead of left as a black
-band, so the output is (H - bar) tall.
+    python scripts/mask_video.py in.mp4 out.mp4 [workers]
 
 Template matching is the whole cost and each frame is independent, so frames are
 masked in a process pool; decode and write stay sequential.
@@ -16,7 +13,7 @@ from pathlib import Path
 
 import cv2
 
-from gui_mask import BOTTOM_BAR_H, REF_H, gui_mask, load_templates
+from gui_mask import gui_mask, load_templates
 
 TEMPLATE_DIR = Path(__file__).resolve().parents[1] / "data" / "templates"
 BATCH = 256          # frames held in memory at once (~1.5 GB at 1080p)
@@ -35,15 +32,13 @@ def _mask_one(frame):
     return frame
 
 
-def main(src, dst, workers=1, crop=False):
+def main(src, dst, workers=1):
     global _templates
     _templates = load_templates(TEMPLATE_DIR)   # used directly when workers == 1
     cap = cv2.VideoCapture(str(src))
     fps = cap.get(cv2.CAP_PROP_FPS)
     w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    # same scaling gui_mask uses, so the cut lands exactly on the bar it masked
-    keep = h - int(round(BOTTOM_BAR_H * h / REF_H)) if crop else h
-    out = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, keep))
+    out = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
     def batches():
         buf = []
@@ -64,7 +59,7 @@ def main(src, dst, workers=1, crop=False):
     for buf in batches():
         masked = pool.map(_mask_one, buf) if pool else [_mask_one(f) for f in buf]
         for f in masked:
-            out.write(f[:keep])
+            out.write(f)
         n += len(buf)
         print(f"{n} frames, {(time.perf_counter() - t0) / n:.3f} s/frame", flush=True)
     if pool:
@@ -78,5 +73,4 @@ def main(src, dst, workers=1, crop=False):
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--crop"]
-    main(args[0], args[1], int(args[2]) if len(args) > 2 else 1, "--crop" in sys.argv)
+    main(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 1)
