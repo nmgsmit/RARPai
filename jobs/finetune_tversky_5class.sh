@@ -4,7 +4,7 @@
 #SBATCH --error=logs/%j.err
 #SBATCH --time=08:00:00
 #SBATCH --partition=gpu_h100
-#SBATCH --gpus-per-node=1
+#SBATCH --gpus-per-node=2
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=128G
 
@@ -21,10 +21,12 @@ python scripts/finetune_seg_tversky.py \
     --data-root ../data/RARPSurgenet/fold1 \
     --encoder-ckpt ../backbones/RARP_checkpoint_epoch0050_teacher.pth \
     --out outputs/rarp_tversky_5class \
-    --run-name tverskyall \
+    --run-name tverskysquare1080 \
     --keep-classes 1,2,3,4 \
-    --batch-size 8 \
+    --height 1080 --width 1080 \
+    --batch-size 2 \
+    --accum-steps 4 \
     --lr 1e-4 \
-    --epochs 50 \
+    --epochs 10 \
     --bg-in-loss \
     "$@"
