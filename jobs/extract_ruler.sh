@@ -12,7 +12,7 @@ module load 2023
 module load FFmpeg/6.0-GCCcore-12.3.0
 
 FPS=5
-SRC=$HOME/data/UMCrulervid
+SRC=$HOME/data/UMCrulervidNOgui
 RUL=$HOME/data/UMCrulerHD
 MIX=$HOME/data/UMCmixed
 OLD=$HOME/data/UMCdissectionHD
