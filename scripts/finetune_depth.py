@@ -326,7 +326,7 @@ def load_scale_anchors(clip_dir, hw):
     return out
 
 
-def scale_loss(depth, inv_K, batch, hw, delta=0.3):
+def scale_loss(depth, inv_K, batch, hw, delta=0.3, classes=None):
     """Metric anchor: predicted 3D length of each annotated segment vs its known mm.
 
     Self-supervised depth is scale-ambiguous; this is the only term that fixes the global scale.
@@ -337,9 +337,17 @@ def scale_loss(depth, inv_K, batch, hw, delta=0.3):
     slots carry weight 0. Uses all ANCHOR_PTS points (not just the endpoints) so a single noisy
     depth sample on these thin objects averages out.
 
+    `classes` (list of class_id) restricts SUPERVISION to those objects; the eval always scores
+    every class, so an excluded class becomes a held-out cross-object check of the learned scale.
+
     Returns (loss, ratio (B,N) = predicted/true length, weight (B,N)).
     """
     pts, mm, w = batch["anch_pts"], batch["anch_mm"], batch["anch_w"]
+    if classes:
+        keep = torch.zeros_like(w, dtype=torch.bool)
+        for c in classes:
+            keep |= batch["anch_cls"] == c
+        w = w * keep
     B, N, P, _ = pts.shape
     h, wid = hw
     g = torch.stack([pts[..., 0] / (wid - 1) * 2 - 1, pts[..., 1] / (h - 1) * 2 - 1], -1)
@@ -432,6 +440,11 @@ def _selfcheck_scale_loss():
     batch["anch_mm"] = torch.tensor([[mm * 2]])   # claim it is twice as long -> ratio 0.5
     _, ratio2, _ = scale_loss(depth, inv_K, batch, (h, w))
     assert abs(ratio2.item() - 0.5) < 1e-3, ratio2.item()
+    batch["anch_cls"] = torch.tensor([[1]])       # class filter must zero out excluded objects
+    l3, _, w3 = scale_loss(depth, inv_K, batch, (h, w), classes=[2, 3])
+    assert w3.sum().item() == 0 and l3.item() == 0.0, (w3.sum().item(), l3.item())
+    l4, _, w4 = scale_loss(depth, inv_K, batch, (h, w), classes=[1])
+    assert w4.sum().item() == 1.0 and l4.item() > 0, (w4.sum().item(), l4.item())
 
 
 # ------------------------------------------------------------------------- losses
@@ -590,7 +603,8 @@ def position_loss(R, batch, hw, ssim, pos_smooth_w):
 
 
 def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj, project,
-                      hw, min_depth, max_depth, w, anchor=None, khead=None, scale_w=0.0):
+                      hw, min_depth, max_depth, w, anchor=None, khead=None, scale_w=0.0,
+                      scale_cls=None):
     """Stage 1: depth + pose + Transform against the appearance-refined target."""
     aug = {f: batch[("color_aug", f)] for f in (-1, 0, 1)}
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -624,7 +638,7 @@ def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj,
     if khead is not None:
         logs.update(_k_logs(K, hw))
     if scale_w > 0 and "anch_w" in batch:
-        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw)
+        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw, classes=scale_cls)
         loss = loss + scale_w * sl
         logs["scale"] = sl.item()
         logs["loss"] = loss.item()
@@ -656,7 +670,7 @@ def _set_stage(R, pose_enc, pose_dec, depth_model, stage, khead=None):
 
 def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, project,
                      hw, min_depth, max_depth, smooth_w, automask=True, anchor=None,
-                     khead=None, scale_w=0.0):
+                     khead=None, scale_w=0.0, scale_cls=None):
     """Returns (loss, logs). Single-scale Monodepth2 photometric + smoothness."""
     h, w = hw
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -699,7 +713,7 @@ def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, pro
     if khead is not None:
         logs.update(_k_logs(K, hw))
     if scale_w > 0 and "anch_w" in batch:
-        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw)
+        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw, classes=scale_cls)
         loss = loss + scale_w * sl
         logs["scale"] = sl.item()
         logs["loss"] = loss.item()
@@ -792,7 +806,7 @@ def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, 
                 batch, depth_model, pose_enc, pose_dec, ssim, backproj, project, hw,
                 args.min_depth, args.max_depth, args.smoothness,
                 automask=not args.no_automask, anchor=anchor, khead=khead,
-                scale_w=args.scale_w)
+                scale_w=args.scale_w, scale_cls=args.scale_classes)
         if train:
             if not torch.isfinite(loss):           # guard: never step on a NaN/Inf batch
                 skipped += 1
@@ -832,7 +846,8 @@ def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim
             _set_stage(R, pose_enc, pose_dec, depth_model, 1, khead)   # depth/pose/transform
             loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
                                            backproj, project, hw, args.min_depth, args.max_depth,
-                                           w, anchor=anchor, khead=khead, scale_w=args.scale_w)
+                                           w, anchor=anchor, khead=khead, scale_w=args.scale_w,
+                                           scale_cls=args.scale_classes)
             if not torch.isfinite(loss):
                 skipped += 1; continue
             opt.zero_grad(); loss.backward(); _clip(opt, args.grad_clip); opt.step()
@@ -844,7 +859,8 @@ def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim
                 loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
                                                backproj, project, hw, args.min_depth, args.max_depth,
                                                w, anchor=anchor, khead=khead,
-                                               scale_w=args.scale_w)
+                                               scale_w=args.scale_w,
+                                               scale_cls=args.scale_classes)
         for k, v in logs.items():
             agg[k] = agg.get(k, 0.0) + v
         nb += 1
@@ -955,6 +971,11 @@ def main():
                     help="ignore Train/Validation/Test dirs and split the clips under --data-root "
                          "by VIDEO (surgery), holding out N_VAL / N_TEST videos. Use for the ruler "
                          "dumps, which are a flat <video>/<clip>/images tree.")
+    ap.add_argument("--scale-classes", type=int, nargs="+", default=None, metavar="ID",
+                    help="restrict the scale loss to these scale_objects.json class_ids "
+                         "(1=Ruler, 2=Catheter tip, 3=Robot arm). The metric eval still scores "
+                         "EVERY class, so an excluded one is a held-out cross-object check. "
+                         "Default: supervise on all.")
     ap.add_argument("--max-anchors", type=int, default=4,
                     help="max annotated objects per frame fed to the scale loss (rest dropped)")
     ap.add_argument("--no-automask", action="store_true")
@@ -1122,7 +1143,8 @@ def main():
                            overlay_mask=not args.no_overlay_mask,
                            overlay_std_thresh=args.overlay_std_thresh, refine=args.refine,
                            motion_top_frac=args.motion_top_frac, anchor_w=args.anchor_w,
-                           scale_w=args.scale_w, video_split=args.video_split,
+                           scale_w=args.scale_w, scale_classes=args.scale_classes,
+                           video_split=args.video_split,
                            max_anchors=ds_kw["anchors_max"],
                            init=str(args.init), data_root=str(root)))
 
