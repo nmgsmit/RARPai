@@ -19,6 +19,35 @@ sessions don't re-derive them. Keep entries one or two lines.
   anchors. Neither run beats a single global constant on the frozen warm-start (deb 0.191).
   => next lever is `--anchor-w`, not the class mix.
 
+## 2026-09-02 — DEPTH: --min-depth/--max-depth WAS THE BUG (metric scale solved)
+- ROOT CAUSE of the first ruler run's failure: the defaults `--min-depth 0.1 --max-depth 150`.
+  disp_to_depth maps sigmoid disp -> depth via min_disp=1/max_depth, max_disp=1/min_depth, so with
+  those bounds the endoscopic range 35-120mm needs disp in [0.00017, 0.0022] = **0.2% of the
+  network's output range**, jammed against zero. That single fact explains all three symptoms:
+  warm-start "scale 0.005" (a mid-range disp ~0.36 decodes to 0.28mm), the scale loss's slow crawl
+  (must drive disp to ~0.001 through a saturating region), and the class divergence (at disp~0.001
+  a 0.001 step moves depth 22mm, so the catheter landed 8x nearer than the ruler).
+- FIX = one flag: `--min-depth 20 --max-depth 200`. Warm-start metric scale jumps 0.005 -> **0.894**
+  with NO training, abs_rel 0.995 -> 0.186. SCARED unchanged (0.054). Use these bounds for anything
+  metric on mm data; the 0.1/150 defaults are a KITTI/SCARED-unit convention, not mm.
+- RESULTS, 5 held-out videos, n=665, no median scaling (all 12 ep, K frozen):
+  `range` (anchor .3, sw .1) scale .919 abs_rel .211 | `range-noanchor` (sw .1) .933 / .200
+  | **`range-sw05` (anchor .3, sw .5) scale .974, abs_rel .205, SCARED .0557** <- best.
+  Val scale 1.002. Checkpoints in outputs/depth_ruler_range{,_noanchor,_sw05}/best.pth.
+- CROSS-ANCHOR CHECK NOW PASSES (SUL_10_week_plan Phase 3): sw05 per-class test scale
+  Ruler 1.036 / Catheter 0.982 / Robot arm 0.892 — three independent known-size objects agree
+  within ~14% on unseen surgeries. The catheter's 0.08 in the old-range runs was range compression,
+  not a bad annotation.
+- ANCHOR REVERSAL: with the OLD range `--anchor-w` FOUGHT `--scale-w` (anchor_loss is absolute L1
+  on log-disp to the frozen teacher => it pins the global scale at the teacher's wrong value; train
+  scale converged while val scale collapsed back to 0.036). With the corrected range the teacher is
+  already ~metric, so anchor+scale are complementary: sw05 trains stably to ep10, noanchor peaks at
+  ep1 then drifts (final val scale 0.797). Keep --anchor-w 0.3.
+- REMAINING CEILING: abs_rel ~= abs_rel_deb (.205 vs .205) => the residual ~20% is NOT a global
+  offset any calibration can remove, it is genuine per-object error. Scale is solved, accuracy is
+  not. Uncalibrated f is worth ~3% of that, not 20%. Also watch sw05's test/photo (0.158 vs ~0.049
+  elsewhere) while its SCARED depth score is fine -> the pose/refine nets took the hit, not depth.
+
 ## 2026-09-02 — DEPTH: metric scale loss from scale_objects.json (+ first result)
 - DATA: `../data/processed/depthclips_ruler_NoGUI/NOgui/<video>/clip_NNN.mp4/` (note: clip dir is
   named `*.mp4`) holds `images/` + `masks/` + `scale_objects.json` + `source_crop.json`. 1677
