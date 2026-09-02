@@ -3,6 +3,32 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-02 — DEPTH: metric scale loss from scale_objects.json (+ first result)
+- DATA: `../data/processed/depthclips_ruler_NoGUI/NOgui/<video>/clip_NNN.mp4/` (note: clip dir is
+  named `*.mp4`) holds `images/` + `masks/` + `scale_objects.json` + `source_crop.json`. 1677
+  frames / 65 clips / 18 videos, 89% of frames annotated. Objects = straight segments with known
+  mm: class 1 Ruler (annotator-typed 10-20mm), 2 Catheter tip (16Fr/3 = 5.333mm), 3 Robot arm
+  (8mm), each with `a`,`b` + 5 collinear `points` in 1340x1072 px (already cropped from 1920x1080
+  = the pillarbox removal, so K = the base 4:5 content K, all crop fracs 0).
+- LOSS `scale_loss` (finetune_depth.py): sample depth at the annotated points, back-project with
+  inv_K, compare polyline 3D length to the true mm as a Huber log-ratio, conf-weighted. Log space
+  = dimensionless (one `--scale-w` for all classes) and multiplicative on the global scale.
+  Do NOT use the json's `mm_per_px`: it is Z/f, depth-dependent, only valid at its own object.
+- `split_by_video` splits by SURGERY not clip; `eval_metric_scale` reports per class
+  `scale` (median pred/true length; 1.0 = metric), `abs_rel`, and `abs_rel_deb` (after dividing
+  out the global median = how much is ONE constant vs real shape error). Metric outranks SCARED
+  for checkpoint selection (SCARED is median-scaled => blind to scale).
+- PRE-FLIGHT check that the geometry is sound: `Z = f*S/p` from the annotations alone gives
+  median 55mm (ruler) / 61mm (catheter) / 45mm (arm) — all in endoscopic range, arm nearest.
+- FIRST RESULT (`endodac-ruler-scale`, jiui7izm, 4 ep, K frozen, scale-w 0.1): warm-start EndoDAC
+  is off by ONE constant — all 3 classes scale 0.005-0.006, debiased err 0.09-0.26, SCARED
+  abs_rel 0.057. Training raises scale 0.005 -> 0.605 monotonically (loss still falling, not
+  converged) BUT the classes DIVERGE (arm 0.855 / ruler 0.449 / catheter 0.365) and ruler
+  debiased err grows 0.26 -> 0.92, SCARED 0.057 -> 0.213. The scale term pins depth only at
+  annotated pixels, so the net satisfies it by locally deforming the map instead of rescaling it.
+  => a single global constant on the FROZEN warm-start beats 4 epochs of this. Next: `--anchor-w`
+  (frozen-teacher log-disp) to hold geometry while only the scale moves.
+
 ## 2026-07-18 — GUI template matching: `data/templates/` for overlay detection
 - `gui_mask.py` loads GUI templates via `load_templates(template_dir)` → all `.png` files in a dir,
   sorted by filename. Put your cropped template images in `data/templates/` (e.g., instrument icons,
