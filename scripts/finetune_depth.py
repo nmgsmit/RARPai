@@ -16,6 +16,13 @@ Data: RARPAtlas is MONOCULAR 1080p YouTube clips (no stereo) laid out as
 with consecutive frames per clip -> we build (t-stride, t, t+stride) triplets that have
 real camera motion for the photometric loss.
 
+METRIC mode (--scale-w): the ruler dumps at
+  ../data/processed/depthclips_ruler_NoGUI/NOgui/<video>/<clip>/{images,scale_objects.json}
+carry per-frame annotated segments of KNOWN physical length (Ruler, Catheter tip 5.333 mm,
+Robot arm 8 mm). `scale_loss` compares the back-projected 3D length of each against its mm, which
+is the ONLY term that fixes the otherwise-arbitrary global scale -- i.e. what turns the output
+into a metric depth map. `eval_metric_scale` scores that on held-out VIDEOS (--video-split).
+
 Real run (on Snellius, gpu_h100):
     python scripts/finetune_depth.py \
         --data-root ../data/RARPAtlas \
@@ -30,6 +37,7 @@ non-rigid artifacts show up in the qualitative panels.
 """
 from __future__ import annotations
 import argparse
+import json
 import os
 import random
 import sys
@@ -138,7 +146,7 @@ class RARPTriplets(Dataset):
                  augment=False, vignette_thresh=0.04, mask_overlay=True,
                  overlay_frames=16, overlay_std_thresh=6.0, overlay_min_valid=0.25,
                  side_crop_frac=0.0, top_crop_frac=0.0, sample_frac=1.0,
-                 motion_top_frac=1.0):
+                 motion_top_frac=1.0, clip_dirs=None, anchors_max=0):
         self.h, self.w = hw
         self.stride = stride
         self.bottom_crop_frac = bottom_crop_frac
@@ -163,15 +171,29 @@ class RARPTriplets(Dataset):
         # without hardcoding geometry. Clips too static to trust fall back to no mask.
         self.samples = []         # (frames[list[Path]], center_idx)
         self.overlay = {}         # str(clip_dir) -> valid mask (1,H,W) float, or None
-        clip_dirs = sorted(Path(split_dir).glob("*/*/clip_*/images"))
-        for d in clip_dirs:
-            frames = sorted(d.glob("frame_*.jpg")) or sorted(d.glob("frame_*.png"))
+        self.anchors_max = anchors_max
+        self.anchors = {}         # str(clip_dir) -> {center_idx: [(pts,mm,conf,class_id), ...]}
+        dirs = [Path(d) for d in clip_dirs] if clip_dirs is not None \
+            else sorted(Path(split_dir).glob("*/*/clip_*/images"))
+        for d in dirs:
+            frames = sorted(d.glob("frame_*.jpg")) or sorted(d.glob("frame_*.png")) \
+                or sorted(d.glob("*.jpg")) or sorted(d.glob("*.png"))
             for i in range(stride, len(frames) - stride):
                 self.samples.append((frames, i))
             self.overlay[str(d)] = self._overlay_mask(
                 frames, overlay_frames, overlay_std_thresh, overlay_min_valid) \
                 if mask_overlay else None
-        assert self.samples, f"no triplets found under {split_dir} (looked for */*/clip_*/images)"
+            if anchors_max:
+                self.anchors[str(d)] = load_scale_anchors(d.parent, (self.h, self.w))
+        assert self.samples, f"no triplets found under {split_dir or dirs[:1]}"
+        if anchors_max:
+            # Annotated points live in the dump's own (already-cropped) pixels; a training-time
+            # crop would displace them. ponytail: assert instead of transforming them -- the
+            # ruler dumps are pre-cropped to the 5:4 content, so no run needs both.
+            assert side_crop_frac == top_crop_frac == bottom_crop_frac == 0.0, \
+                "scale anchors are in source pixels; --*-crop-frac would displace them"
+            na = sum(len(v) for v in self.anchors.values())
+            print(f"[anchors] {na} annotated frames over {len(dirs)} clips", flush=True)
         # Frames sampled at 5-10 fps are highly redundant -> subsample triplet CENTERS (not frames:
         # each kept sample is still a real (t-s,t,t+s) triplet). Keeps every clip/video represented,
         # cuts epoch time proportionally. Fixed seed -> reproducible, stable across runs.
@@ -249,7 +271,167 @@ class RARPTriplets(Dataset):
             valid = valid * ov
         out["valid"] = valid
         out["K"], out["inv_K"] = self.K, self.inv_K
+        if self.anchors_max:
+            out.update(self._anchor_tensors(str(frames[0].parent), c))
         return out
+
+    def _anchor_tensors(self, clip_key, center):
+        """Fixed-shape (N,P,2)/(N,) tensors so anchors collate: unused slots get weight 0."""
+        n = self.anchors_max
+        pts = torch.zeros(n, ANCHOR_PTS, 2)
+        mm = torch.ones(n)
+        w = torch.zeros(n)
+        cls = torch.zeros(n, dtype=torch.long)
+        rows = self.anchors.get(clip_key, {}).get(center, [])[:n]
+        for i, (p, m, c, ci) in enumerate(rows):
+            idx = np.linspace(0, len(p) - 1, ANCHOR_PTS).round().astype(int)
+            pts[i] = torch.from_numpy(p[idx])
+            mm[i] = m
+            w[i] = c
+            cls[i] = ci
+        return {"anch_pts": pts, "anch_mm": mm, "anch_w": w, "anch_cls": cls}
+
+
+# ---------------------------------------------------------- metric scale anchors
+ANCHOR_PTS = 5            # points sampled per annotated segment (matches n_track_points)
+
+
+def load_scale_anchors(clip_dir, hw):
+    """Read <clip>/scale_objects.json -> {frame_idx: [(pts, mm, conf, class_id), ...]}, in FEED px.
+
+    Each annotated object is a straight segment of KNOWN physical length (`mm`) with `points`
+    along it in source-frame pixels: Ruler (annotator-typed mm), Catheter tip (Fr/3 = 5.333 mm)
+    and Robot arm (8 mm). Rescaling source -> feed is a pure isotropic factor because the dump is
+    already cropped to the 5:4 content (source_crop.json) and the feed keeps that aspect.
+    ponytail: align_corners convention (w-1), matching the grid_sample in scale_loss; the
+    half-pixel difference vs PIL's resize is <0.2% on a 300 px segment.
+    """
+    p = Path(clip_dir) / "scale_objects.json"
+    if not p.exists():
+        return {}
+    d = json.loads(p.read_text())
+    sw, sh = d["frame_size"]
+    sx, sy = (hw[1] - 1) / (sw - 1), (hw[0] - 1) / (sh - 1)
+    out = {}
+    for k, objs in d["frames"].items():
+        rows = []
+        for o in objs:
+            pts = np.asarray(o.get("points") or [], np.float32)
+            if len(pts) < 2 or not o.get("mm"):
+                continue
+            rows.append((np.stack([pts[:, 0] * sx, pts[:, 1] * sy], 1),
+                         float(o["mm"]), float(o.get("conf") or 1.0), int(o["class_id"])))
+        if rows:
+            out[int(k)] = rows
+    return out
+
+
+def scale_loss(depth, inv_K, batch, hw, delta=0.3):
+    """Metric anchor: predicted 3D length of each annotated segment vs its known mm.
+
+    Self-supervised depth is scale-ambiguous; this is the only term that fixes the global scale.
+    Depth is sampled at the annotated points, back-projected with inv_K, and the polyline length
+    compared to the physical length in LOG space -- dimensionless, so one weight covers all
+    object classes, and it acts as a multiplicative correction on the scale rather than fighting
+    the photometric gradient. Huber caps early-training outliers. Confidence-weighted; padded
+    slots carry weight 0. Uses all ANCHOR_PTS points (not just the endpoints) so a single noisy
+    depth sample on these thin objects averages out.
+
+    Returns (loss, ratio (B,N) = predicted/true length, weight (B,N)).
+    """
+    pts, mm, w = batch["anch_pts"], batch["anch_mm"], batch["anch_w"]
+    B, N, P, _ = pts.shape
+    h, wid = hw
+    g = torch.stack([pts[..., 0] / (wid - 1) * 2 - 1, pts[..., 1] / (h - 1) * 2 - 1], -1)
+    z = F.grid_sample(depth, g.view(B, N * P, 1, 2), align_corners=True,
+                      padding_mode="border").view(B, N, P)
+    hom = torch.cat([pts, torch.ones_like(pts[..., :1])], -1)
+    p3 = torch.einsum("bij,bnpj->bnpi", inv_K[:, :3, :3], hom) * z.unsqueeze(-1)
+    length = (p3[:, :, 1:] - p3[:, :, :-1]).norm(dim=-1).sum(-1)
+    ratio = length / mm.clamp(min=1e-6)
+    r = ratio.clamp(min=1e-6).log()
+    l = F.huber_loss(r, torch.zeros_like(r), reduction="none", delta=delta)
+    return (l * w).sum() / w.sum().clamp(min=1), ratio.detach(), w
+
+
+@torch.no_grad()
+def eval_metric_scale(depth_model, loader, hw, device, min_depth, max_depth):
+    """Is the depth map actually METRIC? Same geometry as scale_loss, with NO median scaling.
+
+    Per class and overall: `scale` = median predicted/true length (1.0 = metric), `abs_rel` =
+    median |ratio-1| (the raw error you would report), `abs_rel_deb` = the same after dividing
+    out the global median scale -- i.e. how much of the error is ONE constant offset (curable by
+    a single calibration) versus genuine per-object error.
+    """
+    was_training = depth_model.training
+    depth_model.eval()
+    rows = []
+    for batch in loader:
+        if "anch_w" not in batch:
+            break
+        batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        disp = F.interpolate(depth_model(batch[("color", 0)])[("disp", 0)], hw,
+                             mode="bilinear", align_corners=False)
+        _, depth = disp_to_depth(disp, min_depth, max_depth)
+        _, ratio, w = scale_loss(depth, batch["inv_K"], batch, hw)
+        m = w > 0
+        rows.append(torch.stack([ratio[m], batch["anch_cls"][m].float()], 1).cpu())
+    depth_model.train(was_training)
+    if not rows:
+        return {}
+    r = torch.cat(rows).numpy()
+    out = {}
+
+    def stats(v, tag):
+        if len(v) < 3:
+            return
+        sc = float(np.median(v))
+        out[tag + "scale"] = sc
+        out[tag + "abs_rel"] = float(np.median(np.abs(v - 1.0)))
+        out[tag + "abs_rel_deb"] = float(np.median(np.abs(v / sc - 1.0)))
+        out[tag + "n"] = float(len(v))
+
+    stats(r[:, 0], "")
+    for ci in np.unique(r[:, 1]):
+        stats(r[r[:, 1] == ci, 0], f"c{int(ci)}_")
+    return out
+
+
+def split_by_video(root, n_val, n_test, seed=42):
+    """Split clip dirs by VIDEO (surgery), not by clip -- clips from one surgery share anatomy,
+    lighting and scope, so a clip-level split leaks. Deterministic given seed."""
+    dirs = sorted(p for p in Path(root).rglob("images") if p.is_dir())
+    assert dirs, f"no */images clip dirs under {root}"
+    by_vid = {}
+    for d in dirs:
+        by_vid.setdefault(d.parent.parent.name, []).append(d)
+    vids = sorted(by_vid)
+    assert len(vids) > n_val + n_test, \
+        f"{len(vids)} videos, asked to hold out {n_val + n_test}"
+    random.Random(seed).shuffle(vids)
+    te, va, tr = vids[:n_test], vids[n_test:n_test + n_val], vids[n_test + n_val:]
+    print(f"[split] videos {len(tr)} train / {len(va)} val / {len(te)} test | "
+          f"val={[v[:8] for v in va]} test={[v[:8] for v in te]}", flush=True)
+    return [[d for v in g for d in by_vid[v]] for g in (tr, va, te)]
+
+
+def _selfcheck_scale_loss():
+    """A horizontal segment on a fronto-parallel plane has an exactly known metric length."""
+    h, w = 64, 80
+    fx = 0.82 * w
+    K = torch.tensor([[fx, 0, w / 2, 0], [0, 1.02 * h, h / 2, 0],
+                      [0, 0, 1, 0], [0, 0, 0, 1]])[None]
+    inv_K, Z = torch.inverse(K), 50.0
+    depth = torch.full((1, 1, h, w), Z)
+    u0, u1 = 30.0, 50.0
+    mm = (u1 - u0) * Z / fx                       # true length of that segment at depth Z
+    batch = {"anch_pts": torch.tensor([[u0, h / 2], [u1, h / 2]]).view(1, 1, 2, 2),
+             "anch_mm": torch.tensor([[mm]]), "anch_w": torch.ones(1, 1)}
+    loss, ratio, _ = scale_loss(depth, inv_K, batch, (h, w))
+    assert abs(ratio.item() - 1.0) < 1e-3 and loss.item() < 1e-6, (ratio.item(), loss.item())
+    batch["anch_mm"] = torch.tensor([[mm * 2]])   # claim it is twice as long -> ratio 0.5
+    _, ratio2, _ = scale_loss(depth, inv_K, batch, (h, w))
+    assert abs(ratio2.item() - 0.5) < 1e-3, ratio2.item()
 
 
 # ------------------------------------------------------------------------- losses
@@ -408,7 +590,7 @@ def position_loss(R, batch, hw, ssim, pos_smooth_w):
 
 
 def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj, project,
-                      hw, min_depth, max_depth, w, anchor=None, khead=None):
+                      hw, min_depth, max_depth, w, anchor=None, khead=None, scale_w=0.0):
     """Stage 1: depth + pose + Transform against the appearance-refined target."""
     aug = {f: batch[("color_aug", f)] for f in (-1, 0, 1)}
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -441,6 +623,13 @@ def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj,
                 transform=(transf / 2).item(), pose_rot=rot.item(), pose_trans=trn.item())
     if khead is not None:
         logs.update(_k_logs(K, hw))
+    if scale_w > 0 and "anch_w" in batch:
+        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw)
+        loss = loss + scale_w * sl
+        logs["scale"] = sl.item()
+        logs["loss"] = loss.item()
+        if aw.sum() > 0:                       # mean predicted/true length: 1.0 = metric
+            logs["scale_ratio"] = (ratio * aw).sum().item() / aw.sum().item()
     if anchor is not None:
         teacher, aw = anchor
         a = anchor_loss(disp, teacher, aug[0], valid, hw)
@@ -466,7 +655,8 @@ def _set_stage(R, pose_enc, pose_dec, depth_model, stage, khead=None):
 
 
 def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, project,
-                     hw, min_depth, max_depth, smooth_w, automask=True, anchor=None, khead=None):
+                     hw, min_depth, max_depth, smooth_w, automask=True, anchor=None,
+                     khead=None, scale_w=0.0):
     """Returns (loss, logs). Single-scale Monodepth2 photometric + smoothness."""
     h, w = hw
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -508,6 +698,13 @@ def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, pro
                 pose_rot=rot.item(), pose_trans=trans.item())
     if khead is not None:
         logs.update(_k_logs(K, hw))
+    if scale_w > 0 and "anch_w" in batch:
+        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw)
+        loss = loss + scale_w * sl
+        logs["scale"] = sl.item()
+        logs["loss"] = loss.item()
+        if aw.sum() > 0:                       # mean predicted/true length: 1.0 = metric
+            logs["scale_ratio"] = (ratio * aw).sum().item() / aw.sum().item()
     if anchor is not None:
         teacher, aw = anchor
         a = anchor_loss(disp, teacher, aug[0], valid, hw)
@@ -594,7 +791,8 @@ def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, 
             loss, logs = photometric_step(
                 batch, depth_model, pose_enc, pose_dec, ssim, backproj, project, hw,
                 args.min_depth, args.max_depth, args.smoothness,
-                automask=not args.no_automask, anchor=anchor, khead=khead)
+                automask=not args.no_automask, anchor=anchor, khead=khead,
+                scale_w=args.scale_w)
         if train:
             if not torch.isfinite(loss):           # guard: never step on a NaN/Inf batch
                 skipped += 1
@@ -634,7 +832,7 @@ def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim
             _set_stage(R, pose_enc, pose_dec, depth_model, 1, khead)   # depth/pose/transform
             loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
                                            backproj, project, hw, args.min_depth, args.max_depth,
-                                           w, anchor=anchor, khead=khead)
+                                           w, anchor=anchor, khead=khead, scale_w=args.scale_w)
             if not torch.isfinite(loss):
                 skipped += 1; continue
             opt.zero_grad(); loss.backward(); _clip(opt, args.grad_clip); opt.step()
@@ -645,7 +843,8 @@ def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim
             with torch.no_grad():
                 loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
                                                backproj, project, hw, args.min_depth, args.max_depth,
-                                               w, anchor=anchor, khead=khead)
+                                               w, anchor=anchor, khead=khead,
+                                               scale_w=args.scale_w)
         for k, v in logs.items():
             agg[k] = agg.get(k, 0.0) + v
         nb += 1
@@ -747,6 +946,17 @@ def main():
                     help="weight of the L1 log-disp anchor to the FROZEN warm-start model; "
                          "preserves pretrained geometry (tool depth) while adapting appearance. "
                          "0 disables; try 0.3")
+    ap.add_argument("--scale-w", type=float, default=0.0,
+                    help="weight of the METRIC scale-anchor loss: predicted 3D length of each "
+                         "annotated known-size object (scale_objects.json) vs its true mm, in "
+                         "log space. This is what makes the depth map metric; 0 disables. "
+                         "Try 0.1.")
+    ap.add_argument("--video-split", type=int, nargs=2, default=None, metavar=("N_VAL", "N_TEST"),
+                    help="ignore Train/Validation/Test dirs and split the clips under --data-root "
+                         "by VIDEO (surgery), holding out N_VAL / N_TEST videos. Use for the ruler "
+                         "dumps, which are a flat <video>/<clip>/images tree.")
+    ap.add_argument("--max-anchors", type=int, default=4,
+                    help="max annotated objects per frame fed to the scale loss (rest dropped)")
     ap.add_argument("--no-automask", action="store_true")
     ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--panel-size", type=int, default=8, help="fixed qualitative frames")
@@ -777,6 +987,7 @@ def main():
     if args.smoke:
         _selfcheck_crop_intrinsics()
         _selfcheck_khead_init()
+        _selfcheck_scale_loss()
         m = build_depth_model(model_shape, device)
         pe = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
         pd = decoders.PoseDecoder(pe.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
@@ -827,13 +1038,18 @@ def main():
           f"stride={args.frame_stride} refine={args.refine} "
           f"overlay_mask={not args.no_overlay_mask} device={device}", flush=True)
 
+    # Anchors load whenever the scale loss is on OR we split by video (the ruler dumps), so
+    # the metric eval still has something to score in a --scale-w 0 baseline run.
+    ds_kw["anchors_max"] = args.max_anchors if (args.scale_w > 0 or args.video_split) else 0
+    tr_dirs, va_dirs, te_dirs = split_by_video(root, *args.video_split, args.seed) \
+        if args.video_split else (None, None, None)
     tr_ds = RARPTriplets(root / "Train", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
                          augment=not args.no_augment, sample_frac=args.sample_frac,
-                         motion_top_frac=args.motion_top_frac, **ds_kw)
+                         motion_top_frac=args.motion_top_frac, clip_dirs=tr_dirs, **ds_kw)
     tr = DataLoader(tr_ds, args.batch_size, shuffle=True, num_workers=args.workers,
                     pin_memory=True, drop_last=True)
     va_ds = RARPTriplets(root / "Validation", hw, k_norm, args.frame_stride,
-                         args.bottom_crop_frac, **ds_kw)
+                         args.bottom_crop_frac, clip_dirs=va_dirs, **ds_kw)
     va = DataLoader(va_ds, args.batch_size, shuffle=False, num_workers=args.workers,
                     pin_memory=True, drop_last=True)
 
@@ -906,6 +1122,8 @@ def main():
                            overlay_mask=not args.no_overlay_mask,
                            overlay_std_thresh=args.overlay_std_thresh, refine=args.refine,
                            motion_top_frac=args.motion_top_frac, anchor_w=args.anchor_w,
+                           scale_w=args.scale_w, video_split=args.video_split,
+                           max_anchors=ds_kw["anchors_max"],
                            init=str(args.init), data_root=str(root)))
 
     outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
@@ -925,6 +1143,13 @@ def main():
                                side_crop=content_crop(args.side_crop_frac, args.black_bar_frac),
                                bottom_crop=args.bottom_crop_frac, top_crop=args.top_crop_frac)
 
+    def eval_metric_now(loader):
+        """Metric accuracy on the known-size objects. Unlike SCARED (median-scaled, so blind to
+        scale) this is the only number that says whether the depth map is METRIC."""
+        if not ds_kw["anchors_max"]:
+            return {}
+        return eval_metric_scale(depth_model, loader, hw, device, args.min_depth, args.max_depth)
+
     # epoch-0 warm-start baseline (panel + SCARED). Pretrained EndoDAC is already strong on SCARED,
     # so a fine-tune that never beats epoch 0 shouldn't ship -> seed `best` from the warm-start and
     # save it as the initial best.pth (only a genuine improvement overwrites it).
@@ -932,16 +1157,26 @@ def main():
         qualitative_panel(depth_model, panel, hw, device, args.min_depth, args.max_depth),
         caption="epoch 0 (warm-start, before UMC fine-tune)"), "epoch": 0}
     best = float("inf")
-    sel_name = "val_photo"                                      # updated to scared_abs_rel if GT present
+    sel_name = "val_photo"          # -> scared_abs_rel, then metric_val_abs_rel, if available
     sres0 = eval_scared_now()
     if sres0 is not None:
         sm0, _, _ = sres0
         log0.update({f"scared/{k}": v for k, v in sm0.items()})
         best, sel_name = sm0["abs_rel"], "scared_abs_rel"
-        torch.save(depth_model.state_dict(), outdir / "best.pth")   # warm-start eligible as best
-        wandb.run.summary.update({f"best_{sel_name}": best, "best_epoch": 0})
         print(f"[epoch 0] warm-start scared_abs_rel={best:.4f}  rmse={sm0['rmse']:.4f}  "
               f"a1={sm0['a1']:.4f}", flush=True)
+    # Metric error outranks SCARED for selection: SCARED is median-scaled, so a model can win it
+    # while being metrically wrong by any constant factor -- which is exactly what we train here.
+    mres0 = eval_metric_now(va)
+    if mres0:
+        log0.update({f"metric_val/{k}": v for k, v in mres0.items()})
+        best, sel_name = mres0["abs_rel"], "metric_val_abs_rel"
+        print(f"[epoch 0] warm-start metric scale={mres0['scale']:.3f} "
+              f"abs_rel={mres0['abs_rel']:.3f} debiased={mres0['abs_rel_deb']:.3f} "
+              f"(n={int(mres0['n'])})", flush=True)
+    if best < float("inf"):
+        torch.save(depth_model.state_dict(), outdir / "best.pth")   # warm-start eligible as best
+        wandb.run.summary.update({f"best_{sel_name}": best, "best_epoch": 0})
     wandb.log(log0)
     for ep in range(1, args.epochs + 1):
         tr_logs = do_epoch(tr, train=True)
@@ -958,9 +1193,15 @@ def main():
             score, sel_name = sm["abs_rel"], "scared_abs_rel"
         else:
             score = va_logs["photo"]                           # no GT -> proxy selection
+        mres = eval_metric_now(va)
+        if mres:
+            logd.update({f"metric_val/{k}": v for k, v in mres.items()})
+            score, sel_name = mres["abs_rel"], "metric_val_abs_rel"
         print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
               f"val_photo={va_logs['photo']:.4f}  {sel_name}={score:.4f}  "
-              f"pose_trans={tr_logs['pose_trans']:.4f}", flush=True)
+              + (f"metric_scale={mres['scale']:.3f}  " if mres else "")
+              + (f"train_scale={tr_logs['scale']:.4f}  " if "scale" in tr_logs else "")
+              + f"pose_trans={tr_logs['pose_trans']:.4f}", flush=True)
         panel_img = qualitative_panel(depth_model, panel, hw, device, args.min_depth, args.max_depth)
         logd["qual/panel"] = wandb.Image(panel_img, caption=f"epoch {ep} [rgb | depth]")
         wandb.log(logd)
@@ -974,12 +1215,18 @@ def main():
             wandb.run.summary["best_epoch"] = ep
 
     # final report numbers on Test (proxy only -- no depth GT)
-    te_ds = RARPTriplets(root / "Test", hw, k_norm, args.frame_stride, args.bottom_crop_frac, **ds_kw)
+    te_ds = RARPTriplets(root / "Test", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
+                         clip_dirs=te_dirs, **ds_kw)
     te = DataLoader(te_ds, args.batch_size, shuffle=False, num_workers=args.workers, drop_last=True)
     depth_model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
     te_logs = do_epoch(te, train=False)
     print(f"[test] photo={te_logs['photo']:.4f} smooth={te_logs['smooth']:.4f}", flush=True)
     wandb.run.summary.update({f"test/{k}": v for k, v in te_logs.items()})
+    mte = eval_metric_now(te)                  # HELD-OUT videos: the headline metric number
+    if mte:
+        print("[metric/test] " + "  ".join(f"{k}={v:.4f}" for k, v in mte.items()), flush=True)
+        wandb.log({f"metric_test/{k}": v for k, v in mte.items()})
+        wandb.run.summary.update({f"metric_test/{k}": v for k, v in mte.items()})
     wandb.log({"qual/test_panel": wandb.Image(
         qualitative_panel(depth_model, [(te_ds[i][("color", 0)], te_ds[i]["valid"])
                           for i in np.linspace(0, len(te_ds) - 1, args.panel_size).astype(int)],
