@@ -3,6 +3,22 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-02 — DEPTH: --scale-classes A/B — dropping the Ruler makes metric scale WORSE
+- `--scale-classes ID...` restricts scale supervision to given class_ids; the metric eval still
+  scores every class, so an excluded one is a held-out cross-object check.
+- A/B on the same split (4 ep, K frozen, scale-w 0.1): all-classes `jiui7izm` vs cath+arm-only
+  `a1dlnj65`. Test scale 0.559 vs 0.062; test abs_rel 0.516 vs 0.938. Held-out Ruler scale 0.027
+  in run 2 = the learned scale did NOT transfer to an unsupervised class at all.
+- CAUSE is supervision VOLUME, not ruler quality: of 856 annotated TRAIN frames, 850 carry a
+  ruler but only 283 carry a catheter/arm, so 2/3 of batches contribute zero scale gradient.
+  The per-batch loss is w-weighted, so those frames are silently free. The ruler is not bad data
+  — at warm-start all 3 classes agree exactly (scale 0.005/0.005/0.006).
+- BUT run 2 is better per-object once the global offset is divided out: test abs_rel_deb catheter
+  0.384 (vs 0.742) and arm 0.350 (vs 0.371); SCARED 0.195 vs 0.213. So cath+arm supervision is
+  CLEANER but too sparse; the ruler is ABUNDANT but the net deforms it locally to satisfy the
+  anchors. Neither run beats a single global constant on the frozen warm-start (deb 0.191).
+  => next lever is `--anchor-w`, not the class mix.
+
 ## 2026-09-02 — DEPTH: metric scale loss from scale_objects.json (+ first result)
 - DATA: `../data/processed/depthclips_ruler_NoGUI/NOgui/<video>/clip_NNN.mp4/` (note: clip dir is
   named `*.mp4`) holds `images/` + `masks/` + `scale_objects.json` + `source_crop.json`. 1677
