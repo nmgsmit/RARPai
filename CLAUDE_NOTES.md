@@ -384,3 +384,46 @@ here.
 Defaults now `--min-bars 4`, `--bar-thresh 0.90`, `--pad-after 0`. Over 10 videos at stride 5:
 769 pair hits, 41 inferred, 14326 clear. Every inferred hit spot-checked against raw pixels was a
 real bar.
+
+
+## 2026-09-02 - depth measurement GUI (`scripts/gui_depth_measure.py`)
+
+Click two points on a frame, get the distance in mm. Local Windows app (Tkinter, so nothing to
+install beyond torch/PIL/matplotlib/opencv/fvcore), CPU inference, no Snellius involvement.
+Defaults are pinned to the run that made depth metric: `outputs/depth_ruler_range_sw05/best.pth`,
+`--image-shape 392 490`, `--min-depth 20 --max-depth 200`, K = the SCARED assumed
+(0.82, 1.02, 0.5, 0.5). Nick has no calibrated da Vinci intrinsics, so the assumed K stands.
+
+**The measurement is the same maths as the scale loss that trained the model.** `segment_length`
+back-projects both clicked pixels with normalised K -- X = (u/W - cx)z/fx, Y = (v/H - cy)z/fy --
+and takes the norm, exactly `scale_loss`'s per-segment length with N=2. `--self-test` asserts that
+against a fronto-parallel plane the same way `_selfcheck_scale_loss` does. Consequence worth
+keeping: everything is in NORMALISED coordinates, so display resolution, crop size and the depth
+map's own resolution are all decoupled.
+
+**The DPT head does not return the feed resolution.** A 392x490 feed comes back as a 448x560 disp.
+Aspect is preserved, so normalised sampling stays exact and the GUI keeps the native map instead of
+resizing it (training interpolated to the round32 `hw`; either is fine, this one loses less).
+
+**Framing is the failure mode to watch, not the model.** The assumed K describes the 5:4 ruler-dump
+view. Hand the model a raw 16:9 console frame and both the depth and the mm are wrong, silently.
+So the GUI auto-detects the pillarbox on load (`auto_bars`, near-black border rows/cols), exposes
+the three crop fracs, and shows the resulting aspect in orange unless it is within 0.08 of 1.25.
+
+**Scale honesty.** Held-out test scale ratio was 0.974, per-class 1.04/0.98/0.89 -- so a number
+here is mm +-a few percent, and the per-object spread is wider than the global scale error. The
+`scale x` box and *Calibrate from selected...* (type the true length of a measured known object ->
+solves the multiplier, rescales everything) are how you do better on a specific scene. Depth is
+sampled as a patch median (default r=2) because a single sample on a thin instrument edge can land
+on the discontinuity and be off by centimetres.
+
+**Tests.** `scripts/tests/smoke_gui_depth_measure.py` drives the real Tk window under Xvfb
+(26 checks: auto-crop, click->measure, scale/patch/calibrate, undo/clear, CSV+PNG export) with the
+dialogs stubbed, since a modal would deadlock the mainloop headless; `run_gui(args, on_ready=...)`
+exists only as that hook. `scripts/tests/smoke_depth_backend.py` builds EndoDAC, saves a
+random-weight checkpoint and runs it through `DepthBackend` -- proves the 389-key contract, the
+patch grid at 392x490 and the 20/200 band without needing the trained weights.
+
+`DepthBackend` imports `make_endodac`/`disp_to_depth` from `finetune_depth` rather than copying
+them (the vit_base `input_size` monkeypatch is easy to get subtly wrong), and shims a no-op
+`dotenv` if it is missing so measuring does not depend on the wandb creds path.

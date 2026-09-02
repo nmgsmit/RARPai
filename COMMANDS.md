@@ -52,3 +52,43 @@ git add -A && git commit -m "msg" && git push
 git pull
 ```
 Code only reaches Snellius after this round-trip — editing locally does nothing until pushed + pulled.
+
+## Measure a distance on an image (local Windows GUI)
+
+Click two points on a frame -> length in mm from the depth map. Runs on the laptop, CPU is fine
+(~1-3 s per frame). Nothing here touches Snellius.
+
+**One-time setup (PowerShell, in the repo):**
+```powershell
+# 1. copy the trained checkpoint down from Snellius (keep the folder name!)
+mkdir outputs\depth_ruler_range_sw05
+scp snellius:~/RARPai/outputs/depth_ruler_range_sw05/best.pth outputs\depth_ruler_range_sw05\
+
+# 2. deps (Tkinter ships with python.org Python; the CPU torch wheel is enough)
+pip install torch torchvision numpy pillow matplotlib opencv-python fvcore
+#   fvcore is a hard import of the vendored EndoDAC backbone, not optional.
+#   "xFormers is not available/disabled" warnings on start-up are expected and harmless.
+```
+
+**Run:**
+```powershell
+python scripts\gui_depth_measure.py                          # browses ..\data
+python scripts\gui_depth_measure.py --data-dir ..\data\fold1
+python scripts\gui_depth_measure.py --image ..\data\some\frame_0001.jpg
+python scripts\gui_depth_measure.py --self-test              # geometry checks, no torch needed
+python scripts\gui_depth_measure.py --no-model               # UI only, synthetic depth
+```
+
+**Using it:** *Open folder* -> pick a frame -> left-click point A, left-click point B -> the mm
+appears on the line. Wheel = zoom, right-drag = pan, `Esc` cancels a half-placed point,
+`Ctrl-Z`/`<-`/`->` undo / prev / next image.
+
+- **Check the aspect readout says ~1.250 before believing a number.** The model was trained on the
+  5:4 ruler dumps, so a raw 16:9 console frame must have its black bars cropped off; *Auto bars*
+  runs on load and usually gets it, the three frac boxes are the manual override.
+- **Expect a few percent of scale error** (held-out test scale ratio 0.974). For better than that on
+  a given scene, measure something of known size, select it in the list, hit *Calibrate from
+  selected...* and type the true mm - every measurement rescales.
+- Depth is sampled as a median over a small patch (`patch px`), so clicking near an edge is
+  forgiving; drop it to 0 if you are measuring something genuinely thin.
+- *Export CSV* / *Save PNG* write the measurements next to whatever you name them.

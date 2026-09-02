@@ -17,6 +17,9 @@ tqdm>=4.65
 # SurgeNet
 timm==1.0.13
 
+# EndoDAC backbone (third_party/endodac) — hard import of models/backbones/layers/utils.py
+fvcore>=0.1.5
+
 # HuggingFace — model/checkpoint downloads
 huggingface-hub>=0.23
 
