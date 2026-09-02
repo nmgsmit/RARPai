@@ -20,21 +20,30 @@ source venv/bin/activate
 # instead of an arbitrary scale; --video-split holds out whole surgeries (4 val / 5 test of 18)
 # so the reported metric error can't be leaked by a sibling clip.
 #
-# K is FROZEN here (--no-learn-intrinsics): the focal and the depth scale trade off, so letting
-# the IntrinsicsHead move while the scale loss pulls on depth makes the result unreadable.
-# Run 2 flips it on to see whether the anchors calibrate f.
+# --min-depth/--max-depth ARE NOT OPTIONAL HERE. The 0.1/150 defaults are a KITTI/SCARED-unit
+# convention: with them disp_to_depth squeezes the 35-120mm endoscopic range into 0.2% of the
+# sigmoid's output range and the model cannot be metric (warm-start scale 0.005). At 20/200 the
+# SAME untrained weights score scale 0.894. See CLAUDE_NOTES 2026-09-02.
 #
-# Short convergence probe: 4 epochs. Watch train/scale_ratio -> 1.0 and metric_val/abs_rel.
+# K is FROZEN (--no-learn-intrinsics): focal and depth scale trade off, so letting the
+# IntrinsicsHead move while the scale loss pulls on depth makes the result unreadable. Run 2
+# flips it on to see whether the anchors calibrate f now that the scale is pinned.
+#
+# Best config so far (endodac-ruler-range-sw05): test scale 0.974 on the 5 held-out videos,
+# per-class 1.04 / 0.98 / 0.89, SCARED abs_rel 0.056. Residual ~20% is per-object, not scale.
 # Frames are dumped at unknown fps, so --frame-stride 1 (clips are only ~26 frames); sweep it.
 python scripts/finetune_depth.py \
     --data-root ../data/processed/depthclips_ruler_NoGUI \
     --init ../backbones/EndoDAC/depth_model.pth \
     --pose-init-dir ../backbones/EndoDAC \
-    --out outputs/depth_ruler_scale \
-    --run-name endodac-ruler-scale \
+    --out outputs/depth_ruler_metric \
+    --run-name endodac-ruler-metric \
     --image-shape 392 490 \
     --video-split 4 5 \
-    --scale-w 0.1 \
+    --scale-w 0.5 \
+    --anchor-w 0.3 \
+    --min-depth 20 \
+    --max-depth 200 \
     --no-learn-intrinsics \
-    --epochs 4 \
+    --epochs 12 \
     "$@"
