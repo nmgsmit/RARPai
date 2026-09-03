@@ -454,3 +454,13 @@ Nothing is ever invalidated - the folder is a permanent dump other scripts can r
 directories, fingerprint stability across mtime, LRU eviction, and a counting backend proving the
 model runs at most once per image+crop); the Xvfb suite is up to 38 checks, including precompute,
 the `*` marks, and returning to a checkpoint's folder with its maps intact.
+
+### Build stamp + scrolling control column
+
+Two bug reports on the same day ("I don't see the new buttons", "still slow") had one likely cause:
+an old copy running. There was no way to tell by looking, so `BUILD` is now printed at start-up,
+shown in the title bar and available as `--version` -- bump it on every user-visible change.
+
+The control column also scrolls now (canvas + inner frame). Tk clips a too-tall frame silently, so
+on a laptop screen whichever section did not fit simply vanished, which is indistinguishable from
+the app being out of date. Sections can be added freely from here.

@@ -72,6 +72,7 @@ pip install torch torchvision numpy pillow matplotlib opencv-python fvcore
 
 **Run:**
 ```powershell
+python scripts\gui_depth_measure.py --version               # which build + which file
 python scripts\gui_depth_measure.py                          # browses ..\data
 python scripts\gui_depth_measure.py --data-dir ..\data\fold1
 python scripts\gui_depth_measure.py --image ..\data\some\frame_0001.jpg
@@ -105,3 +106,8 @@ Other scripts can read the dump directly: `np.load(f)["depth"]` is the depth in 
 - Depth is sampled as a median over a small patch (`patch px`), so clicking near an edge is
   forgiving; drop it to 0 if you are measuring something genuinely thin.
 - *Export CSV* / *Save PNG* write the measurements next to whatever you name them.
+
+**Missing a button the notes mention?** The title bar and `--version` print a build number - if it
+is lower than the change you are looking for, the running copy is an old one (wrong folder, or
+`git pull` not done in the folder you launch from). The control column scrolls, so nothing is ever
+hidden by a small screen.

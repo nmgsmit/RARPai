@@ -53,6 +53,10 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parents[1]
 
+# Bump on every user-visible change. Printed at start-up and shown in the title bar, so
+# "I don't see the new buttons" is one glance instead of a guess about which copy is running.
+BUILD = 3   # 1: measure  2: depth cache + checkpoint picker  3: scrollable panel, build stamp
+
 # ------------------------------------------------------------------ defaults (best run)
 DEFAULT_CKPT = REPO / "outputs" / "depth_ruler_range_sw05" / "best.pth"
 DEFAULT_DATA = REPO.parent / "data"
@@ -503,7 +507,7 @@ def run_gui(args, on_ready=None):
     sess = Session(k_norm=tuple(args.intrinsics), scale=args.scale, radius=args.patch_radius)
 
     root = tk.Tk()
-    root.title("RARPai - depth ruler")
+    root.title(f"RARPai - depth ruler (build {BUILD})")
     root.geometry("1500x900")
 
     state = dict(path=None, full=None, crop=None, depth=None, disp_img=None, tkimg=None,
@@ -511,8 +515,26 @@ def run_gui(args, on_ready=None):
                  provider=None, abort=False)
 
     # ---------------------------------------------------------------- left: controls
-    left = ttk.Frame(root, padding=8)
-    left.pack(side="left", fill="y")
+    # The control column SCROLLS. Tk clips a too-tall frame silently -- on a laptop screen that
+    # quietly hides whichever controls do not fit, which looks exactly like the app being out of
+    # date. A canvas + inner frame means new sections can never disappear.
+    left_outer = ttk.Frame(root)
+    left_outer.pack(side="left", fill="y")
+    left_canvas = tk.Canvas(left_outer, width=252, highlightthickness=0, takefocus=0)
+    left_scroll = ttk.Scrollbar(left_outer, orient="vertical", command=left_canvas.yview)
+    left_canvas.configure(yscrollcommand=left_scroll.set)
+    left_scroll.pack(side="right", fill="y")
+    left_canvas.pack(side="left", fill="y", expand=True)
+    left = ttk.Frame(left_canvas, padding=8)
+    left_win = left_canvas.create_window((0, 0), window=left, anchor="nw")
+    left.bind("<Configure>",
+              lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all")))
+    left_canvas.bind("<Configure>",
+                     lambda e: left_canvas.itemconfigure(left_win, width=e.width))
+    for w in (left_canvas, left):
+        w.bind("<MouseWheel>", lambda e: left_canvas.yview_scroll(
+            -1 if e.delta > 0 else 1, "units"))
+
     canvas = tk.Canvas(root, bg="#1e1e1e", highlightthickness=0, cursor="tcross")
     canvas.pack(side="right", fill="both", expand=True)
 
@@ -1024,12 +1046,19 @@ def run_gui(args, on_ready=None):
                              scale=v_scale, rad=v_rad, fx=v_fx, fy=v_fy),
                    set_auto_crop=set_auto_crop, provider=lambda: state["provider"],
                    set_checkpoint=set_checkpoint, precompute_all=precompute_all,
-                   mark_files=mark_files, filebox=filebox,
+                   mark_files=mark_files, filebox=filebox, cache_lbl=cache_lbl,
+                   ckpt_box=ckpt_box, left=left, left_canvas=left_canvas,
                    export_csv=export_csv, save_png=save_png, calibrate=calibrate,
                    select_index=select_index, step=step, zoom=zoom)
         root.after(200, lambda: on_ready(ctx))
 
     root.mainloop()
+
+
+def banner():
+    """Which build, from which file. The answer to "why don't I see the new buttons"."""
+    f = Path(__file__).resolve()
+    return f"gui_depth_measure build {BUILD}  |  {f}"
 
 
 def main():
@@ -1052,10 +1081,16 @@ def main():
     ap.add_argument("--device", default=None, help="cuda / cpu (default: auto)")
     ap.add_argument("--no-model", action="store_true", help="UI only, synthetic depth")
     ap.add_argument("--self-test", action="store_true", help="geometry checks, no torch needed")
+    ap.add_argument("--version", action="store_true",
+                    help="print which build and which file is about to run, then exit")
     args = ap.parse_args()
+    if args.version:
+        print(banner())
+        return
     if args.self_test:
         self_test()
         return
+    print(banner(), flush=True)
     run_gui(args)
 
 

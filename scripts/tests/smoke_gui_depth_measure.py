@@ -71,6 +71,10 @@ def drive(ctx):
     popups = stub_dialogs(csv_path, png_path, true_mm=25.0)
     try:
         check(state["depth"] is not None, "depth predicted on load")
+        check(f"build {G.BUILD}" in root.title(), f"title carries the build stamp ({G.BUILD})")
+        panel = ctx["cache_lbl"].winfo_toplevel()
+        check(panel is root, "control panel lives in the window")
+        check(ctx["cache_lbl"].winfo_manager() == "pack", "cache label is laid out")
         check(not CKPT or ctx["provider"]().backend.model is not None,
               "real model loaded inside the GUI")
         check(state["crop"].size == (1344, 1080),
@@ -214,7 +218,7 @@ def main():
         cache_dir=str(TMP / "cache"), no_cache=False,
         min_depth=G.DEFAULT_MIN_DEPTH, max_depth=G.DEFAULT_MAX_DEPTH,
         intrinsics=list(G.DEFAULT_K_NORM), scale=1.0, patch_radius=2, device="cpu",
-        no_model=not CKPT, self_test=False)
+        no_model=not CKPT, self_test=False, version=False)
     G.run_gui(args, on_ready=drive)
     print("FAILURES:", FAILS if FAILS else "none")
     sys.exit(1 if FAILS else 0)
