@@ -464,3 +464,17 @@ shown in the title bar and available as `--version` -- bump it on every user-vis
 The control column also scrolls now (canvas + inner frame). Tk clips a too-tall frame silently, so
 on a laptop screen whichever section did not fit simply vanished, which is indistinguishable from
 the app being out of date. Sections can be added freely from here.
+
+### Timing in the status line, and npz compression dropped (same day)
+
+Follow-up report: "still slow" even on build 3 with the cache in place. Suspicion was the .npz
+format. Benchmarked before touching anything (448x560 float32 map, the actual size the DPT head
+returns): `savez_compressed` 50 ms/write, plain `savez` <1 ms/write, `np.load` read 6 ms either
+way. All three are noise next to a multi-second CPU forward pass -- npz was never the bottleneck.
+Dropped the compression anyway (no reason to pay 50ms x thousands of frames on a big precompute
+run for ~11% smaller files), but the real fix is diagnostic, not speed: `DepthProvider.depth_for`
+now returns elapsed time alongside the tier, and the status line shows both, e.g.
+`frame_0142.jpg [cache 6 ms]` vs `[model 2400 ms]`. "Slow" no longer needs a guess about which
+stage -- the line says model vs disk vs something else in the click/redraw path.
+
+BUILD -> 4.

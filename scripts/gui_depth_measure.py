@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,7 +56,8 @@ REPO = Path(__file__).resolve().parents[1]
 
 # Bump on every user-visible change. Printed at start-up and shown in the title bar, so
 # "I don't see the new buttons" is one glance instead of a guess about which copy is running.
-BUILD = 3   # 1: measure  2: depth cache + checkpoint picker  3: scrollable panel, build stamp
+BUILD = 4   # 1: measure  2: depth cache + checkpoint picker  3: scrollable panel, build stamp
+            # 4: per-stage timing in the status line + faster (uncompressed) cache writes
 
 # ------------------------------------------------------------------ defaults (best run)
 DEFAULT_CKPT = REPO / "outputs" / "depth_ruler_range_sw05" / "best.pth"
@@ -304,13 +306,16 @@ class DepthCache:
 
     def put(self, img_path, fracs, depth):
         ik, ck = self.img_key(img_path), self.crop_key(fracs)
-        np.savez_compressed(self.path_for(img_path, ik, ck), depth=depth.astype(np.float32),
-                            meta=json.dumps({"source": str(Path(img_path).resolve()),
-                                             "crop_fracs": list(fracs),
-                                             "image_shape": list(self.image_shape),
-                                             "min_depth": self.min_depth,
-                                             "max_depth": self.max_depth,
-                                             "version": self.VERSION}))
+        # Plain (uncompressed) npz: benchmarked at <1ms/write vs ~50ms compressed for a
+        # 448x560 float32 map, for ~11% more disk -- irrelevant next to seconds of CPU
+        # inference, and it adds up over a big precompute run for nothing in return.
+        np.savez(self.path_for(img_path, ik, ck), depth=depth.astype(np.float32),
+                meta=json.dumps({"source": str(Path(img_path).resolve()),
+                                 "crop_fracs": list(fracs),
+                                 "image_shape": list(self.image_shape),
+                                 "min_depth": self.min_depth,
+                                 "max_depth": self.max_depth,
+                                 "version": self.VERSION}))
         self.index.setdefault(ik, set()).add(ck)
 
 
@@ -340,22 +345,26 @@ class DepthProvider:
             else self.cache.has_any(img_path)
 
     def depth_for(self, img_path, pil_crop, fracs, on_compute=None):
+        """Returns (depth, tier, elapsed_seconds). Timing is reported, not guessed at: when
+        something is slow, the status line already says whether that was the model or disk."""
+        t0 = time.perf_counter()
         if self.cache is None:
             self.computed += 1
-            return self.backend.predict(pil_crop), "model"
+            return self.backend.predict(pil_crop), "model", time.perf_counter() - t0
         key = (self.cache.img_key(img_path), self.cache.crop_key(fracs))
         if key in self.mem:
             self.mem[key] = self.mem.pop(key)    # touch: most recently used goes last
-            return self.mem[key], "memory"
+            return self.mem[key], "memory", time.perf_counter() - t0
         hit = self.cache.get(img_path, fracs)
         if hit is not None:
-            return self._remember(key, hit), "cache"
+            return self._remember(key, hit), "cache", time.perf_counter() - t0
         if on_compute:
             on_compute()
         self.computed += 1
         depth = self.backend.predict(pil_crop)
+        t_model = time.perf_counter() - t0
         self.cache.put(img_path, fracs, depth)
-        return self._remember(key, depth), "model"
+        return self._remember(key, depth), "model", time.perf_counter() - t0
 
 
 # ------------------------------------------------------------------------ app state
@@ -469,12 +478,12 @@ def self_test():
 
         prov = DepthProvider(CountingBackend(), DepthCache(tmp / "cache2", ck1, (392, 490), 20, 200,
                                                            log=lambda m: None))
-        a, src_a = prov.depth_for(img, None, (0, 0, 0))
-        b_, src_b = prov.depth_for(img, None, (0, 0, 0))
+        a, src_a, _ = prov.depth_for(img, None, (0, 0, 0))
+        b_, src_b, _ = prov.depth_for(img, None, (0, 0, 0))
         assert (src_a, src_b) == ("model", "memory") and CountingBackend.calls == 1
         assert np.array_equal(a, b_)
         prov.mem.clear()
-        _, src_c = prov.depth_for(img, None, (0, 0, 0))
+        _, src_c, _ = prov.depth_for(img, None, (0, 0, 0))
         assert src_c == "cache" and CountingBackend.calls == 1        # disk hit, no model run
         assert prov.cached(img) and prov.cached(img, (0, 0, 0))
         assert not prov.cached(img, (0.2, 0, 0))
@@ -656,7 +665,9 @@ def run_gui(args, on_ready=None):
             be = DepthBackend(path, args.image_shape, args.min_depth, args.max_depth, args.device)
             try:
                 log(f"loading {ckpt_label(path)} (first time takes ~30 s on CPU) ...", "#06c")
+                t0 = time.perf_counter()
                 be.load(log=lambda m: log(m, "#06c"))
+                log(f"loaded {ckpt_label(path)} in {time.perf_counter() - t0:.1f}s", "#06c")
             except Exception as exc:                          # noqa: BLE001 - surface to the UI
                 log(f"model load failed: {exc}", "#c00")
                 messagebox.showerror("Checkpoint", str(exc))
@@ -807,7 +818,7 @@ def run_gui(args, on_ready=None):
             log("no checkpoint loaded", "#c00")
             return
         try:
-            state["depth"], src = prov.depth_for(
+            state["depth"], src, dt = prov.depth_for(
                 state["path"], state["crop"], fracs(),
                 on_compute=lambda: log(f"predicting depth for {state['path'].name} ...", "#06c"))
         except Exception as exc:                              # noqa: BLE001 - surface to the UI
@@ -817,7 +828,7 @@ def run_gui(args, on_ready=None):
             return
         d = state["depth"]
         state["disp_img"] = Image.fromarray(colorize(1.0 / np.clip(d, 1e-6, None))).resize(state["crop"].size)
-        log(f"{state['path'].name} [{src}]  depth {d.min():.0f}-{d.max():.0f} mm "
+        log(f"{state['path'].name} [{src} {dt * 1000:.0f} ms]  depth {d.min():.0f}-{d.max():.0f} mm "
             f"(median {np.median(d):.0f})")
         if src == "model":
             update_cache_label(); mark_files()

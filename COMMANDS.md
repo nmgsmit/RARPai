@@ -111,3 +111,16 @@ Other scripts can read the dump directly: `np.load(f)["depth"]` is the depth in 
 is lower than the change you are looking for, the running copy is an old one (wrong folder, or
 `git pull` not done in the folder you launch from). The control column scrolls, so nothing is ever
 hidden by a small screen.
+
+**Still slow after the cache landed?** Every status-line message now ends `[tier NNN ms]` -
+`[memory]`, `[cache]` or `[model]`. Read that before guessing at a cause:
+- `[model 2000+ ms]` on a frame you have not visited before, or after a fresh `git pull` on
+  Snellius (a checkpoint's cache lives under `outputs/depth_cache/<fingerprint>/`, which is not
+  checked into git) - expected, that IS the one-time cost. Run *Precompute depth for folder*
+  once per checkpoint and every later visit is `[cache]`/`[memory]`.
+- `[cache 5-15 ms]` or `[memory <1 ms]` and it still feels slow - the depth prediction is not
+  what is slow; something else in the click/redraw path is. Say what you clicked and the exact
+  status-line text.
+- The .npz files are NOT the bottleneck: writing one (448x560 float32, ~1 MB) is under a
+  millisecond uncompressed, reading one is a few ms - both negligible next to the multi-second
+  CPU forward pass. Storage format was never the cause; the timing tag now proves it either way.
