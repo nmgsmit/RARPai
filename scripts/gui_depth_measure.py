@@ -13,8 +13,15 @@ against a known object in the same shot when you need better than that.
 
     python scripts/gui_depth_measure.py                       # defaults, see below
     python scripts/gui_depth_measure.py --ckpt path\to\best.pth --data-dir path\to\images
-    python scripts/gui_depth_measure.py --self-test           # geometry checks, no torch needed
+    python scripts/gui_depth_measure.py --self-test           # geometry + cache, no torch needed
     python scripts/gui_depth_measure.py --no-model            # UI only (synthetic depth)
+
+Every depth map is computed once and kept, in `outputs/depth_cache/<run>_<ckpt>_<fingerprint>/`
+as float32 mm under the npz key `depth`. The checkpoint dropdown lists every `outputs/*/*.pth`
+and switching to one switches to ITS cache folder, so its maps are picked straight back up --
+the folder is keyed by the checkpoint's CONTENTS, so re-copying the same best.pth keeps the
+cache while a genuinely different one can never serve a stale map. "Precompute depth for folder"
+fills the whole file list ahead of time; cached frames are marked with a dot.
 
 Geometry (identical convention to finetune_depth.scale_loss, which is what made the model
 metric): with NORMALISED intrinsics (fx, fy, cx, cy) and a pixel (u, v) in an image of size
@@ -35,6 +42,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -47,6 +56,7 @@ REPO = Path(__file__).resolve().parents[1]
 # ------------------------------------------------------------------ defaults (best run)
 DEFAULT_CKPT = REPO / "outputs" / "depth_ruler_range_sw05" / "best.pth"
 DEFAULT_DATA = REPO.parent / "data"
+DEFAULT_CACHE = REPO / "outputs" / "depth_cache"
 DEFAULT_SHAPE = (392, 490)        # what the run was trained/eval'd at
 DEFAULT_MIN_DEPTH = 20.0          # NOT the 0.1/150 default: the ruler run's endoscopic band
 DEFAULT_MAX_DEPTH = 200.0
@@ -198,6 +208,152 @@ class SyntheticBackend:
         return (60.0 + 40.0 * yy + 10.0 * xx ** 2).astype(np.float32)   # depends on both points
 
 
+# ----------------------------------------------------------------------- depth cache
+def file_fingerprint(path, digest_size=6, chunk=1 << 22):
+    """Short blake2b of a file's CONTENTS. Content, not mtime/size: re-downloading the same
+    best.pth must land in the cache directory that already holds its depth maps, while an
+    actually-different checkpoint must never share one."""
+    h = hashlib.blake2b(digest_size=digest_size)
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+class DepthCache:
+    """One directory per checkpoint; one .npz per (image, crop), named `<stem>_<img>_<crop>.npz`.
+
+    Depth is a deterministic function of checkpoint, image, crop, feed shape and depth band, so a
+    hit is exact and can never be stale: a different checkpoint lands in a different directory,
+    anything else changes the filename. Nothing is invalidated, so the folder doubles as a
+    permanent depth dump other scripts can read (`np.load(f)["depth"]` -> mm, float32).
+
+    The name splits into an image part and a crop part on purpose: "is this frame cached at all"
+    is then a dict lookup, so the file list can be marked without opening 2000 images to work out
+    what their auto-crop would be.
+    """
+
+    VERSION = 1
+
+    def __init__(self, root, ckpt, image_shape, min_depth, max_depth, log=print):
+        self.image_shape, self.min_depth, self.max_depth = tuple(image_shape), min_depth, max_depth
+        ckpt = Path(ckpt)
+        fp = file_fingerprint(ckpt) if ckpt.is_file() else "nockpt"
+        stem = f"{ckpt.parent.name}_{ckpt.stem}" if ckpt.is_file() else "synthetic"
+        self.name = f"{stem}_{fp}"
+        self.dir = Path(root) / self.name
+        self.dir.mkdir(parents=True, exist_ok=True)
+        meta = self.dir / "meta.json"
+        if not meta.exists():
+            meta.write_text(json.dumps(
+                {"version": self.VERSION, "checkpoint": str(ckpt), "fingerprint": fp,
+                 "image_shape": list(self.image_shape), "min_depth": min_depth,
+                 "max_depth": max_depth,
+                 "note": "depth maps in mm, float32, under key 'depth'"}, indent=2))
+        self.index = {}                          # img_key -> {crop_key, ...}
+        for f in self.dir.glob("*.npz"):
+            parts = f.stem.rsplit("_", 2)
+            if len(parts) == 3:
+                self.index.setdefault(parts[1], set()).add(parts[2])
+        log(f"cache {self.name}: {self.count()} maps over {len(self.index)} frames")
+
+    def count(self):
+        return sum(len(v) for v in self.index.values())
+
+    def img_key(self, img_path):
+        """Identity of the source frame. Size+mtime are in it, so re-exporting a frame under the
+        same name recomputes instead of silently serving the old depth."""
+        img_path = Path(img_path)
+        try:
+            st = img_path.stat()
+            stamp = f"{st.st_size}:{int(st.st_mtime)}"
+        except OSError:
+            stamp = "?"
+        raw = f"{img_path.resolve()}|{stamp}|{self.image_shape}|{self.min_depth}:{self.max_depth}|{self.VERSION}"
+        return hashlib.blake2b(raw.encode(), digest_size=8).hexdigest()
+
+    def crop_key(self, fracs):
+        return hashlib.blake2b(",".join(f"{f:.6f}" for f in fracs).encode(),
+                               digest_size=4).hexdigest()
+
+    def path_for(self, img_path, ik, ck):
+        return self.dir / f"{Path(img_path).stem}_{ik}_{ck}.npz"
+
+    def has(self, img_path, fracs):
+        return self.crop_key(fracs) in self.index.get(self.img_key(img_path), ())
+
+    def has_any(self, img_path):
+        """Any crop of this frame cached -- what the file list marks. Accurate in practice because
+        the auto-crop is a deterministic function of the image."""
+        return bool(self.index.get(self.img_key(img_path)))
+
+    def get(self, img_path, fracs):
+        ik, ck = self.img_key(img_path), self.crop_key(fracs)
+        if ck not in self.index.get(ik, ()):
+            return None
+        try:
+            with np.load(self.path_for(img_path, ik, ck)) as z:
+                return z["depth"]
+        except Exception:                        # noqa: BLE001 - a truncated file is just a miss
+            self.index.get(ik, set()).discard(ck)
+            return None
+
+    def put(self, img_path, fracs, depth):
+        ik, ck = self.img_key(img_path), self.crop_key(fracs)
+        np.savez_compressed(self.path_for(img_path, ik, ck), depth=depth.astype(np.float32),
+                            meta=json.dumps({"source": str(Path(img_path).resolve()),
+                                             "crop_fracs": list(fracs),
+                                             "image_shape": list(self.image_shape),
+                                             "min_depth": self.min_depth,
+                                             "max_depth": self.max_depth,
+                                             "version": self.VERSION}))
+        self.index.setdefault(ik, set()).add(ck)
+
+
+class DepthProvider:
+    """backend + cache + a small in-memory LRU. `depth_for` is the only entry point the GUI uses.
+
+    Three tiers because they cost three different things: RAM (instant, for prev/next flipping),
+    the cache directory (~10 ms, survives restarts), the model (seconds on CPU)."""
+
+    def __init__(self, backend, cache=None, mem=8):
+        self.backend, self.cache, self.mem_max = backend, cache, mem
+        self.mem = {}                            # key -> depth, insertion-ordered = LRU
+        self.computed = 0                        # model runs this session (the smoke test reads it)
+
+    def _remember(self, key, depth):
+        self.mem[key] = depth
+        while len(self.mem) > self.mem_max:
+            self.mem.pop(next(iter(self.mem)))
+        return depth
+
+    def cached(self, img_path, fracs=None):
+        """Is a map for this frame available without running the model? With `fracs`, that exact
+        crop; without, any crop (what the file list marks)."""
+        if self.cache is None:
+            return False
+        return self.cache.has(img_path, fracs) if fracs is not None \
+            else self.cache.has_any(img_path)
+
+    def depth_for(self, img_path, pil_crop, fracs, on_compute=None):
+        if self.cache is None:
+            self.computed += 1
+            return self.backend.predict(pil_crop), "model"
+        key = (self.cache.img_key(img_path), self.cache.crop_key(fracs))
+        if key in self.mem:
+            self.mem[key] = self.mem.pop(key)    # touch: most recently used goes last
+            return self.mem[key], "memory"
+        hit = self.cache.get(img_path, fracs)
+        if hit is not None:
+            return self._remember(key, hit), "cache"
+        if on_compute:
+            on_compute()
+        self.computed += 1
+        depth = self.backend.predict(pil_crop)
+        self.cache.put(img_path, fracs, depth)
+        return self._remember(key, depth), "model"
+
+
 # ------------------------------------------------------------------------ app state
 @dataclass
 class Measurement:
@@ -265,6 +421,66 @@ def self_test():
     s.scale = 25.0 / m.mm
     assert abs(s.measure(depth, p0, p1).mm - 25.0) < 1e-9
 
+    # ---- cache: a hit must be exact, and a miss must be a miss
+    import shutil
+    import tempfile
+    tmp = Path(tempfile.mkdtemp(prefix="depthcache_selftest_"))
+    try:
+        ck1, ck2 = tmp / "a.pth", tmp / "b.pth"
+        ck1.write_bytes(b"weights-A"); ck2.write_bytes(b"weights-B")
+        img = tmp / "frame_0001.png"
+        img.write_bytes(b"not really a png, only its stat() matters here")
+        c1 = DepthCache(tmp / "cache", ck1, (392, 490), 20, 200, log=lambda m: None)
+        d = np.full((8, 10), 42.0, np.float32)
+        assert not c1.has(img, (0, 0, 0)) and not c1.has_any(img)
+        c1.put(img, (0, 0, 0), d)
+        assert c1.has(img, (0, 0, 0)) and c1.has_any(img) and c1.count() == 1
+        assert np.array_equal(c1.get(img, (0, 0, 0)), d)              # round-trips exactly
+        assert c1.get(img, (0.15, 0, 0)) is None                      # other crop -> miss
+        c1.put(img, (0.15, 0, 0), d * 2)
+        assert c1.count() == 2 and len(c1.index) == 1                 # 2 crops, 1 frame
+        assert np.array_equal(c1.get(img, (0, 0, 0)), d)              # crops do not collide
+
+        c1b = DepthCache(tmp / "cache", ck1, (392, 490), 20, 200, log=lambda m: None)
+        assert c1b.dir == c1.dir and c1b.count() == 2                 # index rebuilt from disk
+        assert np.array_equal(c1b.get(img, (0, 0, 0)), d)
+
+        c2 = DepthCache(tmp / "cache", ck2, (392, 490), 20, 200, log=lambda m: None)
+        assert c2.dir != c1.dir and c2.count() == 0                   # other checkpoint, own dir
+        c3 = DepthCache(tmp / "cache", ck1, (392, 448), 20, 200, log=lambda m: None)
+        assert c3.dir == c1.dir and not c3.has(img, (0, 0, 0))        # other feed shape -> miss
+
+        ck1.write_bytes(b"weights-A")                                 # same CONTENT, new mtime
+        assert DepthCache(tmp / "cache", ck1, (392, 490), 20, 200,
+                          log=lambda m: None).dir == c1.dir           # fingerprint, not mtime
+
+        # ---- provider: model runs at most once per (image, crop)
+        class CountingBackend:
+            image_shape = (392, 490)
+            calls = 0
+
+            def predict(self, pil):
+                CountingBackend.calls += 1
+                return np.full((8, 10), 7.0, np.float32)
+
+        prov = DepthProvider(CountingBackend(), DepthCache(tmp / "cache2", ck1, (392, 490), 20, 200,
+                                                           log=lambda m: None))
+        a, src_a = prov.depth_for(img, None, (0, 0, 0))
+        b_, src_b = prov.depth_for(img, None, (0, 0, 0))
+        assert (src_a, src_b) == ("model", "memory") and CountingBackend.calls == 1
+        assert np.array_equal(a, b_)
+        prov.mem.clear()
+        _, src_c = prov.depth_for(img, None, (0, 0, 0))
+        assert src_c == "cache" and CountingBackend.calls == 1        # disk hit, no model run
+        assert prov.cached(img) and prov.cached(img, (0, 0, 0))
+        assert not prov.cached(img, (0.2, 0, 0))
+        prov.mem_max = 2                                              # LRU evicts, never grows
+        for k in range(5):
+            prov._remember(f"k{k}", d)
+        assert list(prov.mem) == ["k3", "k4"]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
     # bar detection recovers a known pillarbox, and crop_box is pixel-exact
     img = np.zeros((108, 192, 3), np.uint8)
     img[6:100, 29:163] = 200
@@ -284,9 +500,6 @@ def run_gui(args, on_ready=None):
     from tkinter import filedialog, messagebox, ttk
     from PIL import Image, ImageTk
 
-    backend = (SyntheticBackend(image_shape=args.image_shape) if args.no_model else
-               DepthBackend(args.ckpt, args.image_shape, args.min_depth, args.max_depth,
-                            args.device))
     sess = Session(k_norm=tuple(args.intrinsics), scale=args.scale, radius=args.patch_radius)
 
     root = tk.Tk()
@@ -294,7 +507,8 @@ def run_gui(args, on_ready=None):
     root.geometry("1500x900")
 
     state = dict(path=None, full=None, crop=None, depth=None, disp_img=None, tkimg=None,
-                 zoom=1.0, base=1.0, pending=None, files=[], idx=-1)
+                 zoom=1.0, base=1.0, pending=None, files=[], idx=-1,
+                 provider=None, abort=False)
 
     # ---------------------------------------------------------------- left: controls
     left = ttk.Frame(root, padding=8)
@@ -311,6 +525,19 @@ def run_gui(args, on_ready=None):
         var = tk.StringVar(value=str(init))
         ttk.Entry(row, textvariable=var, width=width).pack(side="left")
         return var
+
+    sect("Depth model")
+    ckpt_var = tk.StringVar(value="")
+    ckpt_box = ttk.Combobox(left, textvariable=ckpt_var, state="readonly",
+                            values=[], width=28)
+    ckpt_box.pack(fill="x")
+    ttk.Button(left, text="Browse for checkpoint...",
+               command=lambda: browse_ckpt()).pack(fill="x", pady=2)
+    cache_lbl = ttk.Label(left, text="cache -", foreground="#666", wraplength=230,
+                          justify="left")
+    cache_lbl.pack(anchor="w")
+    ttk.Button(left, text="Precompute depth for folder",
+               command=lambda: precompute_all()).pack(fill="x", pady=2)
 
     sect("Image")
     ttk.Button(left, text="Open folder...", command=lambda: pick_folder()).pack(fill="x")
@@ -367,14 +594,123 @@ def run_gui(args, on_ready=None):
         status.configure(text=str(msg), foreground=color)
         root.update_idletasks()
 
+    # ------------------------------------------------------------------ checkpoint / cache
+    def discover_ckpts():
+        """Every *.pth under outputs/, best.pth first -- the runs this repo produces."""
+        found = sorted(Path(REPO / "outputs").glob("*/*.pth")) if (REPO / "outputs").exists() else []
+        found.sort(key=lambda q: (q.name != "best.pth", str(q)))
+        return found
+
+    def ckpt_label(q):
+        return f"{Path(q).parent.name}/{Path(q).name}"
+
+    def refresh_ckpt_box(current=None):
+        opts = {ckpt_label(q): q for q in discover_ckpts()}
+        if current is not None:
+            opts.setdefault(ckpt_label(current), Path(current))
+        state["ckpt_opts"] = opts
+        ckpt_box.configure(values=list(opts))
+        if current is not None:
+            ckpt_var.set(ckpt_label(current))
+
+    def update_cache_label():
+        prov = state["provider"]
+        if prov is None or prov.cache is None:
+            cache_lbl.configure(text="cache off")
+            return
+        c = prov.cache
+        cache_lbl.configure(text=f"cache: {c.count()} maps / {len(c.index)} frames\n{c.dir}")
+
+    def set_checkpoint(path, synthetic=False):
+        """Load a checkpoint and switch to ITS cache directory. Depth already computed for that
+        checkpoint is picked straight back up; nothing is recomputed on a switch back."""
+        path = Path(path)
+        if synthetic:
+            be = SyntheticBackend(image_shape=args.image_shape)
+        else:
+            if not path.is_file():
+                log(f"checkpoint not found:\n{path}", "#c00")
+                return False
+            be = DepthBackend(path, args.image_shape, args.min_depth, args.max_depth, args.device)
+            try:
+                log(f"loading {ckpt_label(path)} (first time takes ~30 s on CPU) ...", "#06c")
+                be.load(log=lambda m: log(m, "#06c"))
+            except Exception as exc:                          # noqa: BLE001 - surface to the UI
+                log(f"model load failed: {exc}", "#c00")
+                messagebox.showerror("Checkpoint", str(exc))
+                return False
+        cache = None if args.no_cache else DepthCache(
+            args.cache_dir, path, be.image_shape, args.min_depth, args.max_depth,
+            log=lambda m: log(m, "#06c"))
+        state["provider"] = DepthProvider(be, cache)
+        refresh_ckpt_box(path)
+        update_cache_label()
+        mark_files()
+        if state["full"] is not None:
+            reload_image(keep_marks=False)
+        else:
+            log(f"model ready ({'synthetic' if synthetic else be.device})")
+        return True
+
+    def on_ckpt_pick(_=None):
+        q = state.get("ckpt_opts", {}).get(ckpt_var.get())
+        if q and state["provider"] is not None and getattr(state["provider"].backend, "ckpt", None) == Path(q):
+            return
+        if q:
+            set_checkpoint(q)
+
+    def browse_ckpt():
+        f = filedialog.askopenfilename(title="Depth checkpoint",
+                                       initialdir=str(REPO / "outputs"),
+                                       filetypes=[("PyTorch checkpoint", "*.pth *.pt")])
+        if f:
+            set_checkpoint(f)
+
+    def precompute_all():
+        """Walk the whole file list and fill the cache, skipping what is already there. Uses the
+        same auto-crop `load` would, so every map it writes is one a later click will hit."""
+        prov = state["provider"]
+        if prov is None or not state["files"] or state.get("busy"):
+            return                               # `busy`: root.update() below re-enters callbacks
+        todo = [q for q in state["files"] if not prov.cached(q)]
+        if not todo:
+            log(f"all {len(state['files'])} frames already cached")
+            return
+        state["abort"], state["busy"] = False, True
+        done = 0
+        for i, q in enumerate(todo, 1):
+            if state["abort"]:
+                break
+            try:
+                full = Image.open(q).convert("RGB")
+                fr = auto_bars(np.asarray(full))
+                prov.depth_for(q, full.crop(crop_box(full.size, *fr)), fr)
+                done += 1
+            except Exception as exc:                          # noqa: BLE001 - keep going
+                log(f"skipped {Path(q).name}: {exc}", "#c60")
+            log(f"precomputing {i}/{len(todo)} ...", "#06c")
+            root.update()                        # keep the window alive; Esc sets abort
+        state["busy"] = False
+        update_cache_label(); mark_files()
+        log(f"cached {done}/{len(todo)} new maps" + (" (stopped)" if state["abort"] else ""))
+
     # ------------------------------------------------------------------ image loading
     def set_files(paths, select=0):
         state["files"] = list(paths)
-        filebox.delete(0, "end")
-        for p in state["files"]:
-            filebox.insert("end", Path(p).name)
+        mark_files()
         if state["files"]:
             select_index(select)
+
+    def mark_files():
+        """Redraw the file list, prefixing frames whose depth is already on disk with a dot."""
+        prov, sel = state["provider"], state["idx"]
+        filebox.delete(0, "end")
+        for q in state["files"]:
+            hit = prov is not None and prov.cached(q)
+            filebox.insert("end", f"{'* ' if hit else '  '}{Path(q).name}")
+        if 0 <= sel < len(state["files"]):
+            filebox.selection_clear(0, "end")
+            filebox.selection_set(sel)
 
     def select_index(i):
         if not state["files"]:
@@ -444,9 +780,14 @@ def run_gui(args, on_ready=None):
         w, h = state["crop"].size
         aspect_lbl.configure(text=f"aspect {w / h:.3f} (training 5:4 = 1.250)  {w}x{h}",
                              foreground="#666" if abs(w / h - 1.25) < 0.08 else "#c60")
-        log(f"predicting depth for {state['path'].name} ...", "#06c")
+        prov = state["provider"]
+        if prov is None:
+            log("no checkpoint loaded", "#c00")
+            return
         try:
-            state["depth"] = backend.predict(state["crop"])
+            state["depth"], src = prov.depth_for(
+                state["path"], state["crop"], fracs(),
+                on_compute=lambda: log(f"predicting depth for {state['path'].name} ...", "#06c"))
         except Exception as exc:                              # noqa: BLE001 - surface to the UI
             state["depth"] = None
             log(f"depth failed: {exc}", "#c00")
@@ -454,7 +795,10 @@ def run_gui(args, on_ready=None):
             return
         d = state["depth"]
         state["disp_img"] = Image.fromarray(colorize(1.0 / np.clip(d, 1e-6, None))).resize(state["crop"].size)
-        log(f"{state['path'].name}  depth {d.min():.0f}-{d.max():.0f} mm (median {np.median(d):.0f})")
+        log(f"{state['path'].name} [{src}]  depth {d.min():.0f}-{d.max():.0f} mm "
+            f"(median {np.median(d):.0f})")
+        if src == "model":
+            update_cache_label(); mark_files()
         if fit:
             zoom(0.0)
         else:
@@ -550,7 +894,8 @@ def run_gui(args, on_ready=None):
     canvas.bind("<Configure>", lambda e: redraw())
     filebox.bind("<<ListboxSelect>>",
                  lambda e: (filebox.curselection() and select_index(filebox.curselection()[0])))
-    root.bind("<Escape>", lambda e: (state.update(pending=None), redraw()))
+    ckpt_box.bind("<<ComboboxSelected>>", on_ckpt_pick)
+    root.bind("<Escape>", lambda e: (state.update(pending=None, abort=True), redraw()))
     root.bind("<Left>", lambda e: step(-1))
     root.bind("<Right>", lambda e: step(1))
     root.bind("<Control-z>", lambda e: undo())
@@ -652,17 +997,12 @@ def run_gui(args, on_ready=None):
         log(f"wrote {Path(f).name}")
 
     # ---------------------------------------------------------------------- kick off
+    refresh_ckpt_box()
     if args.no_model:
+        set_checkpoint(args.ckpt, synthetic=True)
         log("--no-model: synthetic depth, numbers are meaningless", "#c60")
-    elif not Path(args.ckpt).exists():
-        log(f"checkpoint not found:\n{args.ckpt}", "#c00")
     else:
-        try:
-            log("loading model (first time takes ~30 s on CPU) ...", "#06c")
-            backend.load(log=lambda m: log(m, "#06c"))
-            log(f"model ready on {backend.device}")
-        except Exception as exc:                               # noqa: BLE001
-            log(f"model load failed: {exc}", "#c00")
+        set_checkpoint(args.ckpt)
 
     if args.image:
         p = Path(args.image)
@@ -682,7 +1022,9 @@ def run_gui(args, on_ready=None):
                    refresh_list=refresh_list, listbox=listbox, to_canvas=to_canvas,
                    vars=dict(side=v_side, top=v_top, bot=v_bot, alpha=v_alpha,
                              scale=v_scale, rad=v_rad, fx=v_fx, fy=v_fy),
-                   set_auto_crop=set_auto_crop, backend=backend,
+                   set_auto_crop=set_auto_crop, provider=lambda: state["provider"],
+                   set_checkpoint=set_checkpoint, precompute_all=precompute_all,
+                   mark_files=mark_files, filebox=filebox,
                    export_csv=export_csv, save_png=save_png, calibrate=calibrate,
                    select_index=select_index, step=step, zoom=zoom)
         root.after(200, lambda: on_ready(ctx))
@@ -704,6 +1046,9 @@ def main():
                     metavar=("fx", "fy", "cx", "cy"), help="NORMALISED K; default = SCARED assumed")
     ap.add_argument("--scale", type=float, default=1.0, help="extra multiplier on predicted mm")
     ap.add_argument("--patch-radius", type=int, default=2, help="median window for depth sampling")
+    ap.add_argument("--cache-dir", default=str(DEFAULT_CACHE),
+                    help="where depth maps are stored, one subfolder per checkpoint")
+    ap.add_argument("--no-cache", action="store_true", help="always recompute, write nothing")
     ap.add_argument("--device", default=None, help="cuda / cpu (default: auto)")
     ap.add_argument("--no-model", action="store_true", help="UI only, synthetic depth")
     ap.add_argument("--self-test", action="store_true", help="geometry checks, no torch needed")

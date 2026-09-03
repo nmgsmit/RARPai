@@ -427,3 +427,30 @@ patch grid at 392x490 and the 20/200 band without needing the trained weights.
 `DepthBackend` imports `make_endodac`/`disp_to_depth` from `finetune_depth` rather than copying
 them (the vit_base `input_size` monkeypatch is easy to get subtly wrong), and shims a no-op
 `dotenv` if it is missing so measuring does not depend on the wandb creds path.
+
+### Depth cache + checkpoint picker (same day)
+
+Depth is a deterministic function of (checkpoint, image, crop, feed shape, depth band), so it is
+computed at most once and written to `outputs/depth_cache/<run>_<ckpt>_<fingerprint>/<frame>_<img>_<crop>.npz`
+(float32 mm under key `depth`, `meta.json` beside it). Three tiers, because they cost three
+different things: an 8-entry in-memory LRU (instant, for flipping prev/next), the cache directory
+(~10 ms, survives restarts), the model (seconds on CPU). `DepthProvider.depth_for` is the only
+entry point the GUI uses and reports which tier answered.
+
+**Keyed by checkpoint CONTENTS, not path or mtime.** `file_fingerprint` is a blake2b of the file,
+so re-scp-ing the same `best.pth` lands back in the folder that already holds its maps, while a
+genuinely different checkpoint can never serve a stale map - which is the whole reason the
+directory is per-checkpoint rather than per-run-name. Choosing a checkpoint in the dropdown
+(populated from `outputs/*/*.pth`) switches cache folders with it, so A/B-ing two runs on the same
+frames costs one prediction each and nothing thereafter.
+
+**The filename splits into an image part and a crop part on purpose.** "Is this frame cached at
+all" is then a dict lookup, so the file list can mark 2000 frames without opening any of them to
+work out what their auto-crop would be. Exactness is not lost: a click still looks up the exact
+(image, crop) pair, and the mark is accurate in practice because `auto_bars` is deterministic.
+Nothing is ever invalidated - the folder is a permanent dump other scripts can read.
+
+`--self-test` now covers the cache without torch (round-trip, crop collisions, per-checkpoint
+directories, fingerprint stability across mtime, LRU eviction, and a counting backend proving the
+model runs at most once per image+crop); the Xvfb suite is up to 38 checks, including precompute,
+the `*` marks, and returning to a checkpoint's folder with its maps intact.

@@ -10,6 +10,9 @@ data/clips_*/
 data/cue_ds/
 data/sweep_cache/
 
+# Cached depth maps from the measurement GUI (regenerate: scripts/gui_depth_measure.py)
+outputs/depth_cache/
+
 # Models & checkpoints
 models/checkpoints/
 *.pth

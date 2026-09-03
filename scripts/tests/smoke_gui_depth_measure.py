@@ -35,6 +35,10 @@ def check(cond, msg):
         FAILS.append(msg)
 
 
+def make_frames(dirpath, n=3):
+    return [make_frame(dirpath / f"frame_{i:04d}.png") for i in range(1, n + 1)]
+
+
 def make_frame(path):
     """1920x1080 pillarboxed 5:4 'console frame': black bars + textured content."""
     a = np.zeros((1080, 1920, 3), np.uint8)
@@ -67,7 +71,8 @@ def drive(ctx):
     popups = stub_dialogs(csv_path, png_path, true_mm=25.0)
     try:
         check(state["depth"] is not None, "depth predicted on load")
-        check(not CKPT or ctx["backend"].model is not None, "real model loaded inside the GUI")
+        check(not CKPT or ctx["provider"]().backend.model is not None,
+              "real model loaded inside the GUI")
         check(state["crop"].size == (1344, 1080),
               f"auto-crop stripped the pillarbox -> {state['crop'].size}")
         check(abs(state["crop"].size[0] / state["crop"].size[1] - 1.25) < 0.01,
@@ -143,6 +148,51 @@ def drive(ctx):
         ctx["clear"]()
         check(not sess.items and ctx["listbox"].size() == 0, "clear empties the session")
 
+        # ---- cache: a frame is only ever predicted once per checkpoint + crop
+        prov = ctx["provider"]()
+        n0 = prov.computed
+        first = state["depth"].copy()
+        ctx["reload_image"](keep_marks=False)
+        check(prov.computed == n0, "reloading the same frame does not run the model again")
+        check(np.array_equal(state["depth"], first), "the cached map is bit-identical")
+        prov.mem.clear()
+        ctx["reload_image"](keep_marks=False)
+        check(prov.computed == n0 and np.array_equal(state["depth"], first),
+              "with the memory tier dropped, the map still comes off disk")
+        cache_dir = prov.cache.dir
+        check(cache_dir.exists() and (cache_dir / "meta.json").exists(),
+              f"cache folder written with meta.json ({cache_dir.name})")
+        npz = sorted(cache_dir.glob("*.npz"))
+        check(len(npz) >= 1, f"depth map stored as .npz ({len(npz)})")
+        with np.load(npz[0]) as z:
+            check(np.array_equal(z["depth"], first) and z["depth"].dtype == np.float32,
+                  "the stored .npz holds the same float32 map, readable by other scripts")
+
+        ctx["vars"]["side"].set("0.30")                      # a different crop is a different map
+        ctx["reload_image"](keep_marks=False)
+        check(prov.computed == n0 + 1, "changing the crop recomputes rather than reusing")
+        ctx["set_auto_crop"]()
+        check(prov.computed == n0 + 1, "going back to the auto crop hits the cache again")
+
+        n1 = prov.computed
+        ctx["precompute_all"]()
+        check(prov.computed == n1 + 2, f"precompute filled the other 2 frames (+{prov.computed - n1})")
+        ctx["precompute_all"]()
+        check(prov.computed == n1 + 2, "a second precompute run has nothing to do")
+        check(ctx["filebox"].get(0).startswith("*"), "cached frames are marked in the file list")
+        ctx["select_index"](2)
+        check(prov.computed == n1 + 2, "stepping to a precomputed frame runs no model")
+
+        # ---- a different checkpoint means a different folder, and back again is free
+        if CKPT:
+            n_maps = prov.cache.count()
+            ok = ctx["set_checkpoint"](str(CKPT))             # reload -> same fingerprint, same dir
+            prov2 = ctx["provider"]()
+            check(ok and prov2.cache.dir == cache_dir,
+                  "reselecting a checkpoint returns to its own cache folder")
+            check(prov2.cache.count() == n_maps and prov2.computed == 0,
+                  f"and its {n_maps} maps are picked straight back up, nothing recomputed")
+
         ctx["vars"]["side"].set("0.0"); ctx["vars"]["top"].set("0.0"); ctx["vars"]["bot"].set("0.0")
         ctx["reload_image"](keep_marks=False)
         check(state["crop"].size == (1920, 1080), "manual crop fracs are honoured (full frame)")
@@ -157,9 +207,11 @@ def drive(ctx):
 
 
 def main():
-    img = make_frame(TMP / "frame_0001.png")
+    frames = make_frames(TMP)
+    img = frames[0]
     args = types.SimpleNamespace(
         ckpt=CKPT, data_dir=str(TMP), image=str(img), image_shape=list(G.DEFAULT_SHAPE),
+        cache_dir=str(TMP / "cache"), no_cache=False,
         min_depth=G.DEFAULT_MIN_DEPTH, max_depth=G.DEFAULT_MAX_DEPTH,
         intrinsics=list(G.DEFAULT_K_NORM), scale=1.0, patch_radius=2, device="cpu",
         no_model=not CKPT, self_test=False)

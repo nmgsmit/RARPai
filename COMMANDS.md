@@ -83,6 +83,19 @@ python scripts\gui_depth_measure.py --no-model               # UI only, syntheti
 appears on the line. Wheel = zoom, right-drag = pan, `Esc` cancels a half-placed point,
 `Ctrl-Z`/`<-`/`->` undo / prev / next image.
 
+**Depth maps are computed once and kept.** Every map lands in
+`outputs/depth_cache/<run>_<ckpt>_<fingerprint>/` as a `.npz` (float32 mm, key `depth`, plus a
+`meta.json` describing the run) - so revisiting a frame, or reopening the app tomorrow, is
+instant. The dropdown at the top lists every `outputs/*/*.pth` in the repo; picking one loads it
+**and switches to that checkpoint's own cache folder**, so its maps are picked straight back up
+and switching back and forth costs nothing. *Precompute depth for folder* fills the cache for the
+whole file list in one go (`Esc` stops it); frames already on disk are marked `*` in the list.
+The folder is keyed by the checkpoint's CONTENTS, so re-copying the same `best.pth` from Snellius
+keeps the cache, while a genuinely different checkpoint gets its own folder and can never serve a
+stale map. `--cache-dir` moves it, `--no-cache` turns it off.
+
+Other scripts can read the dump directly: `np.load(f)["depth"]` is the depth in mm.
+
 - **Check the aspect readout says ~1.250 before believing a number.** The model was trained on the
   5:4 ruler dumps, so a raw 16:9 console frame must have its black bars cropped off; *Auto bars*
   runs on load and usually gets it, the three frac boxes are the manual override.
