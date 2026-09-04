@@ -3,6 +3,32 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-02 — DEPTH: CONCLUSION — training fixes SCALE; the ~20% per-object error is a floor
+- CHECKPOINT A/B on the 5 held-out videos. Each run differs from the `range` pivot (scale-w 0.1,
+  anchor-w 0.3, 12 ep, K frozen) by ONE flag. wandb metric_test/abs_rel, n=665:
+  `range` mbbm1208 .211 (best ep 4) | `range-noanchor` iz883ljm (anchor 0) .200 (best ep **1**)
+  | `range-sw05` afku6qek (sw 0.5) .205 (best ep 10). Test scale .919 / .933 / **.974**.
+  mm view (`eval_scale_table.py`, n=671): warm-start 25.2% / 2.30mm -> sw05 **19.9% / 1.88mm**.
+- The "+1 GLOBAL CONSTANT" trick is DEAD once the depth range is right: warm-start 25.2% raw ->
+  25.6% after dividing by the fitted k. One constant RE-CENTRES, it does not shrink spread. It
+  only looked impressive in the old 0.1/150 runs because it was silently undoing the range bug.
+- SCALE and PER-OBJECT error trade off, and ONLY SCALE RESPONDS TO TRAINING. sw05 wins scale
+  (.974) but not per-object (deb .205); noanchor wins per-object (deb .187) at best epoch 1, i.e.
+  barely trained. Raising scale-w .1->.5 moves scale .919->.974 and extends useful training
+  (best ep 4->10) but leaves the per-object residual alone: every config lands in 19-22%.
+- `--anchor-w` (L1 log-disp to a FROZEN warm-start teacher) buys TRAINING LENGTH, not accuracy:
+  with it a run stays productive to ep 4/10; without it selection picks ep 1 and all later epochs
+  degrade. NAME COLLISION, will bite again: `--anchor-w` is the geometry regulariser and has
+  NOTHING to do with the scale_objects "anchors", which are driven by `--scale-w`.
+- SO WHAT for SUL: the weights need not carry the scale if it is fitted per-clip at inference
+  (see the affine entry) — but fine-tuning is still NOT redundant, because it helps AFTER
+  calibration too (per-clip affine-disp 9.3% sw05 vs 12.6% warm-start). The ~20% floor is
+  per-object noise on thin objects plus the uncalibrated focal (DEFAULT_K_NORM, never measured
+  on this scope) — neither of which more scale supervision can touch.
+- OPEN: the affine grid was never run on `range-noanchor`. If its deb .187 survives per-clip
+  calibration it could beat sw05's 9.3%, making "1 epoch + per-clip calibration" the whole
+  recipe. Cost: one GPU dump + a CPU fit (~5 min).
+
 ## 2026-09-02 — DEPTH: --scale-classes A/B — dropping the Ruler makes metric scale WORSE
 - `--scale-classes ID...` restricts scale supervision to given class_ids; the metric eval still
   scores every class, so an excluded one is a held-out cross-object check.
