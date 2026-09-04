@@ -106,19 +106,48 @@ def lengths(rays, z, a, b, space):
 
 
 def fit(rays, z, mm, space, affine):
-    """Least-squares (robust) on log(predicted / true) -- scale-free, same objective as training."""
-    from scipy.optimize import least_squares
-    l1 = lengths(rays, z, 1.0, 0.0, space)
-    a0 = np.median(mm / np.maximum(l1, 1e-9)) if space == "depth" \
-        else np.median(np.maximum(l1, 1e-9) / mm)
+    """Robust fit of the calibration (a, b). numpy only -- no scipy in the Snellius venv.
 
-    def res(p):
-        L = lengths(rays, z, p[0], p[1] if affine else 0.0, space)
-        return np.log(np.maximum(L, 1e-9) / mm)
+    Both parameterisations are positively homogeneous once the RATIO r = b/a is fixed:
+      depth:  Z' = a*Z + b = a*(Z + r)        ->  L(a, a*r) = a * L(1, r)
+      disp:   1/Z' = a/Z + b = a*(1/Z + r)    ->  L(a, a*r) = L(1, r) / a
+    So for any r the best scale is closed form in log space -- the MEDIAN of log(L/mm), which is
+    the L1-optimal (hence outlier-robust) offset of a log residual. That collapses the 2-D fit to
+    a 1-D search over r: a coarse grid plus shrinking refinements.
 
-    p0 = [a0, 0.0] if affine else [a0]
-    r = least_squares(res, p0, loss="soft_l1", f_scale=0.3, max_nfev=300)
-    return r.x[0], (r.x[1] if affine else 0.0)
+    ponytail: shorter and more robust than a generic least_squares, and it drops a dependency.
+    """
+    v = z if space == "depth" else 1.0 / np.maximum(z, 1e-9)
+    vmin = float(v.min())
+
+    def solve(r):
+        """-> (log-offset, robust cost) for this ratio r."""
+        L = lengths(rays, z, 1.0, r, space)
+        g = np.isfinite(L) & (L > 1e-9)
+        if not g.any():
+            return 0.0, np.inf
+        res = np.log(L[g] / mm[g])
+        off = float(np.median(res))
+        return off, float(np.median(np.abs(res - off)))
+
+    def to_a(off):
+        return float(np.exp(-off if space == "depth" else off))
+
+    if not affine:
+        return to_a(solve(0.0)[0]), 0.0
+
+    floor = -0.98 * vmin                       # keep Z' (or the disparity) strictly positive
+    lo, hi = floor, 5.0 * float(np.median(v))
+    best_r, best_c = 0.0, np.inf
+    for _ in range(4):
+        for r in np.linspace(lo, hi, 61):
+            c = solve(float(r))[1]
+            if c < best_c:
+                best_c, best_r = c, float(r)
+        span = (hi - lo) / 12.0
+        lo, hi = max(best_r - span, floor), best_r + span
+    a = to_a(solve(best_r)[0])
+    return a, a * best_r
 
 
 def evaluate(d, level, space, affine, cross_class=False):
@@ -136,6 +165,7 @@ def evaluate(d, level, space, affine, cross_class=False):
     if groups is None:
         _, groups = np.unique(d[level], return_inverse=True)
     pred = np.full(len(mm), np.nan)
+    cache = {}
     for g in np.unique(groups):
         idx = np.where(groups == g)[0]
         for j in idx:
@@ -149,7 +179,10 @@ def evaluate(d, level, space, affine, cross_class=False):
                 continue
             if affine and np.ptp(z[src].mean(1)) < 1e-3:  # no depth spread -> shift unidentifiable
                 continue
-            a, b = fit(rays[src], z[src], mm[src], space, affine)
+            key = src.tobytes()
+            if key not in cache:
+                cache[key] = fit(rays[src], z[src], mm[src], space, affine)
+            a, b = cache[key]
             pred[j] = lengths(rays[j:j + 1], z[j:j + 1], a, b, space)[0]
     return pred
 
@@ -182,6 +215,32 @@ def report(d, rows):
             100 * np.median(rel), np.abs(pred[ok] - mm[ok]).mean(), "".join(cells)))
 
 
+def _selfcheck():
+    """Plant a known (a, b) in synthetic data and check the fit recovers the resulting lengths.
+
+    (a, b) itself is only identifiable up to what the geometry constrains, so the assertion is on
+    the thing we actually report -- the predicted length -- not on the raw parameters.
+    """
+    rng = np.random.default_rng(0)
+    n, p = 40, 5
+    z = rng.uniform(30.0, 90.0, (n, p))
+    z = np.sort(z, axis=1)
+    rays = np.stack([rng.uniform(-0.3, 0.3, (n, p)), rng.uniform(-0.3, 0.3, (n, p)),
+                     np.ones((n, p))], -1)
+    for space, (a, b) in (("depth", (0.7, 12.0)), ("disp", (1.4, 0.004))):
+        mm = lengths(rays, z, a, b, space)
+        assert np.all(mm > 0)
+        af, bf = fit(rays, z, mm, space, affine=True)
+        got = lengths(rays, z, af, bf, space)
+        err = np.median(np.abs(got / mm - 1.0))
+        assert err < 0.02, (space, err, af, bf)
+        # scale-only must NOT reproduce a length field that genuinely needed a shift
+        a1, b1 = fit(rays, z, mm, space, affine=False)
+        assert b1 == 0.0
+        assert np.median(np.abs(lengths(rays, z, a1, b1, space) / mm - 1.0)) > err
+    print("[selfcheck] affine fit recovers planted calibrations in both spaces")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", default="outputs/affine_test.npz")
@@ -200,8 +259,13 @@ def main():
     ap.add_argument("--max-depth", type=float, default=200.0)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--selfcheck", action="store_true",
+                    help="verify the fit on synthetic data with a planted calibration, then exit")
     args = ap.parse_args()
 
+    if args.selfcheck:
+        _selfcheck()
+        return
     if not args.fit_only:
         dump_objects(args, args.dump)
     d = dict(np.load(args.dump, allow_pickle=False))
