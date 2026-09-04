@@ -150,7 +150,7 @@ def fit(rays, z, mm, space, affine):
     return a, a * best_r
 
 
-def evaluate(d, level, space, affine, cross_class=False):
+def evaluate(d, level, space, affine, cross_class=False, calib_classes=None):
     """Predicted length for every object, calibrated leave-one-out within its group.
 
     A global fit on 2 parameters over hundreds of objects is effectively free, so it is scored
@@ -161,6 +161,7 @@ def evaluate(d, level, space, affine, cross_class=False):
     """
     rays, z, mm, cls = d["rays"], d["z"], d["mm"], d["cls"]
     need = (2 if affine else 1)
+    calib = np.isin(cls, calib_classes) if calib_classes else None
     groups = {"global": np.zeros(len(mm), np.int64)}.get(level)
     if groups is None:
         _, groups = np.unique(d[level], return_inverse=True)
@@ -169,7 +170,14 @@ def evaluate(d, level, space, affine, cross_class=False):
     for g in np.unique(groups):
         idx = np.where(groups == g)[0]
         for j in idx:
-            if level == "global" and not cross_class:
+            if calib is not None:
+                # DEPLOYMENT CASE: only one object class is ever visible, so calibrate on it and
+                # measure something else. Source and target are disjoint by class, so no LOO
+                # needed -- and objects OF the calibration class are not scored at all.
+                if calib[j]:
+                    continue
+                src = idx[calib[idx]]
+            elif level == "global" and not cross_class:
                 src = idx                                # 2 params over ~700 objects: no leakage
             elif cross_class:
                 src = idx[cls[idx] != cls[j]]            # calibrate on the OTHER object classes
@@ -201,7 +209,8 @@ def report(d, rows):
     print("-" * len(hdr))
     for level, space, affine, cross, pred in rows:
         ok = np.isfinite(pred)
-        name = ("cross-class " if cross else "") + ("affine" if affine else "scale")
+        name = (cross if isinstance(cross, str) else ("cross-class " if cross else "")) \
+            + ("affine" if affine else "scale")
         if ok.sum() < 3:
             print("{:<11}{:<20}{:<7}{:>6}{:>6}   (no group could support this fit)".format(
                 level, name, space, 0, "--"))
@@ -262,6 +271,10 @@ def main():
     ap.add_argument("--max-depth", type=float, default=200.0)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--calib-classes", type=int, nargs="+", default=None, metavar="ID",
+                    help="DEPLOYMENT case: calibrate using ONLY these class_ids (1=Ruler, "
+                         "2=Catheter tip, 3=Robot arm) and score only the other classes. "
+                         "Use --calib-classes 3 when the robot arm is the only anchor in frame.")
     ap.add_argument("--selfcheck", action="store_true",
                     help="verify the fit on synthetic data with a planted calibration, then exit")
     args = ap.parse_args()
@@ -275,6 +288,20 @@ def main():
     print(f"[fit] {len(d['mm'])} objects | {len(set(d['video']))} videos "
           f"{len(set(d['clip']))} clips {len(set(d['frame']))} frames", flush=True)
 
+    # How often is a lone anchor class even present? A calibration you cannot compute is a
+    # deployment failure, so coverage matters as much as the error when it works.
+    for c in sorted(set(d["cls"].tolist())):
+        m = d["cls"] == c
+        fr = len(set(d["frame"][m])) / len(set(d["frame"]))
+        cl = len(set(d["clip"][m])) / len(set(d["clip"]))
+        zs = d["z"][m].mean(1)
+        spread = [np.ptp(d["z"][m & (d["clip"] == k)].mean(1))
+                  for k in sorted(set(d["clip"][m]))]
+        print("[avail] {:<13} n={:<4} in {:>5.0f}% of frames, {:>5.0f}% of clips | "
+              "depth {:.0f}-{:.0f}mm, median within-clip spread {:.1f}mm".format(
+                  CLASS_NAMES[c], int(m.sum()), 100 * fr, 100 * cl,
+                  zs.min(), zs.max(), float(np.median(spread)) if spread else 0.0))
+
     rows = []
     for level in ("global", "video", "clip", "frame"):
         for space, affine in (("depth", False), ("depth", True), ("disp", True)):
@@ -283,6 +310,13 @@ def main():
         for space, affine in (("depth", False), ("disp", True)):
             rows.append((level, space, affine, True,
                          evaluate(d, level, space, affine, cross_class=True)))
+    if args.calib_classes:                             # e.g. --calib-classes 3 = arm only
+        tag = "arm-only " if args.calib_classes == [3] else "calib%s " % args.calib_classes
+        for level in ("global", "video", "clip", "frame"):
+            for space, affine in (("depth", False), ("depth", True), ("disp", True)):
+                rows.append((level, space, affine, tag,
+                             evaluate(d, level, space, affine,
+                                      calib_classes=args.calib_classes)))
     report(d, rows)
 
 
