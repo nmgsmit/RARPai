@@ -19,6 +19,35 @@ sessions don't re-derive them. Keep entries one or two lines.
   anchors. Neither run beats a single global constant on the frozen warm-start (deb 0.191).
   => next lever is `--anchor-w`, not the class mix.
 
+## 2026-09-02 — DEPTH: affine (scale+shift) calibration — LOCALITY beats the shift
+- `scripts/fit_affine_scale.py`: runs a FROZEN model once, dumps per-object rays+depths to .npz,
+  then fits a calibration in numpy (no scipy). Grid = {scale, affine-in-depth, affine-in-disp} x
+  {global, per-video, per-clip, per-frame}. Every LOCAL fit is scored leave-one-object-out; the
+  `cross-class` rows calibrate on the OTHER classes and predict this one (the deployment case).
+- FIT TRICK: fixing r = b/a makes length proportional to a (depth) or 1/a (disp), so the best
+  scale for any r is closed form (median of log(L/mm), L1-optimal => robust). 2-D fit -> 1-D
+  search over r. `--selfcheck` plants a known calibration and asserts recovery.
+- RESULTS, 5 held-out videos, 671 objects (median rel err / median abs mm):
+  frozen warm-start        | trained range-sw05
+  global scale   25.6% 2.01 | 20.4% 1.65
+  global affine  24.8% 1.89 | 18.3% 1.56      <- shift alone buys only ~1-2 points
+  per-clip scale 16.7% 1.19 | 14.1% 1.19
+  per-clip affine(disp) **12.6% 1.02** | **9.3% 0.77**  <- best
+  per-frame scale 26.0% (87% cov) | 22.4%     <- per-frame is WORSE, not better
+  per-frame affine 43.8% (24% cov) | 44.1%    <- LOO leaves ~1 anchor; fit is noise
+- CONCLUSIONS: (1) LOCALITY dominates the shift — global->per-clip roughly halves the error,
+  adding the shift then takes off another 3-5 points. (2) affine in DISPARITY beats affine in
+  depth at clip level (9.3 vs 10.8), consistent with EndoDAC's DepthAnything backbone being
+  affine-invariant in inverse depth — SUL_10_week_plan Phase 3 writes Z = a*d + b, which is the
+  weaker of the two. (3) per-clip is the sweet spot; per-frame has too few anchors to fit 2
+  params (24% coverage) and even scale-only degrades. Aggregate over the clip, per the plan's
+  temporal-aggregation step. (4) an under-determined affine fit extrapolates wildly — read the
+  median mm column, not the mean, on the per-frame rows.
+- SOBERING: CROSS-CLASS (calibrate on other object classes, predict this one) is ~22% at BOTH
+  global and per-clip on sw05 — locality does NOT help when the calibration object differs from
+  the measured one. The 9.3% best benefits from other instances of the SAME class in the clip.
+  For SUL (calibrate on catheter, measure urethra) budget ~22%, i.e. ~4.4mm on a 20mm urethra.
+
 ## 2026-09-02 — DEPTH: --min-depth/--max-depth WAS THE BUG (metric scale solved)
 - ROOT CAUSE of the first ruler run's failure: the defaults `--min-depth 0.1 --max-depth 150`.
   disp_to_depth maps sigmoid disp -> depth via min_disp=1/max_depth, max_disp=1/min_depth, so with
