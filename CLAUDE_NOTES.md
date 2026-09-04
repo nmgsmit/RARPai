@@ -19,6 +19,31 @@ sessions don't re-derive them. Keep entries one or two lines.
   anchors. Neither run beats a single global constant on the frozen warm-start (deb 0.191).
   => next lever is `--anchor-w`, not the class mix.
 
+## 2026-09-02 — DEPTH: ARM-ONLY calibration (the real deployment case) — use SCALE, not affine
+- Deployment has only the Robot arm as an in-frame anchor. `--calib-classes 3` calibrates on the
+  arm alone and scores only the other classes; `diagnose()` reports the depth spread that decides
+  whether the shift b is identifiable at all.
+- SPREAD (test split, sw05): the shift needs anchors at DIFFERENT depths. Measured:
+  within-object (along the annotated segment) Ruler 5.6 / Catheter 1.9 / **Arm 3.2mm**;
+  in-frame pooled 0.0 for every class (only ONE instance per class per frame);
+  in-clip Arm 3.8mm, in-video Arm 5.8mm = **10% of the arm's 37mm working distance**.
+- => The arm's 8mm annotation is the shaft DIAMETER measured ACROSS the shaft (3.2mm of depth
+  spread), NOT a run along its length. The "long cylinder gives you many depths" idea is right
+  physics but is NOT in the current annotations. Getting it needs the 8mm width annotated at
+  SEVERAL STATIONS ALONG the shaft in the same frame.
+- => The arm does move in depth between frames, but only 3.8-5.8mm. Sweeping a minimum-spread
+  requirement shows extra spread does NOT rescue the affine fit: clip-level arm-only affine
+  25.2% (>=3mm) -> 28.3% (>=6mm) -> 29.9% (>=10mm) while coverage collapses 44% -> 24% -> 11%.
+  Every affine variant loses to scale-only. Degenerate fits show up as 1e8 mm in the MEAN column.
+- ARM-ONLY RESULTS (sw05, median rel err / median mm / coverage):
+  global scale 26.1% 2.22 (86%) | **video scale 21.5% 2.02 (56%)** <- best
+  | clip scale 22.6% 1.99 (44%) | frame scale 23.6% 2.02 (22%)
+  Per class from an arm-only calibration: Ruler ~20-23%, Catheter ~26-32%.
+- COVERAGE IS THE BIGGER RISK: the arm is in only 26% of frames and 50% of CLIPS. Half the clips
+  have no arm at all, so no calibration is computable there — a deployment failure, not an error.
+- RECOMMENDATION: arm-only => scale-only fit, pooled over the video/clip (not per frame), budget
+  ~21% median (~4.2mm on a 20mm urethra), and design for the 50% of clips with no anchor.
+
 ## 2026-09-02 — DEPTH: affine (scale+shift) calibration — LOCALITY beats the shift
 - `scripts/fit_affine_scale.py`: runs a FROZEN model once, dumps per-object rays+depths to .npz,
   then fits a calibration in numpy (no scipy). Grid = {scale, affine-in-depth, affine-in-disp} x
