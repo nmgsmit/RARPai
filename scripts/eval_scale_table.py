@@ -96,8 +96,11 @@ def main():
     ap.add_argument("--image-shape", type=int, nargs=2, default=[392, 490])
     ap.add_argument("--intrinsics", type=float, nargs=4, default=list(DEFAULT_K_NORM))
     ap.add_argument("--frame-stride", type=int, default=1)
-    ap.add_argument("--min-depth", type=float, default=0.1)
-    ap.add_argument("--max-depth", type=float, default=150.0)
+    # 20/200 mm, NOT the 0.1/150 KITTI-unit defaults: those compress the 35-120mm endoscopic
+    # band into 0.2% of the sigmoid range, which makes every metric number an artifact.
+    # See CLAUDE_NOTES 2026-09-02 "--min-depth/--max-depth WAS THE BUG".
+    ap.add_argument("--min-depth", type=float, default=20.0)
+    ap.add_argument("--max-depth", type=float, default=200.0)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--csv", default=None, help="also dump every object as pred_mm,true_mm,class")
