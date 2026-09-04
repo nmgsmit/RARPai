@@ -405,6 +405,89 @@ def eval_metric_scale(depth_model, loader, hw, device, min_depth, max_depth):
     return out
 
 
+# ------------------------------------------- hand-annotated catheter test set (sul_reference)
+CATHETER_CLASS = 2       # scale_objects.json class id of the manually drawn catheter width
+
+
+def sample_depth(depth, u_n, v_n, radius=2):
+    """Median depth in a (2r+1)^2 patch -- a single pixel on a thin structure can land on the
+    depth discontinuity. Same as gui_depth_measure.sample_depth (kept local: that module is a GUI)."""
+    h, w = depth.shape
+    u, v = int(round(np.clip(u_n, 0, 1) * (w - 1))), int(round(np.clip(v_n, 0, 1) * (h - 1)))
+    patch = depth[max(0, v - radius):v + radius + 1, max(0, u - radius):u + radius + 1]
+    return float(np.median(patch)) if patch.size else float(depth[v, u])
+
+
+def segment_length(p0, p1, z0, z1, k_norm):
+    """3D length (mm) between two normalised pixels back-projected at their depths."""
+    fx, fy, cx, cy = k_norm
+    a = np.array([(p0[0] - cx) * z0 / fx, (p0[1] - cy) * z0 / fy, z0])
+    b = np.array([(p1[0] - cx) * z1 / fx, (p1[1] - cy) * z1 / fy, z1])
+    return float(np.linalg.norm(b - a))
+
+
+def load_catheter_ref(root, hw):
+    """Hand-drawn catheter widths -> [(img_tensor[3,h,w], a_norm, b_norm, true_mm)].
+
+    Same annotations catheter_scale_check_reference.py reads: scale_objects.json frame keys are
+    indices into the sorted image list. Images are already 5:4 with the banner blacked, so NO crop
+    and NO K adjustment -- feed them as-is with the base --intrinsics."""
+    root = Path(root)
+    so = json.loads((root / "scale_objects.json").read_text())
+    images = sorted((root / "images").glob("*.png"))
+    to_tensor = transforms.ToTensor()
+    out = []
+    for idx, objs in so["frames"].items():
+        i = int(idx)
+        if i >= len(images):
+            continue
+        for o in objs:
+            if o["class_id"] != CATHETER_CLASS:
+                continue
+            img = Image.open(images[i]).convert("RGB")
+            W, H = img.size
+            a, b = o["a"], o["b"]
+            out.append((to_tensor(img.resize((hw[1], hw[0]), Image.BILINEAR)),
+                        (a[0] / W, a[1] / H), (b[0] / W, b[1] / H), float(o["mm"])))
+    return out
+
+
+def _selfcheck_catheter_ref():
+    """A 1 mm-wide object at 50 mm on a K with fx=0.82 spans 1/(50/0.82) of the frame width."""
+    fx = 0.82
+    du = 1.0 / (50.0 / fx)
+    assert abs(segment_length((0.5, 0.5), (0.5 + du, 0.5), 50.0, 50.0, (fx, 1.02, 0.5, 0.5)) - 1.0) < 1e-9
+    d = np.full((10, 10), 7.0); d[5, 5] = 100.0            # median ignores the outlier pixel
+    assert sample_depth(d, 0.5, 0.5) == 7.0
+
+
+@torch.no_grad()
+def eval_catheter_ref(depth_model, ref, hw, device, min_depth, max_depth, k_norm):
+    """THE test metric: measured catheter width minus the true 16 Fr width, in mm. -> 0 when the
+    depth map is metric. Unlike metric_val this GT was drawn by hand on held-out snapshots, with
+    no segmentation mask and no training anchor in the loop."""
+    if not ref:
+        return {}
+    was_training = depth_model.training
+    depth_model.eval()
+    errs, mms = [], []
+    for img, a, b, true_mm in ref:
+        disp = F.interpolate(depth_model(img.unsqueeze(0).to(device))[("disp", 0)], hw,
+                             mode="bilinear", align_corners=False)
+        _, depth = disp_to_depth(disp, min_depth, max_depth)
+        d = depth[0, 0].cpu().numpy()
+        mm = segment_length(a, b, sample_depth(d, *a), sample_depth(d, *b), k_norm)
+        mms.append(mm)
+        errs.append(mm - true_mm)
+    depth_model.train(was_training)
+    e = np.array(errs)
+    return {"err_mm": float(np.median(e)),            # signed: the number that must reach 0
+            "abs_err_mm": float(np.median(np.abs(e))),
+            "width_mm": float(np.median(mms)),
+            "scale": float(np.median(np.array(mms) / np.array([r[3] for r in ref]))),
+            "n": float(len(e))}
+
+
 def split_by_video(root, n_val, n_test, seed=42):
     """Split clip dirs by VIDEO (surgery), not by clip -- clips from one surgery share anatomy,
     lighting and scope, so a clip-level split leaks. Deterministic given seed."""
@@ -981,6 +1064,9 @@ def main():
     ap.add_argument("--no-automask", action="store_true")
     ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--panel-size", type=int, default=8, help="fixed qualitative frames")
+    ap.add_argument("--catheter-ref",
+                    default="../transfer_atlas_mod/workspace/UMCsulsnaps/sul_reference",
+                    help="hand-annotated catheter test set (dir with images/ + scale_objects.json); \"\" to skip")
     ap.add_argument("--scared-dir", default="../data/SCARED/stereo_gt",
                     help="calibrated-stereo SCARED GT (frames/ + gt_depths.npz) for the "
                          "end-of-training metric eval; build with scripts/export_scared_stereo_gt.py")
@@ -1009,6 +1095,7 @@ def main():
         _selfcheck_crop_intrinsics()
         _selfcheck_khead_init()
         _selfcheck_scale_loss()
+        _selfcheck_catheter_ref()
         m = build_depth_model(model_shape, device)
         pe = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
         pd = decoders.PoseDecoder(pe.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
@@ -1165,6 +1252,14 @@ def main():
                                side_crop=content_crop(args.side_crop_frac, args.black_bar_frac),
                                bottom_crop=args.bottom_crop_frac, top_crop=args.top_crop_frac)
 
+    cath_ref = (load_catheter_ref(args.catheter_ref, hw)
+                if args.catheter_ref and Path(args.catheter_ref).exists() else [])
+    print(f"[catheter-ref] {len(cath_ref)} hand-annotated widths from {args.catheter_ref}", flush=True)
+
+    def eval_catheter_now():
+        return eval_catheter_ref(depth_model, cath_ref, hw, device, args.min_depth,
+                                 args.max_depth, k_full)
+
     def eval_metric_now(loader):
         """Metric accuracy on the known-size objects. Unlike SCARED (median-scaled, so blind to
         scale) this is the only number that says whether the depth map is METRIC."""
@@ -1196,6 +1291,11 @@ def main():
         print(f"[epoch 0] warm-start metric scale={mres0['scale']:.3f} "
               f"abs_rel={mres0['abs_rel']:.3f} debiased={mres0['abs_rel_deb']:.3f} "
               f"(n={int(mres0['n'])})", flush=True)
+    cres0 = eval_catheter_now()
+    if cres0:
+        log0.update({f"catheter/{k}": v for k, v in cres0.items()})
+        print(f"[epoch 0] catheter err={cres0['err_mm']:+.3f} mm "
+              f"(width {cres0['width_mm']:.2f} vs true, n={int(cres0['n'])})", flush=True)
     if best < float("inf"):
         torch.save(depth_model.state_dict(), outdir / "best.pth")   # warm-start eligible as best
         wandb.run.summary.update({f"best_{sel_name}": best, "best_epoch": 0})
@@ -1219,10 +1319,14 @@ def main():
         if mres:
             logd.update({f"metric_val/{k}": v for k, v in mres.items()})
             score, sel_name = mres["abs_rel"], "metric_val_abs_rel"
+        cres = eval_catheter_now()
+        if cres:
+            logd.update({f"catheter/{k}": v for k, v in cres.items()})
         print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
               f"val_photo={va_logs['photo']:.4f}  {sel_name}={score:.4f}  "
               + (f"metric_scale={mres['scale']:.3f}  " if mres else "")
               + (f"train_scale={tr_logs['scale']:.4f}  " if "scale" in tr_logs else "")
+              + (f"cath_err={cres['err_mm']:+.3f}mm  " if cres else "")
               + f"pose_trans={tr_logs['pose_trans']:.4f}", flush=True)
         panel_img = qualitative_panel(depth_model, panel, hw, device, args.min_depth, args.max_depth)
         logd["qual/panel"] = wandb.Image(panel_img, caption=f"epoch {ep} [rgb | depth]")
@@ -1249,6 +1353,11 @@ def main():
         print("[metric/test] " + "  ".join(f"{k}={v:.4f}" for k, v in mte.items()), flush=True)
         wandb.log({f"metric_test/{k}": v for k, v in mte.items()})
         wandb.run.summary.update({f"metric_test/{k}": v for k, v in mte.items()})
+    cte = eval_catheter_now()                  # hand-annotated test set, on the SELECTED best model
+    if cte:
+        print("[catheter/test] " + "  ".join(f"{k}={v:.4f}" for k, v in cte.items()), flush=True)
+        wandb.log({f"catheter_test/{k}": v for k, v in cte.items()})
+        wandb.run.summary.update({f"catheter_test/{k}": v for k, v in cte.items()})
     wandb.log({"qual/test_panel": wandb.Image(
         qualitative_panel(depth_model, [(te_ds[i][("color", 0)], te_ds[i]["valid"])
                           for i in np.linspace(0, len(te_ds) - 1, args.panel_size).astype(int)],
