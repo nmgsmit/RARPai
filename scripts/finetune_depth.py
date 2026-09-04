@@ -41,6 +41,7 @@ import json
 import os
 import random
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -146,7 +147,7 @@ class RARPTriplets(Dataset):
                  augment=False, vignette_thresh=0.04, mask_overlay=True,
                  overlay_frames=16, overlay_std_thresh=6.0, overlay_min_valid=0.25,
                  side_crop_frac=0.0, top_crop_frac=0.0, sample_frac=1.0,
-                 motion_top_frac=1.0, clip_dirs=None, anchors_max=0):
+                 motion_top_frac=1.0, clip_dirs=None, anchors_max=0, anchor_sources=None):
         self.h, self.w = hw
         self.stride = stride
         self.bottom_crop_frac = bottom_crop_frac
@@ -172,6 +173,7 @@ class RARPTriplets(Dataset):
         self.samples = []         # (frames[list[Path]], center_idx)
         self.overlay = {}         # str(clip_dir) -> valid mask (1,H,W) float, or None
         self.anchors_max = anchors_max
+        self.anchor_sources = anchor_sources
         self.anchors = {}         # str(clip_dir) -> {center_idx: [(pts,mm,conf,class_id), ...]}
         dirs = [Path(d) for d in clip_dirs] if clip_dirs is not None \
             else sorted(Path(split_dir).glob("*/*/clip_*/images"))
@@ -184,7 +186,8 @@ class RARPTriplets(Dataset):
                 frames, overlay_frames, overlay_std_thresh, overlay_min_valid) \
                 if mask_overlay else None
             if anchors_max:
-                self.anchors[str(d)] = load_scale_anchors(d.parent, (self.h, self.w))
+                self.anchors[str(d)] = load_scale_anchors(d.parent, (self.h, self.w),
+                                                          anchor_sources)
         assert self.samples, f"no triplets found under {split_dir or dirs[:1]}"
         if anchors_max:
             # Annotated points live in the dump's own (already-cropped) pixels; a training-time
@@ -296,13 +299,17 @@ class RARPTriplets(Dataset):
 ANCHOR_PTS = 5            # points sampled per annotated segment (matches n_track_points)
 
 
-def load_scale_anchors(clip_dir, hw):
+def load_scale_anchors(clip_dir, hw, sources=None):
     """Read <clip>/scale_objects.json -> {frame_idx: [(pts, mm, conf, class_id), ...]}, in FEED px.
 
     Each annotated object is a straight segment of KNOWN physical length (`mm`) with `points`
     along it in source-frame pixels: Ruler (annotator-typed mm), Catheter tip (Fr/3 = 5.333 mm)
     and Robot arm (8 mm). Rescaling source -> feed is a pure isotropic factor because the dump is
     already cropped to the 5:4 content (source_crop.json) and the feed keeps that aspect.
+    `sources` (e.g. {"manual"}) keeps only annotations with that `source`: the GUI draws an
+    object on a keyframe ("manual") and optical-flow propagates it to the rest of the clip
+    ("tracked"/"hold"), so manual-only = the human's own pixels with no propagation drift.
+
     ponytail: align_corners convention (w-1), matching the grid_sample in scale_loss; the
     half-pixel difference vs PIL's resize is <0.2% on a 300 px segment.
     """
@@ -318,6 +325,8 @@ def load_scale_anchors(clip_dir, hw):
         for o in objs:
             pts = np.asarray(o.get("points") or [], np.float32)
             if len(pts) < 2 or not o.get("mm"):
+                continue
+            if sources and (o.get("source") or "manual") not in sources:
                 continue
             rows.append((np.stack([pts[:, 0] * sx, pts[:, 1] * sy], 1),
                          float(o["mm"]), float(o.get("conf") or 1.0), int(o["class_id"])))
@@ -450,6 +459,17 @@ def load_catheter_ref(root, hw):
             out.append((to_tensor(img.resize((hw[1], hw[0]), Image.BILINEAR)),
                         (a[0] / W, a[1] / H), (b[0] / W, b[1] / H), float(o["mm"])))
     return out
+
+
+def _selfcheck_anchor_sources(tmp):
+    """manual-only keeps the keyframe and drops the propagated copies."""
+    d = {"frame_size": [100, 100], "frames": {"0": [
+        {"class_id": 2, "mm": 5.333, "source": "manual", "points": [[10, 10], [20, 10]]},
+        {"class_id": 2, "mm": 5.333, "source": "tracked", "points": [[11, 10], [21, 10]]},
+        {"class_id": 2, "mm": 5.333, "points": [[12, 10], [22, 10]]}]}}      # no key -> manual
+    (Path(tmp) / "scale_objects.json").write_text(json.dumps(d))
+    assert len(load_scale_anchors(tmp, (100, 100))[0]) == 3                  # no filter: all
+    assert len(load_scale_anchors(tmp, (100, 100), {"manual"})[0]) == 2      # keyframe + default
 
 
 def _selfcheck_catheter_ref():
@@ -1064,6 +1084,8 @@ def main():
     ap.add_argument("--no-automask", action="store_true")
     ap.add_argument("--no-augment", action="store_true")
     ap.add_argument("--panel-size", type=int, default=8, help="fixed qualitative frames")
+    ap.add_argument("--anchor-sources", default="", help="comma-separated scale_objects.json "
+                    "`source` values to keep (e.g. manual); empty = all (manual+tracked+hold)")
     ap.add_argument("--catheter-ref",
                     default="../transfer_atlas_mod/workspace/UMCsulsnaps/sul_reference",
                     help="hand-annotated catheter test set (dir with images/ + scale_objects.json); \"\" to skip")
@@ -1096,6 +1118,8 @@ def main():
         _selfcheck_khead_init()
         _selfcheck_scale_loss()
         _selfcheck_catheter_ref()
+        with tempfile.TemporaryDirectory() as td:
+            _selfcheck_anchor_sources(td)
         m = build_depth_model(model_shape, device)
         pe = encoders.ResnetEncoder(18, False, num_input_images=2).to(device)
         pd = decoders.PoseDecoder(pe.num_ch_enc, 1, num_frames_to_predict_for=2).to(device)
@@ -1148,6 +1172,8 @@ def main():
 
     # Anchors load whenever the scale loss is on OR we split by video (the ruler dumps), so
     # the metric eval still has something to score in a --scale-w 0 baseline run.
+    ds_kw["anchor_sources"] = (set(x.strip() for x in args.anchor_sources.split(",") if x.strip())
+                               or None)
     ds_kw["anchors_max"] = args.max_anchors if (args.scale_w > 0 or args.video_split) else 0
     tr_dirs, va_dirs, te_dirs = split_by_video(root, *args.video_split, args.seed) \
         if args.video_split else (None, None, None)
@@ -1233,6 +1259,7 @@ def main():
                            scale_w=args.scale_w, scale_classes=args.scale_classes,
                            video_split=args.video_split,
                            max_anchors=ds_kw["anchors_max"],
+                           anchor_sources=args.anchor_sources or "all",
                            init=str(args.init), data_root=str(root)))
 
     outdir = Path(args.out); outdir.mkdir(parents=True, exist_ok=True)
