@@ -150,7 +150,8 @@ def fit(rays, z, mm, space, affine):
     return a, a * best_r
 
 
-def evaluate(d, level, space, affine, cross_class=False, calib_classes=None):
+def evaluate(d, level, space, affine, cross_class=False, calib_classes=None,
+             min_spread=0.0):
     """Predicted length for every object, calibrated leave-one-out within its group.
 
     A global fit on 2 parameters over hundreds of objects is effectively free, so it is scored
@@ -185,7 +186,10 @@ def evaluate(d, level, space, affine, cross_class=False, calib_classes=None):
                 src = idx[idx != j]                      # leave-one-object-out
             if len(src) < need:
                 continue
-            if affine and np.ptp(z[src].mean(1)) < 1e-3:  # no depth spread -> shift unidentifiable
+            # The shift is only identifiable if the calibration anchors sit at DIFFERENT
+            # depths. Pooling one object class over time supplies that spread only if the object
+            # actually moves in depth -- min_spread makes the requirement explicit.
+            if affine and np.ptp(z[src]) < max(min_spread, 1e-3):
                 continue
             key = src.tobytes()
             if key not in cache:
@@ -193,6 +197,33 @@ def evaluate(d, level, space, affine, cross_class=False, calib_classes=None):
             a, b = cache[key]
             pred[j] = lengths(rays[j:j + 1], z[j:j + 1], a, b, space)[0]
     return pred
+
+
+def diagnose(d):
+    """Depth spread is the whole story for the shift, so measure where it can come from.
+
+    WITHIN-object spread is what a long cylinder gives you inside a single frame (the annotated
+    segment recedes in depth along the shaft). BETWEEN-object spread is what pooling over time
+    gives you (the anchor moves). The shift b is conditioned on spread RELATIVE to mean depth --
+    a few mm of spread at a ~40mm working distance is nearly degenerate however many samples
+    you stack up.
+    """
+    print(chr(10) + "[spread] depth diversity available to an affine fit")
+    print("{:<14}{:>7}{:>12}{:>12}{:>12}{:>12}".format(
+        "class", "n", "within-obj", "in-frame", "in-clip", "in-video"))
+    for c in sorted(set(d["cls"].tolist())):
+        m = d["cls"] == c
+        zc, zm = d["z"][m], d["z"][m].mean(1)
+        within = float(np.median(np.ptp(zc, axis=1)))          # along the annotated segment
+
+        def pooled(key):
+            v = [np.ptp(zm[d[key][m] == k]) for k in sorted(set(d[key][m]))]
+            return float(np.median(v)) if v else 0.0
+
+        mean_z = float(np.median(zm))
+        print("{:<14}{:>7}{:>11.1f}{:>12.1f}{:>12.1f}{:>12.1f}   ({:.0f}% of {:.0f}mm)".format(
+            CLASS_NAMES[c], int(m.sum()), within, pooled("frame"), pooled("clip"),
+            pooled("video"), 100 * pooled("clip") / max(mean_z, 1e-9), mean_z))
 
 
 def report(d, rows):
@@ -302,6 +333,8 @@ def main():
                   CLASS_NAMES[c], int(m.sum()), 100 * fr, 100 * cl,
                   zs.min(), zs.max(), float(np.median(spread)) if spread else 0.0))
 
+    diagnose(d)
+
     rows = []
     for level in ("global", "video", "clip", "frame"):
         for space, affine in (("depth", False), ("depth", True), ("disp", True)):
@@ -317,6 +350,14 @@ def main():
                 rows.append((level, space, affine, tag,
                              evaluate(d, level, space, affine,
                                       calib_classes=args.calib_classes)))
+        # Does MORE depth spread rescue the shift? Same fit, but only on groups whose anchors
+        # actually span this many mm. If affine never beats scale even at the top of the range
+        # the data has, pooling one anchor class cannot identify the shift here.
+        for ms in (3.0, 6.0, 10.0, 15.0):
+            for space in ("depth", "disp"):
+                rows.append(("clip", space, True, tag + ">=%.0fmm " % ms,
+                             evaluate(d, "clip", space, True,
+                                      calib_classes=args.calib_classes, min_spread=ms)))
     report(d, rows)
 
 
