@@ -190,29 +190,32 @@ def evaluate(d, level, space, affine, cross_class=False):
 def report(d, rows):
     # ponytail: plain .format(), not nested f-string expressions -- Snellius runs Python 3.11,
     # where a multi-line expression inside f-string braces is a SyntaxError (PEP 701 is 3.12+).
+    # Both a mean AND a median mm column: an under-determined fit (few anchors, no depth spread)
+    # can extrapolate to absurd lengths, and the gap between the two columns is the tell.
     mm, cls = d["mm"], d["cls"]
     classes = sorted(set(cls.tolist()))
     per_hdr = "   | per class median %  (" + ", ".join(CLASS_NAMES[c] for c in classes) + ")"
-    hdr = "{:<11}{:<14}{:<7}{:>6}{:>6}{:>8}{:>9}".format(
-        "fit level", "params", "space", "n", "cov", "med %", "MAE mm") + per_hdr
+    hdr = "{:<11}{:<20}{:<7}{:>6}{:>6}{:>8}{:>9}{:>10}".format(
+        "fit level", "params", "space", "n", "cov", "med %", "med mm", "mean mm") + per_hdr
     print(chr(10) + hdr)
     print("-" * len(hdr))
     for level, space, affine, cross, pred in rows:
         ok = np.isfinite(pred)
         name = ("cross-class " if cross else "") + ("affine" if affine else "scale")
         if ok.sum() < 3:
-            print("{:<11}{:<14}{:<7}{:>6}{:>6}   (no group could support this fit)".format(
+            print("{:<11}{:<20}{:<7}{:>6}{:>6}   (no group could support this fit)".format(
                 level, name, space, 0, "--"))
             continue
         rel = np.abs(pred[ok] / mm[ok] - 1.0)
+        dev = np.abs(pred[ok] - mm[ok])
         cells = []
         for c in classes:
             m = ok & (cls == c)
             cells.append("{:>7.1f}".format(100 * np.median(np.abs(pred[m] / mm[m] - 1.0)))
                          if m.sum() >= 3 else "{:>7}".format("--"))
-        print("{:<11}{:<14}{:<7}{:>6}{:>5.0f}%{:>8.1f}{:>9.2f}   |{}".format(
+        print("{:<11}{:<20}{:<7}{:>6}{:>5.0f}%{:>8.1f}{:>9.2f}{:>10.2f}   |{}".format(
             level, name, space, int(ok.sum()), 100 * ok.mean(),
-            100 * np.median(rel), np.abs(pred[ok] - mm[ok]).mean(), "".join(cells)))
+            100 * np.median(rel), np.median(dev), dev.mean(), "".join(cells)))
 
 
 def _selfcheck():
