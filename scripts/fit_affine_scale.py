@@ -155,25 +155,31 @@ def evaluate(d, level, space, affine, cross_class=False):
 
 
 def report(d, rows):
+    # ponytail: plain .format(), not nested f-string expressions -- Snellius runs Python 3.11,
+    # where a multi-line expression inside f-string braces is a SyntaxError (PEP 701 is 3.12+).
     mm, cls = d["mm"], d["cls"]
-    hdr = (f"{'fit level':<11}{'params':<14}{'space':<7}{'n':>6}{'cov':>6}"
-           f"{'med %':>8}{'MAE mm':>9}{'  | per class median %  (' + ' '.join(
-               f'{CLASS_NAMES[c]}' for c in sorted(set(cls.tolist()))) + ')':<20}")
-    print("\n" + hdr)
-    print("-" * 104)
+    classes = sorted(set(cls.tolist()))
+    per_hdr = "   | per class median %  (" + ", ".join(CLASS_NAMES[c] for c in classes) + ")"
+    hdr = "{:<11}{:<14}{:<7}{:>6}{:>6}{:>8}{:>9}".format(
+        "fit level", "params", "space", "n", "cov", "med %", "MAE mm") + per_hdr
+    print(chr(10) + hdr)
+    print("-" * len(hdr))
     for level, space, affine, cross, pred in rows:
         ok = np.isfinite(pred)
+        name = ("cross-class " if cross else "") + ("affine" if affine else "scale")
         if ok.sum() < 3:
-            print(f"{level:<11}{'affine' if affine else 'scale':<14}{space:<7}"
-                  f"{0:>6}{'--':>6}   (no group could support this fit)")
+            print("{:<11}{:<14}{:<7}{:>6}{:>6}   (no group could support this fit)".format(
+                level, name, space, 0, "--"))
             continue
         rel = np.abs(pred[ok] / mm[ok] - 1.0)
-        per = "  ".join(f"{100 * np.median(np.abs(pred[ok & (cls == c)] / mm[ok & (cls == c)] - 1)):.1f}"
-                        if (ok & (cls == c)).sum() >= 3 else "  --"
-                        for c in sorted(set(cls.tolist())))
-        name = ("cross-class " if cross else "") + ("affine" if affine else "scale")
-        print(f"{level:<11}{name:<14}{space:<7}{int(ok.sum()):>6}{100 * ok.mean():>5.0f}%"
-              f"{100 * np.median(rel):>8.1f}{np.abs(pred[ok] - mm[ok]).mean():>9.2f}   | {per}")
+        cells = []
+        for c in classes:
+            m = ok & (cls == c)
+            cells.append("{:>7.1f}".format(100 * np.median(np.abs(pred[m] / mm[m] - 1.0)))
+                         if m.sum() >= 3 else "{:>7}".format("--"))
+        print("{:<11}{:<14}{:<7}{:>6}{:>5.0f}%{:>8.1f}{:>9.2f}   |{}".format(
+            level, name, space, int(ok.sum()), 100 * ok.mean(),
+            100 * np.median(rel), np.abs(pred[ok] - mm[ok]).mean(), "".join(cells)))
 
 
 def main():
