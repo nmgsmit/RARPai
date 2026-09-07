@@ -147,7 +147,8 @@ class RARPTriplets(Dataset):
                  augment=False, vignette_thresh=0.04, mask_overlay=True,
                  overlay_frames=16, overlay_std_thresh=6.0, overlay_min_valid=0.25,
                  side_crop_frac=0.0, top_crop_frac=0.0, sample_frac=1.0,
-                 motion_top_frac=1.0, clip_dirs=None, anchors_max=0, anchor_sources=None):
+                 motion_top_frac=1.0, clip_dirs=None, anchors_max=0, anchor_sources=None,
+                 balance_classes=None):
         self.h, self.w = hw
         self.stride = stride
         self.bottom_crop_frac = bottom_crop_frac
@@ -195,6 +196,8 @@ class RARPTriplets(Dataset):
             # ruler dumps are pre-cropped to the 5:4 content, so no run needs both.
             assert side_crop_frac == top_crop_frac == bottom_crop_frac == 0.0, \
                 "scale anchors are in source pixels; --*-crop-frac would displace them"
+            if balance_classes:
+                self._balance_anchors(balance_classes)
             na = sum(len(v) for v in self.anchors.values())
             print(f"[anchors] {na} annotated frames over {len(dirs)} clips", flush=True)
         # Frames sampled at 5-10 fps are highly redundant -> subsample triplet CENTERS (not frames:
@@ -217,6 +220,39 @@ class RARPTriplets(Dataset):
             q = np.percentile(scores, [25, 50, 75])
             print(f"[motion] kept {keep}/{len(order)} triplets (cutoff={cut:.2f}; "
                   f"p25/50/75={q[0]:.2f}/{q[1]:.2f}/{q[2]:.2f})", flush=True)
+
+    def _balance_anchors(self, classes):
+        """Put every class on equal footing for a --scale-classes ablation: keep only videos that
+        carry EVERY listed class, then subsample each class to the SAME number of objects.
+
+        Without this the comparison is a supervision-VOLUME test, not an anchor-quality one --
+        the dump has 1472 Ruler objects over 18 videos against 429 Catheter over 9 and 416 Arm
+        over 15, and CLAUDE_NOTES 2026-09-02 already showed volume dominates the outcome.
+        Apply to the TRAIN split only; val/test must keep every annotation to score with.
+        """
+        rows = {}                                  # (video, class) -> [(clip_key, frame, i)]
+        vids = set()
+        for key, byframe in self.anchors.items():
+            vid = Path(key).parent.parent.name
+            vids.add(vid)
+            for f, rs in byframe.items():
+                for i, r in enumerate(rs):
+                    rows.setdefault((vid, r[3]), []).append((key, f, i))
+        keep_vids = sorted(v for v in vids if all(rows.get((v, c)) for c in classes))
+        pool = {c: sorted(x for v in keep_vids for x in rows[(v, c)]) for c in classes}
+        n = min(len(p) for p in pool.values()) if pool else 0
+        assert n, f"no video carries all of {classes}; cannot balance"
+        keep = set()
+        for c in classes:
+            keep.update(random.Random(1234).sample(pool[c], n))
+        for key in list(self.anchors):
+            byframe = self.anchors[key]
+            for f in list(byframe):
+                byframe[f] = [r for i, r in enumerate(byframe[f]) if (key, f, i) in keep]
+                if not byframe[f]:
+                    del byframe[f]
+        print(f"[anchors] balanced to {n} objects x classes {classes} over "
+              f"{len(keep_vids)}/{len(vids)} videos", flush=True)
 
     def _motion_score(self, frames, c):
         """Median per-pixel |diff| between center and +stride frame on a small grayscale thumb
@@ -441,7 +477,9 @@ def eval_metric_scale(depth_model, loader, hw, device, min_depth, max_depth):
 
     stats(r[:, 0], "")
     for ci in np.unique(r[:, 1]):
-        stats(r[r[:, 1] == ci, 0], f"c{int(ci)}_")
+        m = r[:, 1] == ci
+        stats(r[m, 0], f"c{int(ci)}_")
+        stats(r[m, 2], f"c{int(ci)}_inplane_")     # the held-out per-class number to report
 
     zp, zt = r[:, 3], r[:, 3] / np.maximum(r[:, 2], 1e-6)
     ok = (zt > 10) & (zt < 300)                  # a degenerate ratio sends z_true to infinity
@@ -499,6 +537,21 @@ def load_catheter_ref(root, hw):
             out.append((to_tensor(img.resize((hw[1], hw[0]), Image.BILINEAR)),
                         (a[0] / W, a[1] / H), (b[0] / W, b[1] / H), float(o["mm"])))
     return out
+
+
+def _selfcheck_anchor_balance():
+    """Balancing keeps only videos carrying every class, and leaves them equal in count."""
+    ds = object.__new__(RARPTriplets)
+    row = lambda c: (None, 1.0, 1.0, c)
+    ds.anchors = {
+        "root/vidA/clip_0/images": {0: [row(1)] * 5 + [row(2)] * 2, 1: [row(3)] * 3},
+        "root/vidB/clip_0/images": {0: [row(1)] * 4 + [row(3)] * 4},   # no class 2 -> dropped
+    }
+    ds._balance_anchors([1, 2, 3])
+    left = [r[3] for byf in ds.anchors.values() for rs in byf.values() for r in rs]
+    assert sorted(left) == [1, 1, 2, 2, 3, 3], left          # n = min(5,2,3) = 2 per class
+    assert not any(ds.anchors["root/vidB/clip_0/images"].values()), "vidB should be empty"
+    print("[selfcheck] anchor balance OK")
 
 
 def _selfcheck_anchor_sources(tmp):
@@ -1141,6 +1194,11 @@ def main():
                          "(1=Ruler, 2=Catheter tip, 3=Robot arm). The metric eval still scores "
                          "EVERY class, so an excluded one is a held-out cross-object check. "
                          "Default: supervise on all.")
+    ap.add_argument("--anchor-balance", type=int, nargs="+", default=None, metavar="ID",
+                    help="equalise TRAIN scale supervision across these class_ids before "
+                         "--scale-classes picks one: keep only videos carrying all of them, then "
+                         "subsample each class to the same object count. Makes a per-class "
+                         "ablation a test of the ANCHOR, not of how many of it were annotated.")
     ap.add_argument("--max-anchors", type=int, default=4,
                     help="max annotated objects per frame fed to the scale loss (rest dropped)")
     ap.add_argument("--no-automask", action="store_true")
@@ -1180,6 +1238,7 @@ def main():
         _selfcheck_khead_init()
         _selfcheck_scale_loss()
         _selfcheck_catheter_ref()
+        _selfcheck_anchor_balance()
         with tempfile.TemporaryDirectory() as td:
             _selfcheck_anchor_sources(td)
         m = build_depth_model(model_shape, device)
@@ -1241,7 +1300,8 @@ def main():
         if args.video_split else (None, None, None)
     tr_ds = RARPTriplets(root / "Train", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
                          augment=not args.no_augment, sample_frac=args.sample_frac,
-                         motion_top_frac=args.motion_top_frac, clip_dirs=tr_dirs, **ds_kw)
+                         motion_top_frac=args.motion_top_frac, clip_dirs=tr_dirs,
+                         balance_classes=args.anchor_balance, **ds_kw)
     tr = DataLoader(tr_ds, args.batch_size, shuffle=True, num_workers=args.workers,
                     pin_memory=True, drop_last=True)
     va_ds = RARPTriplets(root / "Validation", hw, k_norm, args.frame_stride,
@@ -1369,6 +1429,9 @@ def main():
     def metric_sel(mres):
         """Select on the term being trained: the polyline error would pick the best TILT."""
         k = "inplane_abs_rel" if (args.scale_inplane and "inplane_abs_rel" in mres) else "abs_rel"
+        # A --scale-classes run must not pick its checkpoint by the classes it held out.
+        if args.scale_classes and len(args.scale_classes) == 1:
+            k = next((c for c in [f"c{args.scale_classes[0]}_{k}"] if c in mres), k)
         return mres[k], f"metric_val_{k}"
 
     sres0 = eval_scared_now()
