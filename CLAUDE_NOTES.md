@@ -3,6 +3,33 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-07 — DEPTH: --scale-inplane WORKS (distance tracking) but costs LOCAL GEOMETRY
+- `endodac-ruler-inplane` (job 26440067, gpu_a100 -- gpu_h100 was drained): scale-w 0.5,
+  --scale-inplane, --anchor-w 0, 12 ep. Best epoch 2 by inplane_abs_rel; ckpt kept as
+  `outputs/depth_ruler_inplane/{best,ep2_snapshot}.pth`.
+- TEST (5 held-out videos, n=665), sw05 -> inplane: track_slope .094 -> **.628**,
+  track_stdratio .226 -> .758, track_corr .417 -> .827, inplane_scale ~.74 -> **1.06**.
+  THE DEPTH MAP TRACKS DISTANCE FOR THE FIRST TIME. Confirmed independently on the 69
+  hand-annotated catheter widths: corr(error, apparent size) -- the constant-distance
+  signature -- collapses **+0.845 -> +0.306**.
+- THE COST, two ways of seeing the same thing: SCARED abs_rel .054 -> .134, a1 .983 -> .798;
+  and the test POLYLINE scale is 1.97 while in-plane is 1.06, i.e. depth is now ROUGH ALONG a
+  segment. In-plane supervision constrains the segment's MEAN depth and nothing constrains its
+  variation, so the tilt that used to be the shortcut is now unconstrained noise. Nick saw this
+  as "corrupted from epoch 6" in the qual panels.
+- CATHETER SET (external, hand-drawn, `../data/sul_reference`), measured 3D / measured in-plane:
+  sw05 scale 1.151 / 1.136, debiased 13.1% / 13.3% | inplane 1.927 / 1.639, 21.9% / **15.0%**.
+  Measuring in-plane removes most of the inplane model's penalty => the raw +4.9mm is endpoint
+  roughness, NOT a distance error. Level 1.64 here vs 1.06 on the ruler test set is consistent
+  with slope .63 (not 1.0): these snapshots sit at the NEAR end (z_true ~26-59mm), and an
+  under-tracking model over-reads there. No domain gap needed to explain it.
+- SO: not yet a better deliverable -- sw05 still wins at the habitual working distance. But the
+  failure mode changed from "cannot measure distance" to "measures it at 0.63 gain, with rough
+  local depth". NEXT: restore geometry regularisation now that the scale term only moves the
+  MEAN depth -- A/B --anchor-w 0.1 vs 0.3 with --scale-inplane, 4 epochs (everything past ep 5
+  is the degenerate regime: pose_trans jumps 7x at ep 6). Watch track_slope AND scared_abs_rel
+  together; either alone is gameable.
+
 ## 2026-09-07 — DEPTH: the scale loss was GAMED — training changed segment TILT, not distance
 - Same 671 test objects through warm-start and sw05 dumps (`rays` byte-identical, so annotations
   and K match): per-object mean depth ratio sw05/warm **1.005** (IQR .997-1.013, corr .992,
