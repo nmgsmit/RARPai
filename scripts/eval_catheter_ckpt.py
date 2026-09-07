@@ -24,17 +24,20 @@ def per_frame(model, ref, hw, device, min_depth, max_depth, k_norm):
     than the model thinks), so corr(ratio, apparent size) is +0.84 for the shipped checkpoint and
     should fall toward 0 for a model that tracks distance."""
     model.eval()
-    ratio, apparent = [], []
+    ratio, ratio_ip, apparent = [], [], []
     with torch.no_grad():
         for img, a, b, true_mm in ref:
             disp = F.interpolate(model(img.unsqueeze(0).to(device))[("disp", 0)], hw,
                                  mode="bilinear", align_corners=False)
             _, depth = disp_to_depth(disp, min_depth, max_depth)
             d = depth[0, 0].cpu().numpy()
-            mm = segment_length(a, b, sample_depth(d, *a), sample_depth(d, *b), k_norm)
+            za, zb = sample_depth(d, *a), sample_depth(d, *b)
+            mm = segment_length(a, b, za, zb, k_norm)
+            flat = segment_length(a, b, (za + zb) / 2, (za + zb) / 2, k_norm)
             ratio.append(mm / true_mm)
+            ratio_ip.append(flat / true_mm)
             apparent.append(float(np.hypot(a[0] - b[0], a[1] - b[1])))
-    return np.array(ratio), np.array(apparent)
+    return np.array(ratio), np.array(ratio_ip), np.array(apparent)
 
 
 def main():
@@ -60,14 +63,18 @@ def main():
         model.load_state_dict(torch.load(c, map_location=device))
         r = eval_catheter_ref(model, ref, hw, device, args.min_depth, args.max_depth,
                               tuple(args.intrinsics))
-        ratio, apparent = per_frame(model, ref, hw, device, args.min_depth, args.max_depth,
-                                    tuple(args.intrinsics))
+        ratio, ratio_ip, apparent = per_frame(model, ref, hw, device, args.min_depth,
+                                              args.max_depth, tuple(args.intrinsics))
         deb = np.median(np.abs(ratio / np.median(ratio) - 1.0))
         print(f"{Path(c).parent.name:26s} err {r['err_mm']:+.3f} mm | abs {r['abs_err_mm']:.3f} "
               f"| width {r['width_mm']:.3f} (true 5.333) | scale {r['scale']:.3f} | n {int(r['n'])}",
               flush=True)
+        deb_ip = np.median(np.abs(ratio_ip / np.median(ratio_ip) - 1.0))
         print(f"{'':26s} after removing its own constant: median err {100 * deb:.1f}%  "
               f"| corr(ratio, apparent size) {np.corrcoef(ratio, apparent)[0, 1]:+.3f}", flush=True)
+        print(f"{'':26s} IN-PLANE (one depth for both endpoints, so endpoint-depth roughness "
+              f"cannot inflate it): scale {np.median(ratio_ip):.3f}  debiased {100 * deb_ip:.1f}%  "
+              f"| corr {np.corrcoef(ratio_ip, apparent)[0, 1]:+.3f}", flush=True)
 
 
 if __name__ == "__main__":
