@@ -23,6 +23,11 @@ from pathlib import Path
 import numpy as np
 
 CLASS_NAMES = {1: "Ruler", 2: "Catheter tip", 3: "Robot arm"}
+# Optical-flow propagation copies one drawn object across a clip: it multiplies the COUNT while
+# adding almost no depth spread, so the two are reported apart. In the ruler dumps 1246 of 1472
+# ruler objects are "tracked", and every one of the 416 arm objects is "measured" -- there is not
+# a single hand-drawn arm anchor, which is why --anchor-sources manual silently drops the arm.
+PROPAGATED = {"tracked", "hold"}
 MIN_SPREAD_MM = 30.0        # anchor_spread_curve: 30 mm reaches the 12.7% floor, 15 mm = 15.7%
 MIN_OBJECTS = 20            # same table: 20 -> 16.7%, 50 -> 13.4%, fewer than 10 is unusable
 
@@ -59,7 +64,7 @@ def main():
                   and any(p.glob("*/scale_objects.json")))
     if not vids:
         raise SystemExit(f"no <video>/<clip>/scale_objects.json under {a.root}")
-    print(f"{'video':<26} {'class':<13} {'n':>4} {'manual':>7} "
+    print(f"{'video':<26} {'class':<13} {'n':>4} {'drawn':>6} "
           f"{'z p5-p95 (mm)':>16} {'spread':>7}  verdict")
     fails = 0
     for v in vids:
@@ -67,17 +72,17 @@ def main():
         classes = sorted({c for c, *_ in rows}) if a.class_id is None else [a.class_id]
         for c in classes:
             z = np.array([r[1] for r in rows if r[0] == c])
-            man = sum(1 for r in rows if r[0] == c and r[3] == "manual")
+            man = sum(1 for r in rows if r[0] == c and r[3] not in PROPAGATED)
             if not len(z):
                 continue
             lo, hi = np.percentile(z, [5, 95])
             spread, ok = hi - lo, []
             if spread < a.min_spread:
                 ok.append(f"SPREAD {spread:.0f}<{a.min_spread:.0f}mm")
-            if len(z) < a.min_objects:
-                ok.append(f"COUNT {len(z)}<{a.min_objects}")
+            if man < a.min_objects:                # propagated copies are not independent
+                ok.append(f"DRAWN {man}<{a.min_objects}")
             fails += bool(ok)
-            print(f"{v.name[:24]:<26} {CLASS_NAMES.get(c, c):<13} {len(z):>4} {man:>7} "
+            print(f"{v.name[:24]:<26} {CLASS_NAMES.get(c, c):<13} {len(z):>4} {man:>6} "
                   f"{lo:>7.0f}-{hi:<8.0f} {spread:>6.0f}  "
                   + ("FAIL: " + ", ".join(ok) if ok else "ok"))
     print(f"\n{fails} video/class group(s) below protocol "
