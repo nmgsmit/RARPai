@@ -1426,6 +1426,7 @@ def main():
               + (f"metric_scale={mres['scale']:.3f}  " if mres else "")
               + (f"track_slope={mres['track_slope']:.3f}  " if mres and "track_slope" in mres
                  else "")
+              + (f"scared={sres[0]['abs_rel']:.4f}  " if sres is not None else "")
               + (f"train_scale={tr_logs['scale']:.4f}  " if "scale" in tr_logs else "")
               + (f"cath_err={cres['err_mm']:+.3f}mm  " if cres else "")
               + f"pose_trans={tr_logs['pose_trans']:.4f}", flush=True)
