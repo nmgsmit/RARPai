@@ -1386,7 +1386,10 @@ def main():
         best, sel_name = metric_sel(mres0)
         print(f"[epoch 0] warm-start metric scale={mres0['scale']:.3f} "
               f"abs_rel={mres0['abs_rel']:.3f} debiased={mres0['abs_rel_deb']:.3f} "
-              f"(n={int(mres0['n'])})", flush=True)
+              f"(n={int(mres0['n'])})"
+              + (f" track_slope={mres0['track_slope']:.3f}"
+                 f" stdratio={mres0['track_stdratio']:.3f}" if "track_slope" in mres0 else ""),
+              flush=True)
     cres0 = eval_catheter_now()
     if cres0:
         log0.update({f"catheter/{k}": v for k, v in cres0.items()})
@@ -1421,6 +1424,8 @@ def main():
         print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
               f"val_photo={va_logs['photo']:.4f}  {sel_name}={score:.4f}  "
               + (f"metric_scale={mres['scale']:.3f}  " if mres else "")
+              + (f"track_slope={mres['track_slope']:.3f}  " if mres and "track_slope" in mres
+                 else "")
               + (f"train_scale={tr_logs['scale']:.4f}  " if "scale" in tr_logs else "")
               + (f"cath_err={cres['err_mm']:+.3f}mm  " if cres else "")
               + f"pose_trans={tr_logs['pose_trans']:.4f}", flush=True)

@@ -14,6 +14,7 @@ python scripts/sul_measure_depth.py --root "../transfer_atlas_mod/workspace/SUL_
 """
 import argparse
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -37,12 +38,23 @@ def main():
     ap.add_argument("--ckpt", default=str(DEFAULT_CKPT))
     ap.add_argument("--csv", default=None, help="default: <root>/sul_depth_compare.csv")
     ap.add_argument("--max-tilt", type=float, default=40.0)
+    ap.add_argument("--k-scale", type=float, default=None,
+                    help="multiplier on (fx, fy); or --k-scale-from a k_calibration.json")
+    ap.add_argument("--k-scale-from", default=None,
+                    help="k_calibration.json from fit_fx_catheter.py")
     ap.add_argument("--no-crop", action="store_true",
                     help="skip the pillarbox auto-crop (the model expects ~5:4 framing)")
     args = ap.parse_args()
 
     root = Path(args.root)
     out = Path(args.csv) if args.csv else root / "sul_depth_compare.csv"
+    k = DEFAULT_K_NORM
+    scale_k = args.k_scale
+    if args.k_scale_from:
+        scale_k = json.loads(Path(args.k_scale_from).read_text())["scale"]
+    if scale_k:
+        k = (k[0] * scale_k, k[1] * scale_k, k[2], k[3])
+        print(f"[k] fx,fy scaled by {scale_k:.3f} -> {k[0]:.4f}, {k[1]:.4f}")
     groups, arches = S.load_groups(root), S.load_arches(root)
     backend = DepthBackend(args.ckpt, DEFAULT_SHAPE, DEFAULT_MIN_DEPTH, DEFAULT_MAX_DEPTH).load()
 
@@ -89,7 +101,7 @@ def main():
         a = tuple(min(max(c, 0.0), 1.0) for c in a)
         b = tuple(min(max(c, 0.0), 1.0) for c in b)
         z0, z1 = sample_depth(depth, *a), sample_depth(depth, *b)
-        mm3d = segment_length(a, b, z0, z1, DEFAULT_K_NORM)
+        mm3d = segment_length(a, b, z0, z1, k)
         row.update(sul_depth_mm=f"{mm3d:.2f}", z0_mm=f"{z0:.1f}", z1_mm=f"{z1:.1f}",
                    dz_mm=f"{z1 - z0:+.1f}", status="ok")
         if row["sul_2d_mm"]:
