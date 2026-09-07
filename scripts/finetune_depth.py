@@ -335,7 +335,18 @@ def load_scale_anchors(clip_dir, hw, sources=None):
     return out
 
 
-def scale_loss(depth, inv_K, batch, hw, delta=0.3, classes=None):
+def _anchor_depth(depth, batch, hw):
+    """Depth sampled at every annotated point -> (B, N, P). align_corners matches the (w-1)
+    rescale in load_scale_anchors."""
+    pts = batch["anch_pts"]
+    B, N, P, _ = pts.shape
+    h, wid = hw
+    g = torch.stack([pts[..., 0] / (wid - 1) * 2 - 1, pts[..., 1] / (h - 1) * 2 - 1], -1)
+    return F.grid_sample(depth, g.view(B, N * P, 1, 2), align_corners=True,
+                         padding_mode="border").view(B, N, P)
+
+
+def scale_loss(depth, inv_K, batch, hw, delta=0.3, classes=None, inplane=False):
     """Metric anchor: predicted 3D length of each annotated segment vs its known mm.
 
     Self-supervised depth is scale-ambiguous; this is the only term that fixes the global scale.
@@ -349,6 +360,17 @@ def scale_loss(depth, inv_K, batch, hw, delta=0.3, classes=None):
     `classes` (list of class_id) restricts SUPERVISION to those objects; the eval always scores
     every class, so an excluded class becomes a held-out cross-object check of the learned scale.
 
+    `inplane` FLATTENS the depth across each segment before measuring. The 3D-polyline form is
+    GAMEABLE: bending depth ALONG a segment tilts it out of the image plane and lengthens it
+    without moving it, and that is exactly what the first metric runs learned (CLAUDE_NOTES
+    2026-09-07: object depth unchanged vs warm-start, ratio 1.005, while depth variation along
+    the segment grew +72%). Flat z leaves length = |sum of ray steps| * z, so the ONLY way to
+    satisfy the known mm is to put the object at the right DISTANCE.
+    Cost: an oblique object's in-plane length is mm*cos(theta), so this biases z far by 1/cos.
+    That is a bias one global constant removes; the tilt shortcut was unbounded and destroyed
+    distance tracking altogether. A one-sided loss would drop the cos bias but has a trivial
+    minimum at z -> 0 (nothing pushes depth up), so it is NOT offered.
+
     Returns (loss, ratio (B,N) = predicted/true length, weight (B,N)).
     """
     pts, mm, w = batch["anch_pts"], batch["anch_mm"], batch["anch_w"]
@@ -357,11 +379,9 @@ def scale_loss(depth, inv_K, batch, hw, delta=0.3, classes=None):
         for c in classes:
             keep |= batch["anch_cls"] == c
         w = w * keep
-    B, N, P, _ = pts.shape
-    h, wid = hw
-    g = torch.stack([pts[..., 0] / (wid - 1) * 2 - 1, pts[..., 1] / (h - 1) * 2 - 1], -1)
-    z = F.grid_sample(depth, g.view(B, N * P, 1, 2), align_corners=True,
-                      padding_mode="border").view(B, N, P)
+    z = _anchor_depth(depth, batch, hw)
+    if inplane:                    # mean, not median: gradient reaches every sampled point
+        z = z.mean(-1, keepdim=True).expand_as(z)
     hom = torch.cat([pts, torch.ones_like(pts[..., :1])], -1)
     p3 = torch.einsum("bij,bnpj->bnpi", inv_K[:, :3, :3], hom) * z.unsqueeze(-1)
     length = (p3[:, :, 1:] - p3[:, :, :-1]).norm(dim=-1).sum(-1)
@@ -379,6 +399,14 @@ def eval_metric_scale(depth_model, loader, hw, device, min_depth, max_depth):
     median |ratio-1| (the raw error you would report), `abs_rel_deb` = the same after dividing
     out the global median scale -- i.e. how much of the error is ONE constant offset (curable by
     a single calibration) versus genuine per-object error.
+
+    `scale` ALONE IS NOT ENOUGH -- it is a median, and a model that predicts one constant
+    distance for every frame scores 1.0 on it (CLAUDE_NOTES 2026-09-07). `track_slope` /
+    `track_stdratio` are the metrics that catch that: the object's TRUE distance is
+    z_true = z_pred / inplane_ratio, so a model that measures distance has slope ~1, and the
+    constant-distance model that shipped scores ~0.09. Read those, not `scale`.
+    Caveat: z_true is over-estimated for an oblique object (in-plane length is mm*cos theta),
+    which flattens the slope a little -- it is a floor on how well the model tracks, not a bound.
     """
     was_training = depth_model.training
     depth_model.eval()
@@ -391,8 +419,11 @@ def eval_metric_scale(depth_model, loader, hw, device, min_depth, max_depth):
                              mode="bilinear", align_corners=False)
         _, depth = disp_to_depth(disp, min_depth, max_depth)
         _, ratio, w = scale_loss(depth, batch["inv_K"], batch, hw)
+        _, ratio_ip, _ = scale_loss(depth, batch["inv_K"], batch, hw, inplane=True)
+        zp = _anchor_depth(depth, batch, hw).mean(-1)
         m = w > 0
-        rows.append(torch.stack([ratio[m], batch["anch_cls"][m].float()], 1).cpu())
+        rows.append(torch.stack([ratio[m], batch["anch_cls"][m].float(),
+                                 ratio_ip[m], zp[m]], 1).cpu())
     depth_model.train(was_training)
     if not rows:
         return {}
@@ -411,6 +442,15 @@ def eval_metric_scale(depth_model, loader, hw, device, min_depth, max_depth):
     stats(r[:, 0], "")
     for ci in np.unique(r[:, 1]):
         stats(r[r[:, 1] == ci, 0], f"c{int(ci)}_")
+
+    zp, zt = r[:, 3], r[:, 3] / np.maximum(r[:, 2], 1e-6)
+    ok = (zt > 10) & (zt < 300)                  # a degenerate ratio sends z_true to infinity
+    if ok.sum() > 20 and zt[ok].std() > 1e-6:
+        out["inplane_scale"] = float(np.median(r[ok, 2]))
+        out["inplane_abs_rel"] = float(np.median(np.abs(r[ok, 2] - 1.0)))
+        out["track_slope"] = float(np.polyfit(zt[ok], zp[ok], 1)[0])
+        out["track_stdratio"] = float(zp[ok].std() / zt[ok].std())
+        out["track_corr"] = float(np.corrcoef(zt[ok], zp[ok])[0, 1])
     return out
 
 
@@ -548,6 +588,17 @@ def _selfcheck_scale_loss():
     assert w3.sum().item() == 0 and l3.item() == 0.0, (w3.sum().item(), l3.item())
     l4, _, w4 = scale_loss(depth, inv_K, batch, (h, w), classes=[1])
     assert w4.sum().item() == 1.0 and l4.item() > 0, (w4.sum().item(), l4.item())
+
+    # THE SHORTCUT: ramp depth along the segment. Its 3D length grows (the model can "become
+    # metric" without moving anything); the in-plane length only follows the mean DISTANCE.
+    batch["anch_mm"] = torch.tensor([[mm]])
+    tilt = torch.full((1, 1, h, w), Z)
+    tilt[0, 0] += (torch.arange(w).float() - u0) * 0.5
+    _, r3d, _ = scale_loss(tilt, inv_K, batch, (h, w))
+    _, rip, _ = scale_loss(tilt, inv_K, batch, (h, w), inplane=True)
+    z_mean = Z + (u1 - u0) * 0.5 / 2                       # depth at u0 is Z, at u1 is Z + 10
+    assert r3d.item() > 1.2 * rip.item(), (r3d.item(), rip.item())
+    assert abs(rip.item() - z_mean / Z) < 1e-3, (rip.item(), z_mean / Z)
 
 
 # ------------------------------------------------------------------------- losses
@@ -707,7 +758,7 @@ def position_loss(R, batch, hw, ssim, pos_smooth_w):
 
 def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj, project,
                       hw, min_depth, max_depth, w, anchor=None, khead=None, scale_w=0.0,
-                      scale_cls=None):
+                      scale_cls=None, scale_inplane=False):
     """Stage 1: depth + pose + Transform against the appearance-refined target."""
     aug = {f: batch[("color_aug", f)] for f in (-1, 0, 1)}
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -741,7 +792,8 @@ def refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim, backproj,
     if khead is not None:
         logs.update(_k_logs(K, hw))
     if scale_w > 0 and "anch_w" in batch:
-        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw, classes=scale_cls)
+        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw, classes=scale_cls,
+                                   inplane=scale_inplane)
         loss = loss + scale_w * sl
         logs["scale"] = sl.item()
         logs["loss"] = loss.item()
@@ -773,7 +825,7 @@ def _set_stage(R, pose_enc, pose_dec, depth_model, stage, khead=None):
 
 def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, project,
                      hw, min_depth, max_depth, smooth_w, automask=True, anchor=None,
-                     khead=None, scale_w=0.0, scale_cls=None):
+                     khead=None, scale_w=0.0, scale_cls=None, scale_inplane=False):
     """Returns (loss, logs). Single-scale Monodepth2 photometric + smoothness."""
     h, w = hw
     color = {f: batch[("color", f)] for f in (-1, 0, 1)}
@@ -816,7 +868,8 @@ def photometric_step(batch, depth_model, pose_enc, pose_dec, ssim, backproj, pro
     if khead is not None:
         logs.update(_k_logs(K, hw))
     if scale_w > 0 and "anch_w" in batch:
-        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw, classes=scale_cls)
+        sl, ratio, aw = scale_loss(depth, inv_K, batch, hw, classes=scale_cls,
+                                   inplane=scale_inplane)
         loss = loss + scale_w * sl
         logs["scale"] = sl.item()
         logs["loss"] = loss.item()
@@ -909,7 +962,8 @@ def run_epoch(loader, depth_model, pose_enc, pose_dec, ssim, backproj, project, 
                 batch, depth_model, pose_enc, pose_dec, ssim, backproj, project, hw,
                 args.min_depth, args.max_depth, args.smoothness,
                 automask=not args.no_automask, anchor=anchor, khead=khead,
-                scale_w=args.scale_w, scale_cls=args.scale_classes)
+                scale_w=args.scale_w, scale_cls=args.scale_classes,
+                scale_inplane=args.scale_inplane)
         if train:
             if not torch.isfinite(loss):           # guard: never step on a NaN/Inf batch
                 skipped += 1
@@ -950,7 +1004,8 @@ def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim
             loss, logs = refine_depth_step(batch, depth_model, pose_enc, pose_dec, R, ssim,
                                            backproj, project, hw, args.min_depth, args.max_depth,
                                            w, anchor=anchor, khead=khead, scale_w=args.scale_w,
-                                           scale_cls=args.scale_classes)
+                                           scale_cls=args.scale_classes,
+                scale_inplane=args.scale_inplane)
             if not torch.isfinite(loss):
                 skipped += 1; continue
             opt.zero_grad(); loss.backward(); _clip(opt, args.grad_clip); opt.step()
@@ -963,7 +1018,8 @@ def run_epoch_refine(loader, depth_model, pose_enc, pose_dec, R, opt, opt0, ssim
                                                backproj, project, hw, args.min_depth, args.max_depth,
                                                w, anchor=anchor, khead=khead,
                                                scale_w=args.scale_w,
-                                               scale_cls=args.scale_classes)
+                                               scale_cls=args.scale_classes,
+                scale_inplane=args.scale_inplane)
         for k, v in logs.items():
             agg[k] = agg.get(k, 0.0) + v
         nb += 1
@@ -1070,6 +1126,12 @@ def main():
                          "annotated known-size object (scale_objects.json) vs its true mm, in "
                          "log space. This is what makes the depth map metric; 0 disables. "
                          "Try 0.1.")
+    ap.add_argument("--scale-inplane", action="store_true",
+                    help="measure the anchor IN-PLANE (one depth per segment) instead of as a 3D "
+                         "polyline. The polyline form is gameable -- tilting a segment lengthens "
+                         "it without moving it, which is what the first metric runs learned. Use "
+                         "this for any run that is supposed to make the depth track DISTANCE, "
+                         "and pair it with --anchor-w 0 (that term pins depth to the warm-start).")
     ap.add_argument("--video-split", type=int, nargs=2, default=None, metavar=("N_VAL", "N_TEST"),
                     help="ignore Train/Validation/Test dirs and split the clips under --data-root "
                          "by VIDEO (surgery), holding out N_VAL / N_TEST videos. Use for the ruler "
@@ -1257,6 +1319,7 @@ def main():
                            overlay_std_thresh=args.overlay_std_thresh, refine=args.refine,
                            motion_top_frac=args.motion_top_frac, anchor_w=args.anchor_w,
                            scale_w=args.scale_w, scale_classes=args.scale_classes,
+                           scale_inplane=args.scale_inplane,
                            video_split=args.video_split,
                            max_anchors=ds_kw["anchors_max"],
                            anchor_sources=args.anchor_sources or "all",
@@ -1302,6 +1365,12 @@ def main():
         caption="epoch 0 (warm-start, before UMC fine-tune)"), "epoch": 0}
     best = float("inf")
     sel_name = "val_photo"          # -> scared_abs_rel, then metric_val_abs_rel, if available
+
+    def metric_sel(mres):
+        """Select on the term being trained: the polyline error would pick the best TILT."""
+        k = "inplane_abs_rel" if (args.scale_inplane and "inplane_abs_rel" in mres) else "abs_rel"
+        return mres[k], f"metric_val_{k}"
+
     sres0 = eval_scared_now()
     if sres0 is not None:
         sm0, _, _ = sres0
@@ -1314,7 +1383,7 @@ def main():
     mres0 = eval_metric_now(va)
     if mres0:
         log0.update({f"metric_val/{k}": v for k, v in mres0.items()})
-        best, sel_name = mres0["abs_rel"], "metric_val_abs_rel"
+        best, sel_name = metric_sel(mres0)
         print(f"[epoch 0] warm-start metric scale={mres0['scale']:.3f} "
               f"abs_rel={mres0['abs_rel']:.3f} debiased={mres0['abs_rel_deb']:.3f} "
               f"(n={int(mres0['n'])})", flush=True)
@@ -1345,7 +1414,7 @@ def main():
         mres = eval_metric_now(va)
         if mres:
             logd.update({f"metric_val/{k}": v for k, v in mres.items()})
-            score, sel_name = mres["abs_rel"], "metric_val_abs_rel"
+            score, sel_name = metric_sel(mres)
         cres = eval_catheter_now()
         if cres:
             logd.update({f"catheter/{k}": v for k, v in cres.items()})

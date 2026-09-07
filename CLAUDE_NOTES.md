@@ -3,6 +3,49 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-07 — DEPTH: the scale loss was GAMED — training changed segment TILT, not distance
+- Same 671 test objects through warm-start and sw05 dumps (`rays` byte-identical, so annotations
+  and K match): per-object mean depth ratio sw05/warm **1.005** (IQR .997-1.013, corr .992,
+  median z 42.5 -> 42.5 mm). Twelve epochs did not move the predicted DISTANCE at all.
+- The reported metric scale .801 -> .974 came from somewhere else entirely: in-plane length with
+  z held flat is UNCHANGED (5.76 -> 5.77 mm), while depth variation ALONG the annotated segment
+  |dz| went **2.55 -> 4.39 mm (+72%)**. Tilting a segment out of the image plane lengthens it in
+  3D without moving it. That is the whole "metric scale" gain.
+- TWO CODE CAUSES, both real: (1) `scale_loss` compares the 3D POLYLINE length to mm, so segment
+  tilt is a free way to satisfy it — and `eval_metric_scale` calls the SAME function, so the
+  metric rewards the shortcut it should catch. (2) `anchor_loss` (--anchor-w 0.3) is an L1 pull
+  of log-disp toward a FROZEN warm-start copy over the WHOLE image = "do not change the depth";
+  the only degree of freedom left for the scale term was local shape. Training itself was real
+  (29.58M trainable, train_photo .141 -> .025) — it just went into appearance, not distance.
+- FIX DIRECTION: make length in `scale_loss` IN-PLANE (z flat at the segment median) so the only
+  way to satisfy it is the distance, and run with --anchor-w 0. Caveat: in-plane length is
+  mm*cos(theta), so oblique objects push z too FAR — a ONE-SIDED loss (penalise only predicted >
+  mm) turns each anchor into an upper bound on z and lets the most fronto-parallel ones set it.
+  Judge by the z_pred-vs-z_true slope, never by metric_scale.
+
+## 2026-09-07 — DEPTH: the model does NOT track distance — it predicts a CONSTANT ~43 mm
+- Test: for every annotated object, z_true = z_pred * mm / L_pred (known size vs predicted length),
+  then regress z_pred on z_true. Run on `outputs/affine_{sw05,warmstart}_test.npz` (671 objects,
+  5 held-out videos) and on the 69 hand-annotated UMC catheter widths in `sul_reference`.
+- RULER TEST SET, sw05: z_pred pct5/50/95 = 35 / 42.6 / 47.6 (std 3.9) while z_true = 28 / 43 / 87
+  (std 17.3). slope **0.094**, corr +0.42, std-ratio 0.23. Per class corr .22/.57/.79.
+  WARM-START IS IDENTICAL (slope 0.094, std-ratio 0.16) => scale training MOVED THE CONSTANT, it
+  did not create distance sensitivity. Not a range-mapping artefact this time: 28-87 mm needs
+  sigmoid 0.14-0.68 at --min/max-depth 20/200, nowhere near saturation.
+- UMC SUL SNAPSHOTS (69 manual catheter widths, external check): same picture. near half z_true
+  33 -> z_pred 43.1 | far half z_true 45 -> z_pred 44.9. corr(ratio, width_px) = **+0.84**, i.e.
+  the over-read is entirely "object is closer than the model thinks". Slope is INVARIANT to fx,
+  so a wrong focal cannot explain it (and fit_fx_catheter's 1.36x cannot fix it either).
+- => `metric/test scale = 1.000` is a MEDIAN. It says the constant is well centred, nothing more.
+  The ~20% per-object floor in the 2026-09-02 conclusion IS this compression, and it explains why
+  per-clip calibration halves the error (it re-fits the constant per clip) while more scale
+  supervision never does. Anchor depth spread is NOT the cause: training anchors span
+  z 31-104 mm (n=2317, std 22.8).
+- SO WHAT: a DPT/DepthAnything head is affine-invariant per image by construction; the absolute
+  level has nowhere to live. Next lever is a per-frame scale (ZoeDepth-style: CLS token -> one
+  positive scalar multiplying depth, trained by the existing scale loss), not more --scale-w.
+  Metric to judge it: slope / std-ratio of z_pred vs z_true, NOT metric_scale.
+
 ## 2026-09-02 — DEPTH: CONCLUSION — training fixes SCALE; the ~20% per-object error is a floor
 - CHECKPOINT A/B on the 5 held-out videos. Each run differs from the `range` pivot (scale-w 0.1,
   anchor-w 0.3, 12 ep, K frozen) by ONE flag. wandb metric_test/abs_rel, n=665:
