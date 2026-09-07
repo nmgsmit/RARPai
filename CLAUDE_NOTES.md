@@ -3,6 +3,37 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-07 — DEPTH: WHICH ANCHOR at EQUAL volume — the ROBOT ARM IS THE WORST SUPERVISOR
+- Redo of the 2026-09-02 --scale-classes A/B with the volume confound REMOVED. New flag
+  `--anchor-balance 1 2 3` keeps only TRAIN videos carrying all three classes, then subsamples
+  each to the same count: **135 objects x 3 classes over the SAME 5 videos**. `--seed 66` is the
+  split (searched over 200) where all three are also well represented on the 5 held-out videos
+  (test n 383/143/133). 3 epochs, `jobs/ablate_anchor_class.sh`, jobs 26447579/80/81, base config
+  = the operating point (scale-w 0.5, --scale-inplane, --anchor-w 0.1, K frozen).
+- READ IN-PLANE, per class (`c*_inplane_*`, added to eval_metric_scale). A class the run did NOT
+  supervise is the held-out cross-object check. scale / abs_rel, own class in bold:
+  supervised     c1 Ruler        c2 Catheter     c3 Arm         held-out abs_rel  slope  SCARED
+  Ruler       **.868/.169**     .721/.279      .737/.263            **.271**      .193   .0663
+  Catheter      .672/.331     **.813/.187**    .730/.270              .301        .212   .0626
+  Arm           .667/.336       .626/.374    **.842/.159**            .355        .058   .0575
+- **ARM-ONLY IS NOT ENOUGH.** It is the worst supervisor of the other objects (held-out abs_rel
+  .355 vs the ruler's .271) AND the only arm whose depth stops tracking distance at all
+  (track_slope .058, i.e. back to the constant-distance regime; ruler/catheter ~.20). It also has
+  the LOWEST training scale loss (.0014 vs .0042) and the BEST SCARED (.0575) — it satisfies its
+  own anchors while barely moving the depth map, which is exactly the failure signature.
+- WHY, and it is not annotation quality: z_true = fx*mm/px over the balanced train anchors spans
+  p5-p95 **38.6-73.7 mm for the arm (std 12.4, log-std .216)** against 37.9-124.7 for the ruler
+  (std 25.6) and 45.4-121.9 for the catheter. The arm is seen at ONE working distance. A narrow
+  z range cannot separate "right scale" from "one constant", so it teaches the constant.
+- CONSOLING: every held-out scale now lands in .63-.74 instead of the 2026-09-02 collapse
+  (held-out ruler scale .027). Volume WAS the story there; at equal volume the anchors do
+  partially transfer. Also the arm is the EASIEST object to be scored on (lowest debiased error
+  in every column, .094-.111) — a good measurement target, a bad teacher.
+- SO WHAT for deployment (arm is the only in-frame anchor at inference): do not train on the arm
+  alone. Train on the ruler (or ruler+catheter) and CALIBRATE on the arm — the 2026-09-02
+  arm-only calibration entry already covers that path. If arm-only supervision is unavoidable,
+  the fix is depth-range diversity in the annotations, not more of them.
+
 ## 2026-09-07 — DEPTH: --anchor-w A/B on top of --scale-inplane — 0.1 is the operating point
 - 4-epoch arms, jobs 26440931/26440932, `outputs/depth_inplane_a0{1,3}/best.pth`. TEST (n=665):
   anchor-w   track_slope   scared abs_rel / a1   inplane_scale   inplane_abs_rel
