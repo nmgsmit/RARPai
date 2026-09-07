@@ -45,6 +45,22 @@ IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 # raw mask label ids. We keep only catheter+prostate; everything else -> background.
 RAW_NAMES = {0: "background", 1: "catheter", 2: "prostate", 3: "urethra", 4: "apicalvesicle"}
 
+# The clip-layout data (data/processed/Segmentation/Nick) was annotated with a DIFFERENT
+# and NEWER scheme -- ids taken verbatim from the labelling tool's own legend,
+# transfer_atlas_mod/gui/cutie/utils/palette.py `custom_names`. Do not reorder.
+NICK_NAMES = {0: "background", 1: "urethra", 2: "prostate",
+              3: "dorsalvenousplexus", 4: "catheter", 5: "nonanatomical"}
+SCHEMES = {"rarpsurgenet": RAW_NAMES, "nick": NICK_NAMES}
+
+# Old-scheme raw id -> new-scheme raw id, by NAME. Only the three classes present in
+# both survive; apicalvesicle has no counterpart in the new scheme and maps to
+# background, so the old test set cannot score it and neither can we.
+OLD2NEW = np.zeros(256, dtype=np.uint8)
+for _o, _n in RAW_NAMES.items():
+    for _k, _v in NICK_NAMES.items():
+        if _o and _v == _n:
+            OLD2NEW[_o] = _k
+
 
 def round32(x):
     """CAFormer downsamples by 32, so H and W must be multiples of 32."""
@@ -83,12 +99,51 @@ def photometric(img):
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
+def split_pairs(split_dir: Path):
+    """Old RARPSurgenet layout: <split>/frames/*.png alongside <split>/masks/*.png,
+    paired by sort order."""
+    frames = sorted((split_dir / "frames").glob("*.png"))
+    masks  = sorted((split_dir / "masks").glob("*.png"))
+    assert len(frames) == len(masks) and frames, \
+        f"frame/mask count mismatch or empty in {split_dir}"
+    return list(zip(frames, masks))
+
+
+def clip_pairs(clip_root: Path, seed: int, val_frac=0.15, test_frac=0.15):
+    """Clip layout: <root>/<clip>/images/NNNNNNN.jpg + <clip>/masks/NNNNNNN.png.
+
+    Split is by CLIP, not by frame: consecutive frames of one clip are near-duplicates,
+    so a frame-level split leaks the test set into training and inflates every metric.
+    Pairing is a stem INTERSECTION -- the export has masks with no image and vice versa
+    (6659 images / 6635 masks / 6584 paired), so zip-by-sort-order would silently
+    misalign every frame after the first gap.
+    """
+    clips = sorted(d for d in clip_root.iterdir() if (d / "images").is_dir())
+    assert clips, f"no <clip>/images dirs under {clip_root}"
+    rng = random.Random(seed)
+    order = clips[:]
+    rng.shuffle(order)
+    n_val, n_test = round(len(order) * val_frac), round(len(order) * test_frac)
+    groups = {"Test": order[:n_test],
+              "Validation": order[n_test:n_test + n_val],
+              "Train": order[n_test + n_val:]}
+    out = {}
+    for name, sel in groups.items():
+        pairs = []
+        for c in sel:
+            imgs = {f.stem: f for f in (c / "images").glob("*.jpg")}
+            msks = {f.stem: f for f in (c / "masks").glob("*.png")}
+            pairs += [(imgs[s], msks[s]) for s in sorted(imgs.keys() & msks.keys())]
+        assert pairs, f"split {name} is empty"
+        out[name] = pairs
+    return out, {k: len(v) for k, v in groups.items()}
+
+
 class SegDataset(Dataset):
-    def __init__(self, split_dir: Path, size_hw, remap, augment: bool = False):
-        self.frames = sorted((split_dir / "frames").glob("*.png"))
-        self.masks  = sorted((split_dir / "masks").glob("*.png"))
-        assert len(self.frames) == len(self.masks) and self.frames, \
-            f"frame/mask count mismatch or empty in {split_dir}"
+    def __init__(self, pairs, size_hw, remap, augment: bool = False):
+        self.frames = [p[0] for p in pairs]
+        self.masks  = [p[1] for p in pairs]
+        assert self.frames, "empty dataset"
         self.size_hw = size_hw                           # (H, W)
         self.remap   = remap
         self.augment = augment
@@ -185,7 +240,16 @@ def validate(model, loader, num_classes, device, alpha, beta, include_bg=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-root",    default="../data/RARPSurgenet/fold1")
+    ap.add_argument("--data-root",    default="../data/RARPSurgenet")
+    ap.add_argument("--clip-root",    default=None,
+                    help="clip-layout data root (<clip>/images/*.jpg + <clip>/masks/*.png). "
+                         "Overrides --data-root; splits BY CLIP using --seed.")
+    ap.add_argument("--label-scheme", default="rarpsurgenet", choices=sorted(SCHEMES),
+                    help="which raw-id -> class-name legend the masks use")
+    ap.add_argument("--compare-test", default=None,
+                    help="extra eval on an old-scheme split dir (e.g. ../data/RARPSurgenet/Test) "
+                         "with its labels mapped into the training scheme by name. Only classes "
+                         "present in BOTH schemes are scorable.")
     ap.add_argument("--encoder-ckpt", default="../backbones/RARP_checkpoint_epoch0050_teacher.pth")
     ap.add_argument("--out",          default="outputs/rarp_tversky")
     ap.add_argument("--run-name",     default="tversky-ema")
@@ -226,14 +290,47 @@ def main():
             list(m.parameters())[0].add_(1.0)
         ema.update(m)
         assert all(v.shape == m.state_dict()[k].shape for k, v in ema.shadow.items())
+
+        # old-scheme id -> new-scheme id, by name (the compare-test path depends on this)
+        assert (OLD2NEW[1], OLD2NEW[2], OLD2NEW[3]) == (4, 2, 1), OLD2NEW[:5]
+        assert OLD2NEW[4] == 0, "apicalvesicle has no counterpart -> background"
+        # composing with build_remap must land old ids on the right compact slots
+        _lut = build_remap([1, 2, 3, 4, 5])[OLD2NEW]      # keep all 5 new classes
+        assert (_lut[1], _lut[2], _lut[3], _lut[4]) == (4, 2, 1, 0)
+
+        # clip split: by clip, stems intersected, no clip in two splits
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            for ci in range(20):
+                for sub, ext in (("images", ".jpg"), ("masks", ".png")):
+                    d = Path(td) / f"clip{ci}" / sub
+                    d.mkdir(parents=True)
+                    n = 5 if sub == "images" else 7      # deliberate mask surplus
+                    for k in range(n):
+                        Image.new("RGB" if ext == ".jpg" else "L", (8, 8)).save(d / f"{k:07d}{ext}")
+            sp, ncl = clip_pairs(Path(td), seed=42)
+            assert sum(ncl.values()) == 20, ncl
+            seen = [p[0].parent.parent.name for v in sp.values() for p in v]
+            assert len(set(seen)) == 20, "a clip leaked across splits"
+            assert all(len(v) == 5 * ncl[k] for k, v in sp.items()), "stems not intersected"
+            assert all(a.stem == b.stem for v in sp.values() for a, b in v), "misaligned pair"
+            assert clip_pairs(Path(td), seed=42)[0].keys() == sp.keys()
         print(f"[smoke] ok | out={tuple(out.shape)} device={device}")
         return
 
     root  = Path(args.data_root)
+    scheme = SCHEMES[args.label_scheme]
     keep  = [int(c) for c in args.keep_classes.split(",")]
-    names = ["background"] + [RAW_NAMES.get(c, f"class{c}") for c in keep]  # compact-id -> name
+    names = ["background"] + [scheme.get(c, f"class{c}") for c in keep]  # compact-id -> name
     remap = build_remap(keep)
     nc    = len(keep) + 1
+
+    if args.clip_root:
+        splits, nclips = clip_pairs(Path(args.clip_root), args.seed)
+        print(f"[data] clips {nclips} -> frames "
+              f"{ {k: len(v) for k, v in splits.items()} }")
+    else:
+        splits = {s: split_pairs(root / s) for s in ("Train", "Validation", "Test")}
     if args.height and args.width:
         size_hw = (round32(args.height), round32(args.width))
     else:
@@ -261,10 +358,10 @@ def main():
 
     g  = torch.Generator()
     g.manual_seed(args.seed)
-    tr = DataLoader(SegDataset(root / "Train", size_hw, remap, augment=not args.no_augment),
+    tr = DataLoader(SegDataset(splits["Train"], size_hw, remap, augment=not args.no_augment),
                     args.batch_size, shuffle=True, num_workers=args.workers,
                     pin_memory=True, drop_last=True, generator=g)
-    va = DataLoader(SegDataset(root / "Validation", size_hw, remap),
+    va = DataLoader(SegDataset(splits["Validation"], size_hw, remap),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
 
     model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None).to(device)
@@ -314,7 +411,7 @@ def main():
 
         sched.step(val_loss)
         lr = opt.param_groups[0]["lr"]
-        track = [(c, names[c]) for c in range(1, nc) if names[c] in ("catheter", "urethra")]
+        track = [(c, names[c]) for c in range(1, nc)]   # every foreground class
         per_cls = "  ".join(f"{n}={per_dice[c]:.4f}" for c, n in track)
         print(f"epoch {ep+1}/{args.epochs}  train_loss={avg_loss:.4f}  val_loss={val_loss:.4f}  "
               f"val_mIoU={val_miou:.4f}  val_dice={val_dice:.4f}  {per_cls}", flush=True)
@@ -329,11 +426,11 @@ def main():
             wandb.run.summary["best_val_mIoU"] = val_miou
 
     # final test-set eval using best (EMA) checkpoint
-    te = DataLoader(SegDataset(root / "Test", size_hw, remap),
+    te = DataLoader(SegDataset(splits["Test"], size_hw, remap),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
     te_miou, te_dice, te_loss, te_per_dice = validate(model, te, nc, device, args.alpha, args.beta, args.bg_in_loss)
-    track = [(c, names[c]) for c in range(1, nc) if names[c] in ("catheter", "urethra")]
+    track = [(c, names[c]) for c in range(1, nc)]
     te_per = "  ".join(f"{n}={te_per_dice[c]:.4f}" for c, n in track)
     print(f"[test]  mIoU={te_miou:.4f}  dice={te_dice:.4f}  {te_per}", flush=True)
     wandb.run.summary.update({
@@ -341,6 +438,28 @@ def main():
         "test/dice":  te_dice,
         **{f"test/dice_{n}": te_per_dice[c].item() for c, n in track},
     })
+
+    # Second eval on the OLD test set, for comparison against the pre-existing runs.
+    # Its masks carry the old scheme, so compose old-raw -> new-raw -> compact. Classes
+    # the old set has no label for (and old apicalvesicle) become background there, so
+    # only report the shared ones -- a class absent from the GT scores a meaningless 0.
+    if args.compare_test:
+        shared = [(c, names[c]) for c in range(1, nc)
+                  if names[c] in set(RAW_NAMES.values()) & set(NICK_NAMES.values())]
+        cmp_lut = remap[OLD2NEW] if args.label_scheme == "nick" else remap
+        cmp_ld = DataLoader(SegDataset(split_pairs(Path(args.compare_test)), size_hw, cmp_lut),
+                            args.batch_size, shuffle=False,
+                            num_workers=args.workers, pin_memory=True)
+        c_miou, c_dice, _, c_per = validate(model, cmp_ld, nc, device,
+                                            args.alpha, args.beta, args.bg_in_loss)
+        c_shared = sum(c_per[c] for c, _ in shared) / len(shared)
+        print(f"[compare] {args.compare_test}  shared_dice={c_shared:.4f}  "
+              + "  ".join(f"{n}={c_per[c]:.4f}" for c, n in shared)
+              + f"  (all-class mIoU={c_miou:.4f} dice={c_dice:.4f}, not comparable)", flush=True)
+        wandb.run.summary.update({
+            "compare/shared_dice": float(c_shared),
+            **{f"compare/dice_{n}": c_per[c].item() for c, n in shared},
+        })
 
     wandb.finish()
     print(f"[done] best val_dice={best:.4f} -> {outdir/'best.pth'}")
