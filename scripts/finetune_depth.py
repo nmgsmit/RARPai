@@ -1194,6 +1194,11 @@ def main():
                          "(1=Ruler, 2=Catheter tip, 3=Robot arm). The metric eval still scores "
                          "EVERY class, so an excluded one is a held-out cross-object check. "
                          "Default: supervise on all.")
+    ap.add_argument("--only-videos", nargs="+", default=None, metavar="PREFIX",
+                    help="restrict train, val AND test to these videos (name prefixes) -- "
+                         "per-video ADAPTATION: fit the model to one surgery on the anchor that "
+                         "is actually visible there (--scale-classes 3, the robot arm) and score "
+                         "it on the classes it was never shown. Overrides --video-split's dirs.")
     ap.add_argument("--anchor-balance", type=int, nargs="+", default=None, metavar="ID",
                     help="equalise TRAIN scale supervision across these class_ids before "
                          "--scale-classes picks one: keep only videos carrying all of them, then "
@@ -1298,6 +1303,16 @@ def main():
     ds_kw["anchors_max"] = args.max_anchors if (args.scale_w > 0 or args.video_split) else 0
     tr_dirs, va_dirs, te_dirs = split_by_video(root, *args.video_split, args.seed) \
         if args.video_split else (None, None, None)
+    if args.only_videos:
+        # Train == val == test == one surgery. NOT a leak: supervision is restricted to
+        # --scale-classes (the arm, the only anchor a deployed system can see) while the reported
+        # number is the OTHER classes' length error, which nothing in the run ever touched.
+        # Pair with --epochs 0 to get the un-adapted baseline on exactly the same objects.
+        tr_dirs = [d for d in sorted(Path(root).rglob("images")) if d.is_dir()
+                   and any(d.parent.parent.name.startswith(v) for v in args.only_videos)]
+        assert tr_dirs, f"no clips under {root} for videos {args.only_videos}"
+        va_dirs = te_dirs = tr_dirs
+        print(f"[only-videos] {len(tr_dirs)} clips from {args.only_videos}", flush=True)
     tr_ds = RARPTriplets(root / "Train", hw, k_norm, args.frame_stride, args.bottom_crop_frac,
                          augment=not args.no_augment, sample_frac=args.sample_frac,
                          motion_top_frac=args.motion_top_frac, clip_dirs=tr_dirs,

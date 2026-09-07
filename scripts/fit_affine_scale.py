@@ -46,7 +46,7 @@ def dump_objects(args, out_path):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model_shape = (round14(args.image_shape[0]), round14(args.image_shape[1]))
     hw = (round32(args.image_shape[0]), round32(args.image_shape[1]))
-    tr, va, te = split_by_video(args.data_root, *args.video_split)
+    tr, va, te = split_by_video(args.data_root, *args.video_split, args.seed)
     dirs = {"train": tr, "val": va, "test": te, "all": tr + va + te}[args.split]
 
     ds = RARPTriplets(None, hw, tuple(args.intrinsics), args.frame_stride, clip_dirs=dirs,
@@ -291,6 +291,9 @@ def main():
     ap.add_argument("--ckpt", default="../backbones/EndoDAC/depth_model.pth")
     ap.add_argument("--data-root", default="../data/processed/depthclips_ruler_NoGUI")
     ap.add_argument("--video-split", type=int, nargs=2, default=[4, 5])
+    ap.add_argument("--seed", type=int, default=42,
+                    help="MUST match the seed --ckpt was trained with, or the videos scored here "
+                         "are not the ones it held out")
     ap.add_argument("--split", default="test", choices=["train", "val", "test", "all"])
     ap.add_argument("--image-shape", type=int, nargs=2, default=[392, 490])
     ap.add_argument("--intrinsics", type=float, nargs=4, default=[0.82, 1.02, 0.5, 0.5])
