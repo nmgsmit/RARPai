@@ -3,6 +3,31 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-07 — DEPTH: PER-VIDEO ARM FINETUNING DOES NOT WORK — calibrate instead
+- Base `outputs/adapt_base` (all classes, full volume, --scale-inplane --anchor-w 0.1, 4 ep,
+  seed 66, best ep1): held-out in-plane scale .894 ruler / .894 cath / .830 arm, slope .349.
+  Then per held-out video, --only-videos + --scale-classes 3, 3 epochs, arm anchors only
+  (`jobs/adapt_per_video_arm.sh`, job 26448739; --epochs 0 pass = the un-adapted baseline).
+- IN-PLANE abs_rel, base -> adapted:  ARM (supervised)  .180 -> **.043**  (n=113)
+                                      RULER+CATH (held out) .163 -> **.174** (n=390, WORSE)
+  Per video the held-out number goes .158->.181 (7ee04683), .177->.170 (ee3be53d),
+  .161->.164 (31e2c520). track_slope falls in 2 of 3 (.32->.24, .40->.26).
+- SO: adaptation fits the arm 4x better and the depth map not at all. train_scale collapses to
+  .002 while c1/c2 stand still — the same "satisfy the anchor without moving the depth" failure
+  as the equal-volume ablation, now inside a single video.
+- NO-TRAINING CONTROL (`jobs/adapt_calib_control.sh`, fit_affine_scale --calib-classes 3, job
+  26448740, 607 objects): per-video arm-only **scale** = 90.5% median error (!), per-video
+  arm-only **affine** (a*Z+b) = **16.8% / 1.87mm**, global arm-only affine 15.4% / 1.47mm.
+  All-class per-clip affine is 7.3% / 0.78mm — the ceiling if you ever have richer anchors.
+- WHY, measured on the base model's own depths: the arm's depth spread is 6.0mm within a clip and
+  17.2mm within a video (16% of its range) vs the ruler's 24.8 / 45.5mm (48%). One multiplier
+  fitted on the arm is unidentifiable and explodes on extrapolation; adding the OFFSET rescues
+  it. The arm pins the offset, not the scale.
+- DECISION: do NOT ship per-video arm finetuning. Ship base weights + a per-video (or per-clip)
+  AFFINE-in-depth calibration fitted on the arm. Costs a CPU second, needs no GPU at the bedside,
+  and beats 3 GPU epochs. Open lever if 16.8% is not enough: get depth DIVERSITY into the
+  deployment anchor (annotate the arm at several working distances), not more epochs.
+
 ## 2026-09-07 — DEPTH: WHICH ANCHOR at EQUAL volume — the ROBOT ARM IS THE WORST SUPERVISOR
 - Redo of the 2026-09-02 --scale-classes A/B with the volume confound REMOVED. New flag
   `--anchor-balance 1 2 3` keeps only TRAIN videos carrying all three classes, then subsamples
