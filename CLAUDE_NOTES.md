@@ -3,6 +3,25 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-07 — DEPTH: --anchor-w A/B on top of --scale-inplane — 0.1 is the operating point
+- 4-epoch arms, jobs 26440931/26440932, `outputs/depth_inplane_a0{1,3}/best.pth`. TEST (n=665):
+  anchor-w   track_slope   scared abs_rel / a1   inplane_scale   inplane_abs_rel
+  0 (a00)    0.628         0.134 / 0.798         1.060           0.167
+  0.1 (a01)  **0.430**     **0.070** / 0.957     0.885           0.175
+  0.3 (a03)  0.311         0.067 / 0.963         0.852           0.191
+  sw05       0.094         0.054 / 0.983         ~0.74           --
+- MONOTONIC TRADE, with diminishing returns: 0.1 -> 0.3 costs a THIRD of the tracking (.43 ->
+  .31) and buys almost no geometry (.070 -> .067). Take 0.1. Note the val slope (0.27-0.32)
+  UNDERSTATES the test slope (0.43) -- judge on test.
+- WHY THE CAP: anchor_loss pulls log-disp toward a frozen warm-start copy whose LEVEL is the
+  wrong one, so it holds geometry and vetoes the level at the same time. It should only vote on
+  SHAPE. Next: subtract each image's own mean log-disp from both student and teacher before the
+  L1, so the term is level-blind. Expect slope toward .63 at scared ~.067 if that is the whole
+  story.
+- Best candidate deliverable is now a01, NOT sw05, IF the SUL measurement is taken in-plane --
+  a01 still has inplane_scale .885 (12% too near) and the polyline scale is 2.06, i.e. depth is
+  still rough along a segment. Re-run scripts/eval_catheter_ckpt.py on it before switching.
+
 ## 2026-09-07 — DEPTH: --scale-inplane WORKS (distance tracking) but costs LOCAL GEOMETRY
 - `endodac-ruler-inplane` (job 26440067, gpu_a100 -- gpu_h100 was drained): scale-w 0.5,
   --scale-inplane, --anchor-w 0, 12 ep. Best epoch 2 by inplane_abs_rel; ckpt kept as
