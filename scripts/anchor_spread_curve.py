@@ -30,6 +30,7 @@ def band_trial(d, calib_cls, width, rng, affine=True, space="depth", n_cap=None,
     band centres because WHERE the band sits is itself a nuisance the protocol cannot control.
     """
     rays, z, mm, cls, vid = d["rays"], d["z"], d["mm"], d["cls"], d["video"]
+    zo = z.mean(1) if z.ndim > 1 else z        # depth is sampled per POINT; band on the object
     errs = []
     for _ in range(reps):
         pred, true = [], []
@@ -42,12 +43,12 @@ def band_trial(d, calib_cls, width, rng, affine=True, space="depth", n_cap=None,
             if width is None:
                 src = src_all
             else:                              # a band of the requested width, centred anywhere
-                lo, hi = z[src_all].min(), z[src_all].max()
+                lo, hi = zo[src_all].min(), zo[src_all].max()
                 c = rng.uniform(lo, max(lo, hi - width)) if hi - lo > width else lo
-                src = src_all[(z[src_all] >= c) & (z[src_all] <= c + width)]
+                src = src_all[(zo[src_all] >= c) & (zo[src_all] <= c + width)]
             if n_cap is not None and len(src) > n_cap:
                 src = rng.choice(src, n_cap, replace=False)
-            if len(src) < 2 or np.ptp(z[src]) < 1e-3:
+            if len(src) < 2 or np.ptp(zo[src]) < 1e-3:
                 continue                        # degenerate: the shift is not identifiable
             a, b = fit(rays[src], z[src], mm[src], space, affine)
             p = lengths(rays[tgt], z[tgt], a, b, space)
@@ -68,7 +69,8 @@ def main():
     a = ap.parse_args()
     d = dict(np.load(a.dump, allow_pickle=True))
     rng = np.random.default_rng(a.seed)
-    z, cls = d["z"], d["cls"]
+    cls = d["cls"]
+    z = d["z"].mean(1) if d["z"].ndim > 1 else d["z"]
     print(f"[dump] {len(cls)} objects | calibrate on class {a.calib_class} "
           f"(n={int((cls == a.calib_class).sum())}, depth {z[cls == a.calib_class].min():.0f}-"
           f"{z[cls == a.calib_class].max():.0f} mm), score the others")
