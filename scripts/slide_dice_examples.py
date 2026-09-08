@@ -42,22 +42,26 @@ PRED_RGB = (1.0, 0.85, 0.0)      # prediction fill
 GT_RGB   = "#00E5FF"             # ground-truth outline
 
 
-def crop_box(gt, pred, shape, pad=1.8, min_side=340):
-    """Square crop around the union of GT and prediction, so the anatomy fills the
-    panel. Falls back to the frame centre when neither mask has any pixels."""
+def crop_box(gt, pred, shape, aspect, pad=1.9, min_h=300):
+    """Crop around the union of GT and prediction at the PANEL's aspect ratio, so the
+    anatomy fills the tile. A square crop in a wide panel wastes half the slide."""
     h, w = shape
     m = gt | pred
     if not m.any():
-        cy, cx, side = h // 2, w // 2, min(h, w)
+        cy, cx, bh, bw = h / 2, w / 2, h, w
     else:
         ys, xs = np.nonzero(m)
         cy, cx = (ys.min() + ys.max()) / 2, (xs.min() + xs.max()) / 2
-        side = max(ys.max() - ys.min(), xs.max() - xs.min()) * pad
-    side = int(max(side, min_side))
-    side = min(side, min(h, w))
-    y0 = int(np.clip(cy - side / 2, 0, h - side))
-    x0 = int(np.clip(cx - side / 2, 0, w - side))
-    return y0, x0, side
+        bh, bw = (ys.max() - ys.min()) * pad, (xs.max() - xs.min()) * pad
+    ch = max(bh, bw / aspect, min_h)
+    cw = ch * aspect
+    if cw > w:                                   # frame is not wide enough: clamp both
+        cw, ch = w, w / aspect
+    if ch > h:
+        ch, cw = h, h * aspect
+    y0 = int(np.clip(cy - ch / 2, 0, h - ch))
+    x0 = int(np.clip(cx - cw / 2, 0, w - cw))
+    return y0, x0, int(round(ch)), int(round(cw))
 
 
 def main():
@@ -144,7 +148,12 @@ def main():
     chosen["Typical"] = take(centre, n)
 
     cols = ["Best", "Typical", "Worst"]
-    fig, axes = plt.subplots(n, 3, figsize=(13.333, 7.5), dpi=args.dpi)
+    # panel aspect drives the crop; keep the two in step or the tiles letterbox
+    FIG_W, FIG_H = 13.333, 7.5
+    L, R, TOP, BOT, WS, HS = 0.015, 0.985, 0.845, 0.105, 0.02, 0.045
+    panel_aspect = ((FIG_W * (R - L) / (3 + 2 * WS)) /
+                    (FIG_H * (TOP - BOT) / (n + (n - 1) * HS)))
+    fig, axes = plt.subplots(n, 3, figsize=(FIG_W, FIG_H), dpi=args.dpi)
     fig.patch.set_facecolor("white")
     axes = np.atleast_2d(axes)
 
@@ -162,8 +171,8 @@ def main():
             H, W = im.shape[:2]
             gt = np.array(Image.fromarray(rec["gt"].astype(np.uint8)).resize((W, H), Image.NEAREST)) > 0
             pr = np.array(Image.fromarray(rec["pr"].astype(np.uint8)).resize((W, H), Image.NEAREST)) > 0
-            y0, x0, side = crop_box(gt, pr, (H, W))
-            sl = (slice(y0, y0 + side), slice(x0, x0 + side))
+            y0, x0, ch, cw = crop_box(gt, pr, (H, W), panel_aspect)
+            sl = (slice(y0, y0 + ch), slice(x0, x0 + cw))
             im, gt, pr = im[sl], gt[sl], pr[sl]
 
             shown = im.astype(float) / 255.0
@@ -175,18 +184,20 @@ def main():
                     fontsize=13, fontweight="bold", color="white", va="top",
                     bbox=dict(boxstyle="round,pad=0.28", fc="#00000099", ec="none"))
             if r == 0:
-                ax.set_title(name, fontsize=19, fontweight="bold", pad=10,
+                ax.set_title(name, fontsize=21, fontweight="bold", pad=8,
                              color={"Best": "#1a7f37", "Typical": "#8a6d00",
                                     "Worst": "#b42318"}[name])
 
-    fig.suptitle(args.title, fontsize=23, fontweight="bold", y=0.985)
+    med = rows[len(rows) // 2]["dice"]
+    fig.suptitle(args.title, fontsize=26, fontweight="bold", y=0.975)
+    fig.text(0.5, 0.895, f"median Dice {med:.2f} across {len(rows)} frames  |  "
+                         f"{len(used_clips)} different surgeries, one frame each",
+             ha="center", fontsize=13, color="#444444")
     fig.legend(handles=[Patch(fc=PRED_RGB, ec="none", label="Model prediction"),
-                        Patch(fc="none", ec=GT_RGB, lw=2, label="Ground truth (outline)")],
-               loc="lower center", ncol=2, frameon=False, fontsize=13,
-               bbox_to_anchor=(0.5, 0.005))
-    fig.text(0.5, 0.055, f"{len(used_clips)} different surgeries, one frame each",
-             ha="center", fontsize=11, color="#555555")
-    fig.tight_layout(rect=[0, 0.085, 1, 0.955])
+                        Patch(fc="none", ec=GT_RGB, lw=2.5, label="Ground truth (outline)")],
+               loc="lower center", ncol=2, frameon=False, fontsize=15,
+               bbox_to_anchor=(0.5, 0.012))
+    fig.subplots_adjust(left=L, right=R, top=TOP, bottom=BOT, wspace=WS, hspace=HS)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=args.dpi, facecolor="white")
     print(f"[done] {args.out}")
