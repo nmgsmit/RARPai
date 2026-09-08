@@ -3,6 +3,41 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-08 — SEG: retrain on the new clip-layout annotations (a NEW label scheme)
+
+- DATA: `../data/processed/Segmentation/Nick` — 56 clips, `<clip>/images/*.jpg` +
+  `<clip>/masks/*.png`, 6659 images / 6635 masks / **6584 paired**. Replaces the old
+  `RARPSurgenet` 378/97/60. NOTE `../data/RARPSurgenet/fold1` NO LONGER EXISTS (splits sit
+  directly under `RARPSurgenet/`) — every older `jobs/finetune_*.sh` still points at fold1 and
+  would fail on resubmit.
+- **DIFFERENT LABEL SCHEME.** Legend is the labelling tool's own, `transfer_atlas_mod/gui/cutie/
+  utils/palette.py::custom_names`: 1 urethra, 2 prostate, 3 dorsal venous plexus, 4 catheter,
+  5 non-anatomical. Old scheme was 1 catheter, 2 prostate, 3 urethra, 4 apicalvesicle. Only
+  urethra/prostate/catheter exist in both; DVP + non-anatomical are new, apicalvesicle is gone.
+  `OLD2NEW` in `finetune_seg_tversky.py` maps them BY NAME — never by id.
+- **The masks are mode "P".** The label id is the palette INDEX, so `.convert("L")` maps id 1 to
+  226 (yellow's luminance) and the remap then drops every foreground pixel to background. That
+  cost a run (26466088): loss 0.0000, `val_dice=1.0000`, every per-class dice 0.0000 — because
+  `validate()` averages over PRESENT classes and only background was present. **An all-background
+  dataset reports a PERFECT score, not a zero.** Old masks were mode "L" so the convert was a
+  no-op, which is why this never bit before. There is now a startup `[labels]` histogram + assert
+  that every kept class actually appears; it dies in 2 s instead of looking great for 12 h.
+- SPLIT IS BY CLIP, not by frame (`clip_pairs`, seeded): consecutive frames of a clip are
+  near-duplicates, so a frame split leaks test into train. Pairing is a stem INTERSECTION — the
+  export has 24 more images than masks, so zip-by-sort-order misaligns after the first gap.
+- TWO test numbers: `[test]` = held-out clips (the honest one); `[compare]` = the old 60-frame
+  RARPSurgenet test set with its labels mapped into the new scheme, shared classes only, so it is
+  comparable to `rarp_tversky_dice` (catheter=0.8567 urethra=0.8167). Verified NO leakage between
+  them: old test videos are RARP_001/017/033/053, new clips are RARP_064..092 + 23 uuid-named,
+  intersection empty, and max frame-correlation 0.76 (nothing >0.8).
+- Run = `jobs/finetune_tversky_nick.sh` -> `outputs/rarp_nick_dice`. Every hyperparameter copied
+  from `finetune_tversky_dice.sh` (512px, batch 8, lr 1e-4, 50 ep, a=b=0.5, --bg-in-loss) so the
+  comparison isolates the DATA change. 12 h walltime, not 8: ~17x the steps per epoch.
+- Baselines for the write-up, from the old 60-frame test set: `rarp_tversky_dice` (5-class, 512)
+  dice=0.8135 cath=0.8567 ureth=0.8167 — the best all-class model, copied to
+  `outputs/bestseg/best.pth`. Best of ANY old run was `rarp_tversky_dice_1024_2class`
+  (cath+ureth only) dice=0.8392, which was never promoted to `bestseg/`.
+
 ## 2026-09-07 — DEPTH: PER-VIDEO ARM FINETUNING DOES NOT WORK — calibrate instead
 - Base `outputs/adapt_base` (all classes, full volume, --scale-inplane --anchor-w 0.1, 4 ep,
   seed 66, best ep1): held-out in-plane scale .894 ruler / .894 cath / .830 arm, slope .349.
