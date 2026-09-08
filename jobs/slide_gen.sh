@@ -15,20 +15,23 @@ source venv/bin/activate
 
 # Candidate presentation slides: a generic prostate/urethra view -- no catheter
 # labelled, instruments not dominating, urethra reasonably elongated.
+#
 # Every frame carries instruments (14-34% of the frame, p10-p90), so
-# --max-instrument is a percentile choice, not "none". Three tiers, loosest wins:
-# the strict setting can leave fewer than 6 distinct clips, and the script exits 2
-# rather than silently repeating a surgery.
+# --max-instrument is a percentile choice, not "none".
+#
+# ONE ROW OF THREE, not six panels: that view exists in only 1 clip at the strict
+# setting and 5 at the loosest, so six panels from six distinct surgeries is simply
+# not available -- and three reads faster on a slide anyway.
 run() {
     python scripts/slide_dice_examples.py \
         --checkpoint outputs/ureth_fn/best.pth \
-        --keep-largest --pick-seeds 0,1,2,3 \
-        --out outputs/slide_gen.png "$@"
+        --keep-largest --per-group 1 "$@"
 }
 
-echo "### strict   (instr<=0.18, elong>=1.7)"
-run --no-catheter --max-instrument 0.18 --min-elong 1.7 && exit 0
 echo "### medium   (instr<=0.22, elong>=1.5)"
-run --no-catheter --max-instrument 0.22 --min-elong 1.5 && exit 0
+run --no-catheter --max-instrument 0.22 --min-elong 1.5 \
+    --pick-seeds 0,1,2 --out outputs/slide_med.png
+
 echo "### loose    (instr<=0.30, elong>=1.3)"
-run --no-catheter --max-instrument 0.30 --min-elong 1.3
+run --no-catheter --max-instrument 0.30 --min-elong 1.3 \
+    --pick-seeds 0,1,2 --out outputs/slide_loose.png
