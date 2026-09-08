@@ -203,11 +203,16 @@ def load_encoder(model: MetaFormerFPN, ckpt_path: str):
           f"unexpected={len(msg.unexpected_keys)}")
 
 
-def tversky_ce_loss(logits, target, num_classes, alpha=0.4, beta=0.6, include_bg=False):
+def tversky_ce_loss(logits, target, num_classes, alpha=0.4, beta=0.6, include_bg=False,
+                    weights=None):
     """CE + (1 - mean Tversky). Background (class 0) is excluded from the Tversky
     term unless include_bg=True (keeps it, which can sharpen fg/bg boundaries).
-    alpha weights FP, beta weights FN; alpha=beta=0.5 -> Dice."""
-    ce    = F.cross_entropy(logits, target)
+    alpha weights FP, beta weights FN; alpha=beta=0.5 -> Dice.
+
+    `weights` (a per-class tensor) biases BOTH terms toward a class you care about
+    more than the mean does -- here urethra. The Tversky mean becomes a weighted
+    mean, so a class with weight 3 moves the loss 3x as much as one with weight 1."""
+    ce    = F.cross_entropy(logits, target, weight=weights)
     probs = logits.softmax(1)
     oh    = F.one_hot(target, num_classes).permute(0, 3, 1, 2).float()
     dims  = (0, 2, 3)
@@ -216,7 +221,10 @@ def tversky_ce_loss(logits, target, num_classes, alpha=0.4, beta=0.6, include_bg
     fn = ((1 - probs) * oh).sum(dims)
     tversky = (tp + 1.0) / (tp + alpha * fp + beta * fn + 1.0)
     region = tversky if include_bg else tversky[1:]   # optionally keep background
-    return ce + (1.0 - region.mean())
+    if weights is None:
+        return ce + (1.0 - region.mean())
+    w = weights if include_bg else weights[1:]
+    return ce + (1.0 - (region * w).sum() / w.sum())
 
 
 @torch.no_grad()
@@ -275,6 +283,14 @@ def main():
     ap.add_argument("--ema-decay",    type=float, default=0.999)
     ap.add_argument("--accum-steps",  type=int,   default=1,
                     help="gradient accumulation steps; effective batch = batch_size * accum_steps")
+    ap.add_argument("--select-on",    default="dice",
+                    help="checkpoint selection metric: 'dice' (mean over present classes) "
+                         "or a class name e.g. 'urethra'. Weighting a class in the LOSS but "
+                         "still selecting on the mean saves the wrong epoch.")
+    ap.add_argument("--class-weights", default=None,
+                    help="per-class loss weights, COMPACT order incl. background "
+                         "(e.g. 1,3,1,1,1 to trebles urethra). Applied to the CE weight "
+                         "and to the Tversky mean.")
     ap.add_argument("--bg-in-loss",   action="store_true",
                     help="include background in the Tversky region term (default excluded)")
     ap.add_argument("--no-augment",   action="store_true")
@@ -348,6 +364,13 @@ def main():
     remap = build_remap(keep)
     nc    = len(keep) + 1
 
+    cls_w = None
+    if args.class_weights:
+        vals = [float(v) for v in args.class_weights.split(",")]
+        assert len(vals) == nc, f"--class-weights needs {nc} values (bg first), got {len(vals)}"
+        cls_w = torch.tensor(vals, dtype=torch.float32, device=device)
+        print(f"[loss] class weights {dict(zip(names, vals))}")
+
     if args.clip_root:
         splits, nclips = clip_pairs(Path(args.clip_root), args.seed)
         print(f"[data] clips {nclips} -> frames "
@@ -406,8 +429,10 @@ def main():
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=3)
     ema   = EMA(model, decay=args.ema_decay)
+    assert args.select_on == "dice" or args.select_on in names,         f"--select-on {args.select_on!r} is not 'dice' nor one of {names}"
     print(f"[optim] AdamW lr={args.lr} ReduceLROnPlateau(patience=3) "
-          f"tversky(a={args.alpha},b={args.beta}) ema={args.ema_decay}")
+          f"tversky(a={args.alpha},b={args.beta}) ema={args.ema_decay} "
+          f"select_on={args.select_on}")
     scaler = torch.amp.GradScaler(device)
 
     outdir = Path(args.out)
@@ -424,7 +449,7 @@ def main():
         for i, (x, y) in enumerate(tr):
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with torch.amp.autocast(device):
-                loss = tversky_ce_loss(model(x), y, nc, args.alpha, args.beta, args.bg_in_loss)
+                loss = tversky_ce_loss(model(x), y, nc, args.alpha, args.beta, args.bg_in_loss, cls_w)
             scaler.scale(loss / accum).backward()   # average grads over accum micro-batches
             run += loss.item()
             pending = True
@@ -457,11 +482,14 @@ def main():
                    "val/mIoU": val_miou, "val/dice": val_dice,
                    **{f"val/dice_{n}": per_dice[c].item() for c, n in track},
                    "lr": lr, "epoch": ep + 1})
-        if val_dice > best:
-            best = val_dice
+        sel = val_dice if args.select_on == "dice" else per_dice[names.index(args.select_on)].item()
+        if sel > best:
+            best = sel
             torch.save(ema.shadow, outdir / "best.pth")   # save the EMA weights
-            wandb.run.summary["best_val_dice"] = best
+            wandb.run.summary["best_val_dice"] = val_dice
+            wandb.run.summary[f"best_val_{args.select_on}"] = best
             wandb.run.summary["best_val_mIoU"] = val_miou
+            wandb.run.summary["best_epoch"] = ep + 1
 
     # final test-set eval using best (EMA) checkpoint
     te = DataLoader(SegDataset(splits["Test"], size_hw, remap),
@@ -505,7 +533,7 @@ def main():
     if args.eval_only:
         print(f"[done] eval-only on {args.eval_only}")
     else:
-        print(f"[done] best val_dice={best:.4f} -> {outdir/'best.pth'}")
+        print(f"[done] best val_{args.select_on}={best:.4f} -> {outdir/'best.pth'}")
 
 
 if __name__ == "__main__":
