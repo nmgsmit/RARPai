@@ -281,6 +281,11 @@ def main():
     ap.add_argument("--workers",      type=int,   default=8)
     ap.add_argument("--seed",         type=int,   default=42)
     ap.add_argument("--smoke",        action="store_true")
+    ap.add_argument("--eval-only",    default=None,
+                    help="path to a checkpoint: skip training and just run the [test] and "
+                         "[compare] evals. Recovers the numbers a run that was stopped early "
+                         "never got to print. Splits are seed-derived, so pass the SAME "
+                         "--seed/--clip-root/--keep-classes the run used or the test set differs.")
     args = ap.parse_args()
     seed_everything(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -409,7 +414,9 @@ def main():
     outdir.mkdir(parents=True, exist_ok=True)
     best = -1.0
     accum = max(1, args.accum_steps)
-    for ep in range(args.epochs):
+    # --eval-only skips the loop entirely; everything below (splits, model, metrics)
+    # is already built exactly as a real run builds it.
+    for ep in range(0 if args.eval_only else args.epochs):
         model.train()
         run = 0.0
         opt.zero_grad()
@@ -459,7 +466,9 @@ def main():
     # final test-set eval using best (EMA) checkpoint
     te = DataLoader(SegDataset(splits["Test"], size_hw, remap),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
-    model.load_state_dict(torch.load(outdir / "best.pth", map_location=device))
+    ckpt = Path(args.eval_only) if args.eval_only else outdir / "best.pth"
+    print(f"[eval] checkpoint {ckpt}", flush=True)
+    model.load_state_dict(torch.load(ckpt, map_location=device))
     te_miou, te_dice, te_loss, te_per_dice = validate(model, te, nc, device, args.alpha, args.beta, args.bg_in_loss)
     track = [(c, names[c]) for c in range(1, nc)]
     te_per = "  ".join(f"{n}={te_per_dice[c]:.4f}" for c, n in track)
@@ -493,7 +502,10 @@ def main():
         })
 
     wandb.finish()
-    print(f"[done] best val_dice={best:.4f} -> {outdir/'best.pth'}")
+    if args.eval_only:
+        print(f"[done] eval-only on {args.eval_only}")
+    else:
+        print(f"[done] best val_dice={best:.4f} -> {outdir/'best.pth'}")
 
 
 if __name__ == "__main__":
