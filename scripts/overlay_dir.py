@@ -46,6 +46,21 @@ def compact_legend(scheme: dict, keep: str | None) -> dict:
     return {i: scheme[int(r)] for i, r in enumerate(keep.split(","), start=1)}
 
 
+def _keep_largest(m: np.ndarray, u: int) -> np.ndarray:
+    """Same rule eval_urethra scores: one urethra per frame, drop the rest."""
+    import cv2
+    sel = (m == u).astype(np.uint8)
+    if not sel.any():
+        return m
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(sel, connectivity=8)
+    if n <= 2:
+        return m
+    biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    m = m.copy()
+    m[(lab != biggest) & (lab != 0)] = 0
+    return m
+
+
 def predict(model, img: Image.Image, size_hw, device) -> np.ndarray:
     """Class-id map at the image's ORIGINAL size. size_hw is (H, W) -- feed the model
     the shape it was TRAINED at; a 1088x1344 model fed a 512 square sees the wrong
@@ -72,6 +87,8 @@ def main():
     ap.add_argument("--keep-classes", default=None,
                     help="the run's --keep-classes, so compact ids map back to the right "
                          "names/colours (e.g. 1,2,4,5). Omit if no class was excluded.")
+    ap.add_argument("--keep-largest", type=int, default=0, metavar="CLASSID",
+                    help="compact class id to reduce to its largest component (urethra=1)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--scheme", default="new", choices=("new", "old"))
@@ -103,6 +120,8 @@ def main():
     for p in picks:
         img = Image.open(p).convert("RGB")
         m = predict(model, img, size_hw, device)
+        if args.keep_largest:
+            m = _keep_largest(m, args.keep_largest)
         raw = np.array(img)
         ov = raw.copy()
         for cid, (name, col) in legend.items():
