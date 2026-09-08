@@ -46,7 +46,9 @@ def stray_analysis(model, loader, u, device, halo_px=6):
     """
     # cv2 not scipy: scipy is not in the venv and cv2 already is (mask_video.py).
     import cv2
-    k = np.ones((3, 3), np.uint8)
+    # getStructuringElement, not np.ones: cv2 4.11 rejects the ndarray kernel
+    # (Assertion _kernel.type() == CV_8U) even when its dtype is uint8.
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     tot = dict(pred=0, hit=0, stray=0, halo_near=0, halo_far=0, stray_blobs=0, frames=0)
     model.eval()
     with torch.no_grad():
