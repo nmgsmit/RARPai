@@ -32,7 +32,30 @@ _spec.loader.exec_module(ft)
 from metaformer import MetaFormerFPN  # noqa: E402
 
 
-def stray_analysis(model, loader, u, device, halo_px=6):
+def keep_largest(pred, u):
+    """Zero every urethra component except the biggest one, per frame.
+
+    The urethra is ONE anatomical structure, so a frame holds exactly one component.
+    ~10% of predicted urethra sits in components with no GT overlap at all (about one
+    per frame) and no loss shaping touched that, so drop them by construction instead.
+    Suppressed pixels go to background, never to another class -- relabelling them
+    prostate would invent the exact confusion we are trying to avoid.
+    """
+    import cv2
+    out = pred.copy()
+    for i in range(out.shape[0]):
+        m = (out[i] == u).astype(np.uint8)
+        if not m.any():
+            continue
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        if n <= 2:                                   # background + at most one blob
+            continue
+        biggest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        out[i][(lab != biggest) & (lab != 0)] = 0
+    return out
+
+
+def stray_analysis(model, loader, u, device, halo_px=6, largest=False):
     """Split the urethra leak into HALO and STRAY, because they mean opposite things.
 
     A 21% leak that is a few pixels of boundary slop around an otherwise correct mask
@@ -53,7 +76,10 @@ def stray_analysis(model, loader, u, device, halo_px=6):
     model.eval()
     with torch.no_grad():
         for x, y in loader:
-            pred = (model(x.to(device)).argmax(1).cpu().numpy() == u)
+            pred = model(x.to(device)).argmax(1).cpu().numpy()
+            if largest:
+                pred = keep_largest(pred, u)
+            pred = (pred == u)
             gt = (y.numpy() == u)
             for pm, gm in zip(pred, gt):
                 n, lab = cv2.connectedComponents(pm.astype(np.uint8), connectivity=8)
@@ -75,13 +101,16 @@ def stray_analysis(model, loader, u, device, halo_px=6):
     return tot
 
 
-def confusion(model, loader, nc, device):
+def confusion(model, loader, nc, device, largest=False, largest_u=None):
     """cm[t, p] = pixels of true class t predicted as p."""
     cm = torch.zeros(nc, nc, dtype=torch.long)
     model.eval()
     with torch.no_grad():
         for x, y in loader:
-            pred = model(x.to(device)).argmax(1).cpu().view(-1)
+            pred = model(x.to(device)).argmax(1).cpu().numpy()
+            if largest:
+                pred = keep_largest(pred, largest_u)
+            pred = torch.from_numpy(pred).view(-1)
             t = y.view(-1)
             cm += torch.bincount(t * nc + pred, minlength=nc * nc).reshape(nc, nc)
     return cm
@@ -114,6 +143,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42, help="MUST match the run's --seed")
+    ap.add_argument("--keep-largest", action="store_true",
+                    help="post-process: keep only the largest urethra component per frame")
     ap.add_argument("--no-stray", action="store_true", help="skip the connected-component pass")
     args = ap.parse_args()
 
@@ -136,9 +167,10 @@ def main():
     model.load_state_dict(sd)
     model.to(device)
 
-    print(f"[eval] {args.checkpoint}")
+    u_pre = names.index(scheme[1])          # compact urethra id, needed before confusion()
+    print(f"[eval] {args.checkpoint}"+(" +keep-largest" if args.keep_largest else ""))
     print(f"[eval] split={args.split} n={len(ld.dataset)} feed={size_hw} device={device}")
-    cm = confusion(model, ld, nc, device)
+    cm = confusion(model, ld, nc, device, args.keep_largest, u_pre)
     dice, rec, prec = report(cm, names)
 
     u = names.index(scheme[1]) if scheme[1] in names else None   # urethra compact id
@@ -158,7 +190,7 @@ def main():
         other = pred_u - cm[u, u].item() - cm[p, u].item()
         print(f"        ...of which bg/other            {100*other/pred_u:6.2f}%")
     if not args.no_stray:
-        t = stray_analysis(model, ld, u, device)
+        t = stray_analysis(model, ld, u, device, largest=args.keep_largest)
         pr = max(t["pred"], 1)
         print("")
         print("[leak anatomy] where predicted urethra actually lands")
