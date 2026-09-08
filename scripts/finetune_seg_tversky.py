@@ -154,7 +154,15 @@ class SegDataset(Dataset):
     def __getitem__(self, i):
         h, w = self.size_hw
         img = Image.open(self.frames[i]).convert("RGB").resize((w, h), Image.BICUBIC)
-        msk = Image.open(self.masks[i]).convert("L").resize((w, h), Image.NEAREST)
+        msk = Image.open(self.masks[i])
+        # The labelling tool writes PALETTE-mode masks: the label id is the palette
+        # INDEX, and .convert("L") would push it through the palette to a luminance
+        # (id 1 -> 226), which remap then drops to background -- an all-background
+        # dataset that trains to loss 0 and reports dice 1.0. Old RARPSurgenet masks
+        # are mode "L", where the convert was a harmless no-op. Read indices directly.
+        if msk.mode != "P":
+            msk = msk.convert("L")
+        msk = msk.resize((w, h), Image.NEAREST)      # NEAREST keeps indices exact
         img = np.array(img)
         msk = self.remap[np.array(msk)]                 # drop unwanted classes -> bg
         if self.augment:
@@ -308,6 +316,16 @@ def main():
                     n = 5 if sub == "images" else 7      # deliberate mask surplus
                     for k in range(n):
                         Image.new("RGB" if ext == ".jpg" else "L", (8, 8)).save(d / f"{k:07d}{ext}")
+            # a PALETTE mask must survive the loader as label INDICES, not luminance
+            pm = Image.new("P", (8, 8), 0)
+            pm.putpalette([0, 0, 0, 255, 255, 0, 255, 0, 255] + [0] * 759)
+            pm.putpixel((0, 0), 1); pm.putpixel((1, 1), 2)
+            pmf = Path(td) / "pal.png"; pm.save(pmf)
+            assert set(np.unique(np.array(Image.open(pmf).convert("L")))) != {0, 1, 2}, \
+                "test palette is degenerate -- convert(L) must differ from the indices"
+            got = SegDataset([(pmf, pmf)], (8, 8), build_remap([1, 2]))[0][1].numpy()
+            assert set(np.unique(got)) == {0, 1, 2}, f"palette mask mangled: {np.unique(got)}"
+
             sp, ncl = clip_pairs(Path(td), seed=42)
             assert sum(ncl.values()) == 20, ncl
             seen = [p[0].parent.parent.name for v in sp.values() for p in v]
@@ -363,6 +381,19 @@ def main():
                     pin_memory=True, drop_last=True, generator=g)
     va = DataLoader(SegDataset(splits["Validation"], size_hw, remap),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+
+    # Label sanity: an all-background training set trains to loss 0 and reports
+    # dice 1.0 (validate() averages over PRESENT classes only, and only bg is
+    # present), which looks like a great run. Cost of this check is ~2 s.
+    ds = tr.dataset
+    hist = np.zeros(nc, dtype=np.int64)
+    for j in np.linspace(0, len(ds) - 1, min(24, len(ds))).astype(int):
+        hist += np.bincount(ds[int(j)][1].numpy().ravel(), minlength=nc)
+    frac = hist / hist.sum()
+    print("[labels] " + "  ".join(f"{names[c]}={frac[c]*100:.2f}%" for c in range(nc)), flush=True)
+    missing = [names[c] for c in range(1, nc) if hist[c] == 0]
+    assert not missing, (f"classes {missing} never appear in {len(ds)} training masks -- "
+                         "wrong --keep-classes, --label-scheme, or mask palette mode?")
 
     model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None).to(device)
     load_encoder(model, args.encoder_ckpt)
