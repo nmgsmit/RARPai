@@ -48,7 +48,7 @@ def stray_analysis(model, loader, u, device, halo_px=6):
     import cv2
     # getStructuringElement, not np.ones: cv2 4.11 rejects the ndarray kernel
     # (Assertion _kernel.type() == CV_8U) even when its dtype is uint8.
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    kern = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     tot = dict(pred=0, hit=0, stray=0, halo_near=0, halo_far=0, stray_blobs=0, frames=0)
     model.eval()
     with torch.no_grad():
@@ -58,13 +58,13 @@ def stray_analysis(model, loader, u, device, halo_px=6):
             for pm, gm in zip(pred, gt):
                 n, lab = cv2.connectedComponents(pm.astype(np.uint8), connectivity=8)
                 n -= 1                                    # label 0 is the background label
-                near = (cv2.dilate(gm.astype(np.uint8), k, iterations=halo_px) > 0
+                near = (cv2.dilate(gm.astype(np.uint8), kern, iterations=halo_px) > 0
                         if gm.any() else gm)
                 tot["frames"] += 1
                 tot["pred"] += int(pm.sum())
                 tot["hit"] += int((pm & gm).sum())
-                for k in range(1, n + 1):
-                    comp = lab == k
+                for ci in range(1, n + 1):    # not `k`: that shadowed the kernel
+                    comp = lab == ci
                     if (comp & gm).any():                     # component found real urethra
                         wrong = comp & ~gm
                         tot["halo_near"] += int((wrong & near).sum())
