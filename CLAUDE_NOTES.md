@@ -3,6 +3,38 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-08 — SEG: urethra loop — LOSS SHAPING IS A DEAD LEVER, post-processing won
+
+- INSTRUMENT FIRST: `scripts/eval_urethra.py`. Dice cannot see WHICH way a mask is wrong.
+  Reports U->P, P->U, and `leak` (predicted urethra not on urethra = 1-precision), then splits
+  leak by connected component into HALO (attached to a blob that found real urethra) vs
+  **STRAY** (component with ZERO GT overlap). Those mean opposite things and precision conflates
+  them. Imports the trainer's own `clip_pairs`/`SegDataset` -- a split that differs from the
+  run's own is a silent lie.
+- **The reported failure was not the real one.** U<->P confusion is ~0.3-1.9% each way in every
+  model -- a non-issue. The constraint violation was STRAY blobs: ~10% of predicted urethra,
+  **~1 per frame**, on tissue labelled nothing. Only ~4.7% of leak is boundary slop.
+- SWEEP (6 arms, 512px, DVP excluded, 50 ep, `--select-on urethra`): control / urethra weight
+  x3 / x6 / a=.35 b=.65 / a=.65 b=.35 / a=.8 b=.2. **All six within 0.014 dice (0.789-0.803) =
+  noise on one seed.** The precision-leaning arms (which SHOULD have cut leak) produced the MOST
+  stray (12.3%, 12.0%): shrinking masks fragments them without suppressing confident small blobs.
+  Hypothesis falsified in both directions. Do not spend more GPU on alpha/beta or class weights.
+- **`--keep-largest` (inference-time, no training) is the fix.** The urethra is ONE structure, so
+  keep the biggest component and drop the rest to BACKGROUND (never to another class -- that would
+  invent the U<->P confusion we are avoiding). On `ureth_fn`: dice 0.8032 -> **0.8386**, precision
+  0.7916 -> 0.8898, stray 10.95% -> **0.39%**, blobs 1.15 -> 0.02/frame. Dice went UP.
+- WINNER = `outputs/ureth_fn/best.pth` + `--keep-largest`. vs the first clip-data model
+  (`rarp_nick_dice`, 0.7685) that is +0.070 dice. Most of the gain is NOT the loss: it is
+  `--select-on urethra` (save the best-urethra epoch, not the best-mean-dice one) + dropping DVP.
+- **CAVEAT: keep-largest is NOT in the checkpoint.** Anything loading `best.pth` directly (the
+  ATLAS GUI included) gets the unfiltered ~10% stray. `_keep_largest` is duplicated in
+  `overlay_dir.py` and `eval_urethra.py`; a third consumer should get a shared helper.
+- Remaining error is now RECALL (0.7930): ~21% of GT urethra missed, and keep-largest costs a
+  little of it (0.8153 -> 0.7930) when a true urethra splits in two. That is the next lever, not
+  the loss.
+- Single seed, one 8-clip test split. The arm ranking is not significant; the keep-largest effect
+  (28x) is far outside that noise.
+
 ## 2026-09-08 — SEG: retrain on the new clip-layout annotations (a NEW label scheme)
 
 - DATA: `../data/processed/Segmentation/Nick` — 56 clips, `<clip>/images/*.jpg` +
