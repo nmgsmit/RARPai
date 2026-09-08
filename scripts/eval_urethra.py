@@ -32,6 +32,43 @@ _spec.loader.exec_module(ft)
 from metaformer import MetaFormerFPN  # noqa: E402
 
 
+def stray_analysis(model, loader, u, device, halo_px=6):
+    """Split the urethra leak into HALO and STRAY, because they mean opposite things.
+
+    A 21% leak that is a few pixels of boundary slop around an otherwise correct mask
+    is annotation-grade disagreement. The same 21% spread over blobs on unrelated
+    tissue is the thing we actually forbid ("no urethra signal other than on the
+    urethra"). Precision cannot distinguish them; connected components can.
+
+      stray = predicted-urethra pixels in a component with ZERO overlap of GT urethra
+      halo  = the rest of the leak: wrong pixels attached to a component that did
+              find real urethra (split by distance from GT)
+    """
+    from scipy import ndimage
+    tot = dict(pred=0, hit=0, stray=0, halo_near=0, halo_far=0, stray_blobs=0, frames=0)
+    model.eval()
+    with torch.no_grad():
+        for x, y in loader:
+            pred = (model(x.to(device)).argmax(1).cpu().numpy() == u)
+            gt = (y.numpy() == u)
+            for pm, gm in zip(pred, gt):
+                lab, n = ndimage.label(pm)
+                near = ndimage.binary_dilation(gm, iterations=halo_px) if gm.any() else gm
+                tot["frames"] += 1
+                tot["pred"] += int(pm.sum())
+                tot["hit"] += int((pm & gm).sum())
+                for k in range(1, n + 1):
+                    comp = lab == k
+                    if (comp & gm).any():                     # component found real urethra
+                        wrong = comp & ~gm
+                        tot["halo_near"] += int((wrong & near).sum())
+                        tot["halo_far"] += int((wrong & ~near).sum())
+                    else:                                     # component touches no GT at all
+                        tot["stray"] += int(comp.sum())
+                        tot["stray_blobs"] += 1
+    return tot
+
+
 def confusion(model, loader, nc, device):
     """cm[t, p] = pixels of true class t predicted as p."""
     cm = torch.zeros(nc, nc, dtype=torch.long)
@@ -71,6 +108,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42, help="MUST match the run's --seed")
+    ap.add_argument("--no-stray", action="store_true", help="skip the connected-component pass")
     args = ap.parse_args()
 
     scheme = ft.SCHEMES[args.label_scheme]
@@ -113,6 +151,19 @@ def main():
         print(f"        ...of which prostate            {100*cm[p,u].item()/pred_u:6.2f}%")
         other = pred_u - cm[u, u].item() - cm[p, u].item()
         print(f"        ...of which bg/other            {100*other/pred_u:6.2f}%")
+    if not args.no_stray:
+        t = stray_analysis(model, ld, u, device)
+        pr = max(t["pred"], 1)
+        print("")
+        print("[leak anatomy] where predicted urethra actually lands")
+        print(f"  on GT urethra                {100*t['hit']/pr:6.2f}%")
+        print(f"  halo  <=6px of GT urethra    {100*t['halo_near']/pr:6.2f}%   (boundary slop)")
+        print(f"  halo  >6px, same blob        {100*t['halo_far']/pr:6.2f}%   (over-extension)")
+        print(f"  STRAY blob, no GT overlap    {100*t['stray']/pr:6.2f}%   <-- the constraint")
+        print(f"  stray blobs                  {t['stray_blobs']} over {t['frames']} frames "
+              f"({t['stray_blobs']/max(t['frames'],1):.2f}/frame)")
+        print(f"  STRAYPCT {100*t['stray']/pr:.3f}")
+
     # one line a loop can grep and rank on
     print(f"\nSCORE dice={dice[u]:.4f} leak={leak:.4f} "
           f"u2p={cm[u,p].item()/max(gt_u,1):.4f} p2u={cm[p,u].item()/max(cm[p].sum().item(),1):.4f} "
