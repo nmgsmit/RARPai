@@ -44,7 +44,9 @@ def stray_analysis(model, loader, u, device, halo_px=6):
       halo  = the rest of the leak: wrong pixels attached to a component that did
               find real urethra (split by distance from GT)
     """
-    from scipy import ndimage
+    # cv2 not scipy: scipy is not in the venv and cv2 already is (mask_video.py).
+    import cv2
+    k = np.ones((3, 3), np.uint8)
     tot = dict(pred=0, hit=0, stray=0, halo_near=0, halo_far=0, stray_blobs=0, frames=0)
     model.eval()
     with torch.no_grad():
@@ -52,8 +54,10 @@ def stray_analysis(model, loader, u, device, halo_px=6):
             pred = (model(x.to(device)).argmax(1).cpu().numpy() == u)
             gt = (y.numpy() == u)
             for pm, gm in zip(pred, gt):
-                lab, n = ndimage.label(pm)
-                near = ndimage.binary_dilation(gm, iterations=halo_px) if gm.any() else gm
+                n, lab = cv2.connectedComponents(pm.astype(np.uint8), connectivity=8)
+                n -= 1                                    # label 0 is the background label
+                near = (cv2.dilate(gm.astype(np.uint8), k, iterations=halo_px) > 0
+                        if gm.any() else gm)
                 tot["frames"] += 1
                 tot["pred"] += int(pm.sum())
                 tot["hit"] += int((pm & gm).sum())
