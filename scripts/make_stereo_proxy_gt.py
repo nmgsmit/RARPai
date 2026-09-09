@@ -86,6 +86,13 @@ def ffs_matcher(root, model_path, iters, max_disp):
     from core.utils.utils import InputPadder
 
     model = torch.load(os.path.expanduser(model_path), map_location="cpu", weights_only=False)
+    # Version skew: the published checkpoint's pickled args predate keys the repo HEAD now
+    # reads. Fill from the repo's OWN function defaults (build_gwc_volume_*(normalize=True))
+    # rather than guessing -- a wrong value here changes the cost volume silently.
+    for key, default in (("normalize", True),):
+        if key not in model.args:
+            print("  model.args missing %r, using repo default %r" % (key, default))
+            model.args[key] = default
     model.args.valid_iters = iters
     model.args.max_disp = max_disp
     model.cuda().eval()
