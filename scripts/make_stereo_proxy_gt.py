@@ -188,6 +188,59 @@ def preview(frame, maps, cal, min_disp, num_disp, scale, out, matcher=sgbm_match
               % (100 * ok.mean(), lo, np.median(z[ok]), hi))
 
 
+def depth_jpg(left, z, path, name=""):
+    """Side-by-side rectified image + metric depth with a mm scale bar. Depth alone is hard
+    to read; the reference image is what makes it analysable."""
+    ok = z > 0
+    if not ok.any():
+        return
+    lo, hi = np.percentile(z[ok], [2, 98])
+    # inverse depth so NEAR = bright, matching gui_depth_measure.colorize
+    heat = colorize(np.where(ok, 1.0 / np.maximum(z, 1e-6), np.nan), 1 / hi, 1 / lo)
+    bar_h = 34
+    grad = np.linspace(1 / lo, 1 / hi, OUT_W - 200)[None, :].repeat(bar_h, 0)
+    bar = colorize(grad, 1 / hi, 1 / lo)
+    bar = cv2.copyMakeBorder(bar, 6, 24, 100, 100, cv2.BORDER_CONSTANT, value=(20, 20, 20))
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        mm = 1.0 / (1 / lo + frac * (1 / hi - 1 / lo))
+        x = int(100 + frac * (OUT_W - 200))
+        cv2.putText(bar, "%.0f" % mm, (x - 14, bar_h + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(bar, "mm", (OUT_W - 88, bar_h + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (255, 255, 255), 1, cv2.LINE_AA)
+    heat = np.vstack([heat, cv2.resize(bar, (OUT_W, bar.shape[0]))])
+    left = np.vstack([left, np.full((bar.shape[0], OUT_W, 3), 20, np.uint8)])
+    tiles = []
+    for panel, label in ((left, "rectified LEFT   %s" % name),
+                         (heat, "metric depth  %.0f-%.0f mm  (bright = near)  valid %.1f%%"
+                          % (lo, hi, 100 * ok.mean()))):
+        t = cv2.copyMakeBorder(panel, 44, 10, 10, 10, cv2.BORDER_CONSTANT, value=(20, 20, 20))
+        cv2.putText(t, label, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+        tiles.append(t)
+    cv2.imwrite(path, np.hstack(tiles), [cv2.IMWRITE_JPEG_QUALITY, 92])
+    return lo, hi, float(ok.mean())
+
+
+def run_images(paths, dst, maps, cal, min_disp, num_disp, scale, matcher):
+    """Same pipeline as run_video, for individual SBS frames pasted in as PNGs."""
+    os.makedirs(dst, exist_ok=True)
+    for p in paths:
+        fr = cv2.imread(p)
+        if fr is None or fr.shape[1] != 1920:
+            print("  skip %s (not a 1920x1080 SBS frame)" % os.path.basename(p))
+            continue
+        left, _, z = frame_depth(fr, maps, cal, min_disp, num_disp, scale, matcher)
+        stem = os.path.splitext(os.path.basename(p))[0]
+        cv2.imwrite(os.path.join(dst, stem + "_depth16.png"),
+                    np.clip(z * DEPTH_SCALE, 0, 65535).astype(np.uint16))
+        r = depth_jpg(left, z, os.path.join(dst, stem + ".jpg"), stem[-12:])
+        good = z > 0
+        print("  %-58s valid %5.1f%%  depth p2 %.0f  med %.0f  p98 %.0f mm"
+              % (stem[-58:], 100 * good.mean(),
+                 *(np.percentile(z[good], [2, 50, 98]) if good.any() else (0, 0, 0))))
+
+
 def run_video(video, dst, maps, cal, stride, min_disp, num_disp, scale, matcher):
     name = os.path.splitext(os.path.basename(video))[0]
     for sub in ("images", "depth"):
@@ -239,6 +292,8 @@ def main():
                          "natively, so 1.0 is a 2.1x upsample carrying no new information -- "
                          "measured over 9 frames, 0.5 gives 58%% valid vs 41.7%% at 1.0 with "
                          "median depths agreeing to ~1mm. 0.5*1340=670 ~= native 636.")
+    ap.add_argument("--also-video", action="store_true",
+                    help="by default, if --src holds still frames only those are processed")
     ap.add_argument("--matcher", default="sgbm", choices=["sgbm", "ffs"],
                     help="ffs = C-Fast-FoundationStereo (needs a GPU)")
     ap.add_argument("--ffs-root", default="~/Fast-FoundationStereo")
@@ -271,6 +326,12 @@ def main():
 
     if not (a.src and a.dst):
         raise SystemExit("need --src and --dst (or --preview with --video)")
+    imgs = sorted(sum([glob.glob(os.path.join(a.src, e)) for e in ("*.png", "*.jpg", "*.jpeg")], []))
+    if imgs:
+        print("%d SBS still frames -> %s" % (len(imgs), a.dst))
+        run_images(imgs, a.dst, maps, cal, a.min_disp, a.num_disp, a.scale, matcher)
+        if not a.also_video:
+            return
     vids = sorted(glob.glob(os.path.join(a.src, "*.mp4")))
     print("%d clips -> %s" % (len(vids), a.dst))
     total, allf = 0, []
