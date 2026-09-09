@@ -57,11 +57,24 @@ def rect_maps(calib, right):
     return (ex / sx + x0).astype(np.float32), (ey / sy + SRC_Y).astype(np.float32), valid
 
 
-def specular_mask(img):
+def specular_mask(img, max_blob=2000):
     """Blown-out highlights are view-dependent: they sit at different scene points in the two
-    eyes, so any disparity a matcher reports there is meaningless."""
+    eyes, so any disparity a matcher reports there is meaningless.
+
+    SMALL blobs only. "bright and desaturated" also describes a white da Vinci instrument
+    shaft, and masking those threw away the nearest objects in frame with the sharpest depth
+    discontinuities -- the most valuable supervision in the dataset. Measured over the SBS
+    stills (1849 components): genuine highlights have median area 10 px and p95 128 px, while
+    instrument blobs run 5k-32k, so the two are cleanly separable by size. 2000 sits above
+    every plausible highlight, and anything ambiguous stays masked; the left-right check is
+    the real safety net either way, since a view-dependent highlight fails it anyway.
+    """
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    return (hsv[:, :, 2] > 240) & (hsv[:, :, 1] < 40)
+    bright = ((hsv[:, :, 2] > 240) & (hsv[:, :, 1] < 40)).astype(np.uint8)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(bright, 8)
+    small = np.zeros(n, bool)
+    small[1:] = stats[1:, cv2.CC_STAT_AREA] < max_blob      # 0 is background
+    return small[lab]
 
 
 def make_sgbm(min_disp, num_disp, block=5):

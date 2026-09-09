@@ -5,6 +5,15 @@ sessions don't re-derive them. Keep entries one or two lines.
 
 ## 2026-09-09 - DEPTH 3D: da Vinci SBS geometry solved + real stereo calibration
 
+- SPECULAR MASK BUG (fixed): "bright + desaturated" (V>240,S<40) also describes a white da Vinci
+  instrument shaft, so the first version deleted 0.8-3.8% of each frame that was INSTRUMENT --
+  the nearest objects with the sharpest depth edges, i.e. the best supervision in the set. Now
+  masks SMALL blobs only (`max_blob=2000`): measured over 1849 components, genuine highlights are
+  median 10px / p95 128px while instruments run 5k-32k, so size separates them cleanly. Instrument
+  masking now 0.00%. Pinned by `scripts/tests/smoke_specular_mask.py`.
+- BOARD PRINT SCALE CONFIRMED 100% (Nick measured the printed board by hand, 2026-09-09) -> the
+  metric chain has no unverified scale factor left.
+
 - DATA `../data/3D_ProxyGT/*.mp4` (3 clips) + `../data/ARUCO_calibration/*seg1.mp4`, all
   1920x1080 @59.94, **half-width anamorphic side-by-side**: left eye x164-799, right x1124-1759
   (exactly +960), y32-1047, 636x1016 per eye, squeezed 2x horizontally. Boards are
