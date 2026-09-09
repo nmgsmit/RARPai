@@ -151,7 +151,10 @@ def validate(views, cal):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True)
-    ap.add_argument("--board", default="A", choices=list(BOARDS))
+    ap.add_argument("--board", default="AB", choices=list(BOARDS) + ["AB"],
+                    help="AB pools views from both boards. calibrateCamera does not care that "
+                         "the views come from two different targets -- each view carries its "
+                         "own object points -- and B reaches further out than A does.")
     ap.add_argument("--stride", type=int, default=3)
     ap.add_argument("--min-corners", type=int, default=10)
     ap.add_argument("--blur-pct", type=float, default=40.0, help="drop the blurriest N%%")
@@ -163,10 +166,11 @@ def main():
     ap.add_argument("--out", default="outputs/stereo_calib")
     a = ap.parse_args()
 
-    board = make_board(BOARDS[a.board])
-    views = collect(a.video, board, a.stride, a.min_corners, a.blur_pct)
-    print("usable stereo views after sharpness gate: %d" % len(views))
-    views = spread(views, a.max_views)
+    views = []
+    for name in ("A", "B") if a.board == "AB" else (a.board,):
+        got = collect(a.video, make_board(BOARDS[name]), a.stride, a.min_corners, a.blur_pct)
+        print("board %s: %d usable stereo views after sharpness gate" % (name, len(got)))
+        views += spread(got, a.max_views)
     if len(views) < 8:
         raise SystemExit("only %d views -- not enough to calibrate" % len(views))
     obj = [v["obj"] for v in views]
@@ -182,7 +186,10 @@ def main():
              for lo, hi in ((0, 200), (200, 400), (400, 600), (600, 900))]
     print("corner coverage by radius: " +
           "  ".join("%d-%d: %d" % (lo, hi, n) for lo, hi, n in cover))
-    print("max corner radius %.0f px (frame corner is at ~906)" % rad.max())
+    gy, gx = np.mgrid[0:OUT_H, 0:OUT_W]
+    beyond = float(((np.hypot(gx - OUT_W / 2, gy - OUT_H / 2)) > rad.max()).mean())
+    print("max corner radius %.0f px -> %.0f%% of the frame is EXTRAPOLATED "
+          "(frame corner is at ~906)" % (rad.max(), 100 * beyond))
 
     flags = 0 if a.free_k3 else cv2.CALIB_FIX_K3
     rmsL, KL, DL, *_ = cv2.calibrateCamera(obj, ptsL, size, None, None, flags=flags)
@@ -213,6 +220,7 @@ def main():
         stereo_rotation_deg=deg(R), rect_rot_left_deg=deg(R1), rect_rot_right_deg=deg(R2),
         distortion_left=distortion_px(KL, DL), distortion_right=distortion_px(KR, DR),
         free_k3=bool(a.free_k3), corner_coverage=cover, max_corner_radius=float(rad.max()),
+        extrapolated_frame_frac=beyond,
         # normalised the way the training code writes K: fx/W, fy/H, cx/W, cy/H
         K_norm_left=[KL[0, 0] / OUT_W, KL[1, 1] / OUT_H, KL[0, 2] / OUT_W, KL[1, 2] / OUT_H],
         K_norm_right=[KR[0, 0] / OUT_W, KR[1, 1] / OUT_H, KR[0, 2] / OUT_W, KR[1, 2] / OUT_H],
