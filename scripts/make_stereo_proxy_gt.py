@@ -72,39 +72,76 @@ def make_sgbm(min_disp, num_disp, block=5):
         mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
 
 
-def match(left, right, min_disp, num_disp, scale=1.0):
-    """-> disparity in rectified pixels, NaN where the left-right check fails.
+def sgbm_matcher(left, right, min_disp, num_disp):
+    """ponytail: SGBM, no new dependency. Known ceiling: textureless blood-covered tissue,
+    where a cost volume has nothing to lock onto -- measured 58% valid. `ffs` lifts that."""
+    return make_sgbm(min_disp, num_disp).compute(left, right).astype(np.float32) / 16.0
 
-    ponytail: SGBM, no new dependency. The known ceiling is textureless blood-covered tissue
-    and specular tissue, where a cost volume has nothing to lock onto -- swap in
-    FoundationStereo (monocular prior fills those regions) if the valid fraction is too low.
-    """
+
+def ffs_matcher(root, model_path, iters, max_disp):
+    """C-Fast-FoundationStereo (NVIDIA, CVPR 2026). The checkpoint is a SERIALIZED nn.Module,
+    not a state_dict, so `core` must be importable when it unpickles -- hence sys.path."""
+    import torch
+    sys.path.insert(0, os.path.expanduser(root))
+    from core.utils.utils import InputPadder
+
+    model = torch.load(os.path.expanduser(model_path), map_location="cpu", weights_only=False)
+    model.args.valid_iters = iters
+    model.args.max_disp = max_disp
+    model.cuda().eval()
+    torch.autograd.set_grad_enabled(False)
+
+    def run(left, right, min_disp, num_disp):
+        h, w = left.shape[:2]
+        # cv2 gives BGR; the model was trained on RGB (imageio).
+        to_t = (lambda im: torch.as_tensor(np.ascontiguousarray(im[..., ::-1]))
+                .cuda().float()[None].permute(0, 3, 1, 2))
+        a, b = to_t(left), to_t(right)
+        padder = InputPadder(a.shape, divis_by=32, force_square=False)
+        a, b = padder.pad(a, b)
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+            d = model.forward(a, b, iters=iters, test_mode=True,
+                              optimize_build_volume="pytorch1")
+        return padder.unpad(d.float()).cpu().numpy().reshape(h, w)
+
+    return run
+
+
+def lr_check(dl, dr, min_disp, tol=1.5):
+    """Keep only pixels where matching left->right and right->left agree. For a learned
+    matcher this is what keeps the monocular prior OUT of the supervision: the network will
+    happily hallucinate plausible depth on textureless tissue, and only genuine stereo
+    correspondence survives agreeing in both directions."""
+    h, w = dl.shape
+    xs = np.arange(w)[None, :].repeat(h, 0)
+    src = np.clip(xs - dl, 0, w - 1).astype(np.int32)
+    agree = np.abs(dl - dr[np.arange(h)[:, None], src]) <= tol
+    dl = dl.copy()
+    dl[~agree | (dl <= min_disp)] = np.nan
+    return dl
+
+
+def match(matcher, left, right, min_disp, num_disp, scale=1.0):
+    """-> disparity in FULL-resolution rectified px, NaN where the left-right check fails.
+    The right pass uses the flip trick, so it needs nothing from opencv-contrib."""
     if scale != 1.0:
         sz = (int(OUT_W * scale), int(OUT_H * scale))
         left, right = cv2.resize(left, sz), cv2.resize(right, sz)
         min_disp, num_disp = int(min_disp * scale), int(round(num_disp * scale / 16)) * 16
-    sgbm = make_sgbm(min_disp, num_disp)
-    dl = sgbm.compute(left, right).astype(np.float32) / 16.0
-    # Right disparity via the flip trick, so the left-right consistency check needs no
-    # opencv-contrib (createRightMatcher lives there).
-    dr = make_sgbm(min_disp, num_disp).compute(right[:, ::-1], left[:, ::-1])
-    dr = dr[:, ::-1].astype(np.float32) / 16.0
-
-    h, w = dl.shape
-    xs = np.arange(w)[None, :].repeat(h, 0)
-    src = np.clip(xs - dl, 0, w - 1).astype(np.int32)
-    agree = np.abs(dl - dr[np.arange(h)[:, None], src]) <= 1.5
-    dl[~agree | (dl <= min_disp)] = np.nan
+    dl = matcher(left, right, min_disp, num_disp)
+    dr = matcher(np.ascontiguousarray(right[:, ::-1]),
+                 np.ascontiguousarray(left[:, ::-1]), min_disp, num_disp)[:, ::-1]
+    dl = lr_check(dl, dr, min_disp)
     if scale != 1.0:
         dl = cv2.resize(dl, (OUT_W, OUT_H), interpolation=cv2.INTER_NEAREST) / scale
     return dl
 
 
-def frame_depth(frame, maps, cal, min_disp, num_disp, scale):
+def frame_depth(frame, maps, cal, min_disp, num_disp, scale, matcher=sgbm_matcher):
     (mxL, myL, vL), (mxR, myR, vR) = maps
     left = cv2.remap(frame, mxL, myL, cv2.INTER_CUBIC)
     right = cv2.remap(frame, mxR, myR, cv2.INTER_CUBIC)
-    disp = match(left, right, min_disp, num_disp, scale)
+    disp = match(matcher, left, right, min_disp, num_disp, scale)
     disp[~(vL & vR)] = np.nan
     disp[specular_mask(left)] = np.nan
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -120,8 +157,8 @@ def colorize(a, lo, hi, cmap=cv2.COLORMAP_MAGMA):
     return out
 
 
-def preview(frame, maps, cal, min_disp, num_disp, scale, out):
-    left, disp, z = frame_depth(frame, maps, cal, min_disp, num_disp, scale)
+def preview(frame, maps, cal, min_disp, num_disp, scale, out, matcher=sgbm_matcher):
+    left, disp, z = frame_depth(frame, maps, cal, min_disp, num_disp, scale, matcher)
     ok = z > 0
     lo, hi = np.percentile(z[ok], [5, 95]) if ok.any() else (0, 1)
     tiles = []
@@ -144,7 +181,7 @@ def preview(frame, maps, cal, min_disp, num_disp, scale, out):
               % (100 * ok.mean(), lo, np.median(z[ok]), hi))
 
 
-def run_video(video, dst, maps, cal, stride, min_disp, num_disp, scale):
+def run_video(video, dst, maps, cal, stride, min_disp, num_disp, scale, matcher):
     name = os.path.splitext(os.path.basename(video))[0]
     for sub in ("images", "depth"):
         os.makedirs(os.path.join(dst, name, sub), exist_ok=True)
@@ -156,7 +193,7 @@ def run_video(video, dst, maps, cal, stride, min_disp, num_disp, scale):
         ok, fr = cap.read()
         if not ok:
             continue
-        left, _, z = frame_depth(fr, maps, cal, min_disp, num_disp, scale)
+        left, _, z = frame_depth(fr, maps, cal, min_disp, num_disp, scale, matcher)
         good = z > 0
         fracs.append(float(good.mean()))
         cv2.imwrite(os.path.join(dst, name, "images", "%07d.png" % i), left)
@@ -167,6 +204,7 @@ def run_video(video, dst, maps, cal, stride, min_disp, num_disp, scale):
     f = np.array(fracs) if fracs else np.zeros(1)
     with open(os.path.join(dst, name, "proxy_gt.json"), "w") as fh:
         json.dump(dict(video=os.path.basename(video), frames=kept, stride=stride,
+                       matcher=getattr(matcher, "__name__", "ffs"),
                        depth_scale=DEPTH_SCALE, depth_units="mm", invalid=0,
                        f_times_B=cal["f_times_B_rectified"], scale=scale,
                        K=cal["P1"], image_size=[OUT_W, OUT_H],
@@ -194,7 +232,17 @@ def main():
                          "natively, so 1.0 is a 2.1x upsample carrying no new information -- "
                          "measured over 9 frames, 0.5 gives 58%% valid vs 41.7%% at 1.0 with "
                          "median depths agreeing to ~1mm. 0.5*1340=670 ~= native 636.")
+    ap.add_argument("--matcher", default="sgbm", choices=["sgbm", "ffs"],
+                    help="ffs = C-Fast-FoundationStereo (needs a GPU)")
+    ap.add_argument("--ffs-root", default="~/Fast-FoundationStereo")
+    ap.add_argument("--ffs-model",
+                    default="~/Fast-FoundationStereo/weights/c-fast/model_best_bp2_serialize.pth")
+    ap.add_argument("--ffs-iters", type=int, default=8)
     a = ap.parse_args()
+
+    matcher = sgbm_matcher
+    if a.matcher == "ffs":
+        matcher = ffs_matcher(a.ffs_root, a.ffs_model, a.ffs_iters, a.num_disp)
 
     with open(a.calib) as fh:
         cal = json.load(fh)
@@ -211,7 +259,7 @@ def main():
         cap.release()
         if not ok:
             raise SystemExit("could not read frame %d" % a.frame_index)
-        preview(fr, maps, cal, a.min_disp, a.num_disp, a.scale, a.preview)
+        preview(fr, maps, cal, a.min_disp, a.num_disp, a.scale, a.preview, matcher)
         return
 
     if not (a.src and a.dst):
@@ -220,7 +268,7 @@ def main():
     print("%d clips -> %s" % (len(vids), a.dst))
     total, allf = 0, []
     for v in vids:
-        k, f = run_video(v, a.dst, maps, cal, a.stride, a.min_disp, a.num_disp, a.scale)
+        k, f = run_video(v, a.dst, maps, cal, a.stride, a.min_disp, a.num_disp, a.scale, matcher)
         total += k
         allf.append(f)
     f = np.concatenate(allf)
