@@ -163,7 +163,10 @@ def main():
                     help="fit k3. Default fixes it at 0: the board does not reach the frame "
                          "corners, so a free k3 is unconstrained there and EXTRAPOLATES wildly "
                          "(two OpenCV versions disagreed 5.4 vs 14.7 px mean at r=600-900).")
-    ap.add_argument("--out", default="outputs/stereo_calib")
+    ap.add_argument("--out", default="calib",
+                    help="calib/stereo_calib.json is version-controlled on purpose: it is a "
+                         "measured physical constant every depth number downstream inherits, "
+                         "so a re-run should show up as a git diff.")
     a = ap.parse_args()
 
     views = []
@@ -227,7 +230,7 @@ def main():
     )
     rep["validation"] = validate(views, rep)
     os.makedirs(a.out, exist_ok=True)
-    path = os.path.join(a.out, "calib.json")
+    path = os.path.join(a.out, "stereo_calib.json")
     with open(path, "w") as fh:
         json.dump(rep, fh, indent=2)
 

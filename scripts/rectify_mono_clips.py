@@ -1,8 +1,14 @@
 """Undistort + rectify the mono 1340x1072 depth clips using the stereo calibration.
 
-Why: the calibration (STEREO_REPORT.md §5) shows the console feed is NOT a pinhole camera at
-the periphery -- 2.4px off at r=400-600 and 5.4px (max 34.7) at r=600-900. The depth training
-reprojection loss assumes a pinhole, so every peripheral pixel has been reprojected wrong.
+Why: the calibration (STEREO_REPORT.md §5) shows the console feed is NOT a pinhole camera --
+0.49px off at r=200-400 and 1.76px at r=400-600, all measured. The depth training reprojection
+loss assumes a pinhole, so those pixels have been reprojected wrong.
+
+CAVEAT: the board never reached past r=592 and the frame corner is at r=906, so 26% of the
+frame -- every corner -- is EXTRAPOLATED. Rival distortion models that agree to tenths of a
+pixel inside r=400 disagree 3x out there (5.4 / 15.1 / 6.3 px mean). Running this batch applies
+a large unverified correction exactly where it is biggest. Re-record the calibration with the
+board pushed into the corners first.
 
 Rectifying (rather than only undistorting) puts these frames in the SAME frame as the left eye
 of the 3D clips, so stereo proxy-GT depth maps land directly on top of the mono training images
@@ -199,7 +205,7 @@ def batch(src, dst, m1, m2, K, D, R, P, eye):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--calib", default="outputs/stereo_calib/calib.json")
+    ap.add_argument("--calib", default="calib/stereo_calib.json")
     ap.add_argument("--eye", default="left", choices=["left", "right"],
                     help="which eye the 2D console feed carries -- UNCONFIRMED, see docstring")
     ap.add_argument("--preview", help="write a before/after PNG and stop")
