@@ -131,16 +131,23 @@ def rectify_json(path, dst, K, D, R, P):
     metric-scale loss silently samples the wrong pixels."""
     with open(path) as fh:
         js = json.load(fh)
+    n = lost = 0
     for objs in js.get("frames", {}).values():
         for o in objs:
             for key in ("a", "b"):
                 if key in o:
                     o[key] = warp_points([o[key]], K, D, R, P)[0].tolist()
             if "points" in o:
-                o["points"] = warp_points(o["points"], K, D, R, P).tolist()
+                p = warp_points(o["points"], K, D, R, P)
+                o["points"] = p.tolist()
+                # rectification with alpha=0 zooms in, so edge annotations can land off-frame
+                n += len(p)
+                lost += int(((p[:, 0] < 0) | (p[:, 0] >= W) |
+                             (p[:, 1] < 0) | (p[:, 1] >= H)).sum())
     js["rectified"] = True
     with open(dst, "w") as fh:
         json.dump(js, fh, indent=2)
+    return n, lost
 
 
 def batch(src, dst, m1, m2, K, D, R, P, eye):
@@ -152,7 +159,7 @@ def batch(src, dst, m1, m2, K, D, R, P, eye):
         clips += [c for c in (os.path.join(vdir, n) for n in sorted(os.listdir(vdir)))
                   if os.path.isdir(os.path.join(c, "images"))]
     print("%d clips" % len(clips))
-    n_img = 0
+    n_img = n_pt = n_lost = 0
     for i, clip in enumerate(clips):
         rel = os.path.relpath(clip, src)
         out = os.path.join(dst, rel)
@@ -172,7 +179,8 @@ def batch(src, dst, m1, m2, K, D, R, P, eye):
             if not os.path.isfile(p):
                 continue
             if name == "scale_objects.json":
-                rectify_json(p, os.path.join(out, name), K, D, R, P)
+                a, b = rectify_json(p, os.path.join(out, name), K, D, R, P)
+                n_pt, n_lost = n_pt + a, n_lost + b
             else:
                 shutil.copy2(p, os.path.join(out, name))
         with open(os.path.join(out, "rectify.json"), "w") as fh:
@@ -181,6 +189,9 @@ def batch(src, dst, m1, m2, K, D, R, P, eye):
         if (i + 1) % 10 == 0:
             print("  %d/%d clips, %d images" % (i + 1, len(clips), n_img))
     print("done: %d clips, %d images -> %s" % (len(clips), n_img, dst))
+    if n_pt:
+        print("annotation points: %d total, %d landed off-frame (%.2f%%)"
+              % (n_pt, n_lost, 100 * n_lost / n_pt))
     print("rectified K: fx %.2f fy %.2f cx %.2f cy %.2f" % (P[0, 0], P[1, 1], P[0, 2], P[1, 2]))
     print("normalised: %.4f %.4f %.4f %.4f"
           % (P[0, 0] / W, P[1, 1] / H, P[0, 2] / W, P[1, 2] / H))
