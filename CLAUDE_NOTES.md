@@ -3,6 +3,40 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-09 - DEPTH 3D: da Vinci SBS geometry solved + real stereo calibration
+
+- DATA `../data/3D_ProxyGT/*.mp4` (3 clips) + `../data/ARUCO_calibration/*seg1.mp4`, all
+  1920x1080 @59.94, **half-width anamorphic side-by-side**: left eye x164-799, right x1124-1759
+  (exactly +960), y32-1047, 636x1016 per eye, squeezed 2x horizontally. Boards are
+  `OTHERS/charuco_endoscope_A4.pdf`: A = DICT_4X4_50 ids 0-30, 9x7, square 8.0mm marker 6.0mm;
+  B = ids 31-47, 7x5, square 6.0mm marker 4.5mm.
+- GEOMETRY, measured not guessed: cross-correlating the da Vinci GUI banner (fixed-size overlay
+  = a free ruler) between the SBS halves and the raw mono videos gives **scale 2.125, left edge
+  x=286**, IDENTICAL on all 3 surgical clips, both eyes, and the calibration clip. Combined with
+  mono `source_crop.json` (x289 y4 w1340 h1072) this makes one sub-pixel affine per eye ->
+  the mono 1340x1072 frame: src x 165.41(+960 for R), y 35.76, w 630.59, h 1008.47. In
+  `scripts/calibrate_stereo_charuco.py:eye_to_mono` -- USE THAT, do not re-derive.
+  An error in the affine is absorbed into fx/fy at calibration time, so only consistency between
+  calibration and inference matters. Confirmed sound: calibrated **fx/fy = 1.0003**.
+- The mono 1340x1072 frame is 1020 rows of anatomy + **52 rows of GUI banner** (rows 1020-1071),
+  blacked out in the NoGUI clips. `BANNER_ROW=1020`.
+- CALIBRATION `scripts/calibrate_stereo_charuco.py` -> `outputs/stereo_calib/calib.json`.
+  60 views, RMS 0.50px. **fx 1061.78 fy 1061.51 cx 608.65 cy 535.68** px @1340x1072,
+  **baseline 4.1155 mm**, stereo rotation 0.205 deg. Console ships a pre-converged pair:
+  cxL-cxR = **-96.73 px**, cyL-cyR = 0.01 px (already vertically rectified).
+  Rectified: **Z_mm = 5030.5 / disparity_px**.
+- vs the borrowed SCARED K (0.82,1.02,0.5,0.5): ours normalised = **0.7924, 0.9902, 0.4542,
+  0.4997**. Focal was good to ~3%, cy exact, but **cx is off by 61px (9%)** -- the optical axis
+  is NOT at frame centre. Every prior UMC depth run reprojected through that error.
+- **DISTORTION IS NOT NEGLIGIBLE**: 0.16px mean inside r=200, but 2.4px at r=400-600 and 5.4px
+  (max 34.7) at r=600-900. Skipping undistortion cost 9% depth bias in validation; rectifying
+  fixed it. => the pinhole assumption in the mono pipeline breaks at the periphery.
+- VALIDATION (in-script, reruns free): disparity depth vs the board's own PnP pose, 2463 corners
+  over Z 52-203mm -> **MAE 1.00mm, bias -0.29mm, 0.81% rel**, epipolar |dy| 0.20px median.
+  Transfer to the surgical clips: implied Z median 45-64mm, p5-p95 ~29-110mm -- matches the
+  independent ruler/catheter/arm pre-flight estimate (55/61/45mm). Holds on `5e27066c` too,
+  which is a DIFFERENT session from the calibration clip.
+
 ## 2026-09-08 — SEG: urethra loop — LOSS SHAPING IS A DEAD LEVER, post-processing won
 
 - INSTRUMENT FIRST: `scripts/eval_urethra.py`. Dice cannot see WHICH way a mask is wrong.
