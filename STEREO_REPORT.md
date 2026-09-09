@@ -7,7 +7,7 @@ stereo-calibrating them from the ChArUco clip in `../data/ARUCO_calibration`. Th
 Every number below was measured on the actual files. Where something is still an assumption it
 is marked **ASSUMPTION**; where a number is unsupported by data it is marked **EXTRAPOLATED**.
 
-- Calibration: [scripts/calibrate_stereo_charuco.py](scripts/calibrate_stereo_charuco.py) → `outputs/stereo_calib/calib.json`
+- Calibration: [scripts/calibrate_stereo_charuco.py](scripts/calibrate_stereo_charuco.py) → `calib/stereo_calib.json` (version-controlled)
 - Rectification: [scripts/rectify_mono_clips.py](scripts/rectify_mono_clips.py)
 - Figures: [scripts/stereo_report_figs.py](scripts/stereo_report_figs.py) → `docs/stereo/`
 - Design log: [CLAUDE_NOTES.md](CLAUDE_NOTES.md), 2026-09-09
@@ -35,12 +35,11 @@ the GUI banner, which is excluded.*
 
 ![Anamorphic proof](docs/stereo/fig2_anamorphic_proof.png)
 
-*Figure 2 — The da Vinci instrument badges are drawn as circles by the console. As stored they
-fit an ellipse of ratio ≈2:1. The same circle is overlaid on both panels; it only fits once the
-width has been restored. Radius is half the badge's height, which the horizontal squeeze cannot
-affect.*
+*Figure 2 — The da Vinci instrument badges are drawn as circles by the console. As stored
+(top, isotropic 5×) the rings around "1" and "2" are visibly tall narrow ellipses; after the 2×
+horizontal un-squeeze (bottom) they are round.*
 
-The second, independent confirmation is the calibration itself: **fx/fy = 1.0000** (§3). Had the
+The second, independent confirmation is the calibration itself: **fx/fy = 0.9998** (§3). Had the
 un-squeeze been wrong, the calibrated pixels would not have come out square.
 
 ### The encoder's transform
@@ -115,34 +114,37 @@ at once.*
 
 ### Results (left eye, in the 1340×1072 frame)
 
+Distortion model: **k1 only** — see §5.1 for why.
+
 ```
-fx 1064.12   fy 1064.16   cx 615.35   cy 536.85     px
-fx/fy = 1.0000
-baseline           4.1197 mm
-stereo rotation    0.162°
-console convergence (cxL − cxR)   −96.00 px
+fx 1064.01   fy 1064.27   cx 621.35   cy 535.20     px
+fx/fy = 0.9998
+baseline           4.1179 mm
+stereo rotation    0.188°
+console convergence (cxL − cxR)   −96.54 px
 cyL − cyR                          ~0 px
-rectified:   Z_mm = 4719.6 / disparity_px
+rectified:   Z_mm = 4707.2 / disparity_px
 ```
 
-`cyL − cyR ≈ 0` and a stereo rotation of 0.162° confirm the console ships an **already-rectified**
-pair. The −96 px is a deliberate horizontal convergence shift for comfortable 3D viewing — which
-is why raw disparities come out both positive and negative with a median near zero.
+`cyL − cyR ≈ 0` and a stereo rotation of 0.188° confirm the console ships an **already-rectified**
+pair. The −96.5 px is a deliberate horizontal convergence shift for comfortable 3D viewing —
+which is why raw disparities come out both positive and negative with a median near zero.
 
 ### Robustness of the intrinsics
 
-Three independent calibration configurations. The core parameters move by well under 1%:
+Four independent calibration configurations. The core parameters move by well under 1%:
 
-| | free k3, board A | k3 fixed, board A | **k3 fixed, boards A+B** |
-|---|---|---|---|
-| fx (px) | 1061.78 | 1062.35 | **1064.12** |
-| cx (px) | 608.65 | 608.79 | **615.35** |
-| baseline (mm) | 4.1155 | 4.1201 | **4.1197** |
-| convergence (px) | −96.73 | −95.89 | **−96.00** |
-| validation MAE (mm) | 1.004 | 1.283 | **0.889** |
+| | free k3, board A | k3 fixed, board A | k3 fixed, A+B | **k1 only, A+B** |
+|---|---|---|---|---|
+| fx (px) | 1061.78 | 1062.35 | 1064.12 | **1064.01** |
+| cx (px) | 608.65 | 608.79 | 615.35 | **621.35** |
+| baseline (mm) | 4.1155 | 4.1201 | 4.1197 | **4.1179** |
+| convergence (px) | −96.73 | −95.89 | −96.00 | **−96.54** |
+| board RMS (px) | 0.497 | 0.500 | 0.509 | **0.511** |
+| validation MAE (mm) | 1.004 | 1.283 | 0.889 | **0.900** |
 
-The last column is what `calib.json` now holds. Everything in §4 and §6 rests on parameters that
-are stable across all three; §5 does not, and that is the point of §5.
+The last column is what `calib/stereo_calib.json` now holds. Everything in §4 and §6 rests on
+parameters stable across all four; §5 does not, and that is the point of §5.
 
 ---
 
@@ -152,25 +154,25 @@ Normalised the way the training code writes K (fx/W, fy/H, cx/W, cy/H):
 
 | | fx | fy | cx | cy |
 |---|---|---|---|---|
-| **Ours (measured)** | 0.7941 | 0.9927 | **0.4592** | 0.5008 |
+| **Ours (measured)** | 0.7940 | 0.9928 | **0.4637** | 0.4993 |
 | SCARED / da Vinci Xi | 0.8200 | 1.0200 | 0.5000 | 0.5000 |
-| ratio | 0.968 | 0.973 | **0.918** | 1.002 |
+| ratio | 0.968 | 0.973 | **0.927** | 0.999 |
 
 **The focal length was a good stand-in; the principal point was not.**
 
 - fx, fy agree to ~3%. Borrowing SCARED's focal was defensible.
-- **cx is off by 55 px (8%).** The optical axis is not at frame centre. This biases ray
+- **cx is off by 49 px (7%).** The optical axis is not at frame centre. This biases ray
   directions by up to ~3° across the frame, systematically rather than randomly, so it does not
   average out. Every prior UMC depth run reprojected through this error.
 - cy is correct to 0.1%, which argues the horizontal offset is a real property of how the console
-  crops rather than fit noise. It also held across all three calibration configurations.
+  crops rather than fit noise. It also held across all four calibration configurations.
 
 The ~3% focal error is also a ~3% depth-scale error, directly relevant to the metric scale work —
 some of the observed scale drift may simply be this.
 
 ---
 
-## 5. Lens distortion — real, but only measured over 74% of the frame
+## 5. Lens distortion — real, measured over 74% of the frame, modelled over the rest
 
 ![Distortion](docs/stereo/fig4_distortion.png)
 
@@ -178,33 +180,69 @@ some of the observed scale drift may simply be this.
 the 2D field; inside the dashed circle is measured, outside is extrapolated. Note the field is
 not centred on the frame — that is the cx finding of §4 made visible.*
 
-Pixel displacement from a pure pinhole model, left eye:
+Pixel displacement from a pure pinhole model, left eye, under the adopted k1-only model:
 
 | radius from optical axis | mean | max | corner pairs observed |
 |---|---|---|---|
-| 0–200 px | 0.08 px | 0.31 px | 1881 |
-| 200–400 px | 0.49 px | 1.70 px | 1699 |
-| 400–600 px | 1.76 px | 5.12 px | **117** |
-| 600–900 px | *6.27 px* | *18.12 px* | **0 — EXTRAPOLATED** |
+| 0–200 px | 0.04 px | 0.09 px | 1881 |
+| 200–400 px | 0.39 px | 0.76 px | 1699 |
+| 400–600 px | 1.58 px | 2.60 px | **117** |
+| 600–900 px | *4.13 px* | *8.80 px* | **0 — EXTRAPOLATED** |
 
 **The board never went past r = 592 px. The frame corner is at r = 906. So 26% of the frame,
-including all four corners, is unconstrained by any observation.** Different but equally
-well-fitting distortion models disagree badly out there — 5.4 px (free k3), 15.1 px (k3 fixed,
-board A) and 6.3 px (k3 fixed, A+B) mean displacement in the 600–900 band, a 3× spread — while
-agreeing to a few tenths of a pixel inside r = 400.
+including all four corners, is unconstrained by the calibration target.**
+
+> The 26% is derived from the single furthest detected corner, so it is a fragile statistic — an
+> earlier calibration run whose view selection happened to include one corner at r = 664 reported
+> 13% instead. The substantive coverage is the same in both: 117–143 corners in the 400–600 band
+> and essentially none beyond it. Read the per-band counts, not the headline percentage.
 
 What survives this caveat, and what does not:
 
 - **Survives:** distortion is real and material in the measured zone. Skipping undistortion cost
   a **9% depth bias** in validation; undistorting brought it to 0.8%. Every board corner in that
   test sits inside r = 592, so it is a measured result, not an extrapolated one.
-- **Does not survive:** any specific claim about how large the distortion is at the frame edges
-  or corners. An earlier draft of this report quoted 5.37 px mean at r 600–900 as a finding; that
-  number is a model artefact, not a measurement.
+- **Does not survive:** treating the 600–900 row as a measurement. It is what the adopted model
+  predicts, and an earlier draft of this report quoted a different model's 5.37 px there as if it
+  were a finding.
 
-**Practical consequence.** Correcting the mono clips with this calibration would apply a large,
-unverified correction exactly where the correction is biggest. That is not obviously better than
-leaving it alone. The fix is a re-recording, not more processing — see §8.
+### 5.1 Choosing the model without re-recording the board
+
+Re-recording the calibration with the board pushed into the corners is the textbook fix, but it
+was not available here. **The stereo pair supplies its own constraint instead:** after
+rectification a correspondence must have `dy = 0`, and that holds at every radius, on the
+surgical footage, including where the board never went.
+
+Four models, the same 120 board views, evaluated on ~11 500 SIFT correspondences from the three
+surgical clips:
+
+| model | board RMS | displacement at r=906 | 0–300 | 300–500 | 500–700 | **700–950** |
+|---|---|---|---|---|---|---|
+| **k1 only** *(adopted)* | 0.519 | **9.5 px** | 0.56 | 0.76 | **1.12** | **1.82** |
+| k1, k2 | 0.519 | 19.6 px | 0.55 | 0.73 | 1.48 | 4.35 |
+| k1, k2 + tangential | 0.516 | 24.9 px | 0.58 | 0.80 | 1.63 | 4.20 |
+| k1, k2, k3 | 0.512 | 39.4 px | 0.59 | 0.78 | 1.34 | 2.85 |
+
+(last four columns: median `|dy|` in px after rectification, by radius in the original frame)
+
+All four fit the board **equally well** — RMS 0.512–0.519 is not a meaningful spread — yet they
+extrapolate to the frame corner across a 4× range. The board cannot distinguish them; the
+surgical footage can, and it selects the simplest by 2.4× exactly where the board was silent.
+The richer models were fitting noise inside r < 600 and paying for it outside.
+
+Crucially the 0–300 column is a tie (0.56 vs 0.55 px): **dropping to k1 costs nothing in the
+image centre**, which is where the metric accuracy matters. The bounded edge behaviour is free.
+
+*Limitation:* `dy` probes the radial model indirectly — depth comes from horizontal disparity.
+Radial distortion couples both, so a model that fixes `dy` at large radius is very likely right
+in `dx` too, but this is evidence, not proof. A direct test would be whether the 8 mm robot-arm
+shaft measures 8 mm at large radius as well as at the centre.
+
+**Practical consequence.** With k1 the peripheral correction is bounded and monotone (max 8.8 px
+at the corner rather than 18–39), and it is the model the surgical data prefers. It is safe to
+apply. Where metric accuracy actually matters, weight the proxy-GT depth loss by radius rather
+than hard-cropping — the centre stays fully supervised and the periphery stops injecting
+geometry that nothing verified.
 
 ---
 
@@ -222,8 +260,8 @@ Right: implied depth distributions on the three surgical clips, from SIFT corres
 
 ```
 3697 corners, Z 44–203 mm
-MAE 0.889 mm    bias −0.212 mm    p95 2.450 mm    rel MAE 0.82%
-epipolar |dy| after rectification: median 0.201 px, p95 0.657 px
+MAE 0.900 mm    bias −0.204 mm    p95 2.474 mm    rel MAE 0.83%
+epipolar |dy| after rectification: median 0.200 px, p95 0.654 px
 ```
 
 This check runs automatically inside `calibrate_stereo_charuco.py` and exits non-zero above
@@ -309,7 +347,7 @@ board against the PDF's "must be exactly 100.0 mm" bar and confirmed **100%** (2
 The metric chain therefore has no unverified scale factor left in it.
 
 **Rectification crops FOV.** `stereoRectify(alpha=0)` raises the effective focal from 1064 to
-1222 px, zooming in to discard invalid border. Annotation points near the frame edge fall outside
+~1220 px, zooming in to discard invalid border. Annotation points near the frame edge fall outside
 and would be dropped — a point at (1240, 980) maps to (1376, 1058), off-frame. With only 1677
 annotated frames carrying the metric scale signal, count the losses before choosing `alpha`.
 
@@ -317,7 +355,7 @@ annotated frames carrying the metric scale signal, count the losses before choos
 
 ## 9. Consequences for the proxy-GT plan
 
-**The proxy GT can be metric.** `Z_mm = 4719.6 / disparity_px` on the rectified pair, validated
+**The proxy GT can be metric.** `Z_mm = 4707.2 / disparity_px` on the rectified pair, validated
 to 0.9 mm. This replaces the scale-and-shift-invariant loss that would otherwise be required, and
 gives a dense alternative to the 1677 sparse hand-annotated segments currently carrying the
 metric scale signal.

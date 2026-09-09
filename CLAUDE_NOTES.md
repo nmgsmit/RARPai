@@ -3,6 +3,39 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-09 - DEPTH 3D: the surgical footage picks the distortion model, no re-record needed
+
+- PROBLEM: the ChArUco clip never reaches past r~592 while the frame corner is at r=906, so 26%
+  of the frame is EXTRAPOLATED and the board cannot choose between distortion models. Nick
+  cannot re-capture the edges.
+- FIX: the stereo pair is its own calibration target out there. After rectification a
+  correspondence must have dy=0, and that holds at EVERY radius on the surgical clips. Four
+  models on the same 120 board views, ~11.5k SIFT correspondences from `../data/3D_ProxyGT`:
+
+  | model | board RMS | displ @ r=906 | med \|dy\| 0-300 | 300-500 | 500-700 | 700-950 |
+  |---|---|---|---|---|---|---|
+  | **k1 only** | 0.519 | **9.5px** | 0.56 | 0.76 | **1.12** | **1.82** |
+  | k1,k2 | 0.519 | 19.6px | 0.55 | 0.73 | 1.48 | 4.35 |
+  | k1,k2+tang | 0.516 | 24.9px | 0.58 | 0.80 | 1.63 | 4.20 |
+  | k1,k2,k3 | 0.512 | 39.4px | 0.59 | 0.78 | 1.34 | 2.85 |
+
+  All fit the BOARD identically (RMS 0.512-0.519) but extrapolate over a 4x range. The richer
+  models fit noise inside r<600 and pay for it outside. k1 wins 2.4x at r=700-950 and TIES in
+  the centre (0.56 vs 0.55) -- the bounded edge behaviour is free.
+- `--dist-model {k1,k1k2,k1k2tang,full}` in `calibrate_stereo_charuco.py`, **default k1**.
+  Re-pinned `calib/stereo_calib.json`: fx 1064.01 fy 1064.27 cx 621.35 cy 535.20, baseline
+  4.1179mm, convergence -96.54px, **Z_mm = 4707.2 / disparity_px**, validation MAE 0.900mm
+  (0.83% rel) -- unchanged from the richer models, so nothing was lost.
+- Distortion now bounded+monotone: 0.04 / 0.39 / 1.58 / 4.13 px mean by radius band, corner max
+  8.8px (was 18-39). Safe to apply.
+- CAVEAT: dy probes the RADIAL model; depth comes from dx. Radial distortion couples both so
+  this is strong evidence, not proof. Direct test would be whether the 8mm robot-arm shaft
+  measures 8mm at large radius too. NOT RUN: the radial distribution of `scale_objects.json`
+  annotations (Snellius kept timing out) -- if the arm points sit inside r=600 the edge question
+  is moot for the metric scale loss.
+- Nick's priority: metric accuracy in the CENTRE. => weight the proxy-GT depth loss by radius
+  rather than hard-cropping the periphery.
+
 ## 2026-09-09 - DEPTH 3D: da Vinci SBS geometry solved + real stereo calibration
 
 - SPECULAR MASK BUG (fixed): "bright + desaturated" (V>240,S<40) also describes a white da Vinci

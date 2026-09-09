@@ -289,7 +289,7 @@ def fig_validation(out, calib, stride):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--calib", default="outputs/stereo_calib/calib.json")
+    ap.add_argument("--calib", default="calib/stereo_calib.json")
     ap.add_argument("--out", default="docs/stereo")
     ap.add_argument("--stride", type=int, default=8, help="frame stride for the validation figure")
     ap.add_argument("--only", help="regenerate one figure by number, e.g. 4")

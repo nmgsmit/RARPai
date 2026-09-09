@@ -159,10 +159,14 @@ def main():
     ap.add_argument("--min-corners", type=int, default=10)
     ap.add_argument("--blur-pct", type=float, default=40.0, help="drop the blurriest N%%")
     ap.add_argument("--max-views", type=int, default=60)
-    ap.add_argument("--free-k3", action="store_true",
-                    help="fit k3. Default fixes it at 0: the board does not reach the frame "
-                         "corners, so a free k3 is unconstrained there and EXTRAPOLATES wildly "
-                         "(two OpenCV versions disagreed 5.4 vs 14.7 px mean at r=600-900).")
+    ap.add_argument("--dist-model", default="k1", choices=["k1", "k1k2", "k1k2tang", "full"],
+                    help="Radial terms to fit. Default k1 ONLY. The board never reaches past "
+                         "r~592 while the frame corner is at r=906, so richer models fit noise "
+                         "inside r<600 and then extrapolate wildly. All four fit the board "
+                         "equally well (RMS 0.512-0.519) but their corner displacement spans "
+                         "9.5 / 19.6 / 24.9 / 39.4 px. The surgical footage breaks the tie via "
+                         "its own epipolar constraint -- median |dy| at r=700-950 is "
+                         "1.82 / 4.35 / 4.20 / 2.85 px. k1 wins where the board could not go.")
     ap.add_argument("--out", default="calib",
                     help="calib/stereo_calib.json is version-controlled on purpose: it is a "
                          "measured physical constant every depth number downstream inherits, "
@@ -194,7 +198,10 @@ def main():
     print("max corner radius %.0f px -> %.0f%% of the frame is EXTRAPOLATED "
           "(frame corner is at ~906)" % (rad.max(), 100 * beyond))
 
-    flags = 0 if a.free_k3 else cv2.CALIB_FIX_K3
+    flags = {"k1": cv2.CALIB_FIX_K2 | cv2.CALIB_FIX_K3 | cv2.CALIB_ZERO_TANGENT_DIST,
+             "k1k2": cv2.CALIB_FIX_K3 | cv2.CALIB_ZERO_TANGENT_DIST,
+             "k1k2tang": cv2.CALIB_FIX_K3,
+             "full": 0}[a.dist_model]
     rmsL, KL, DL, *_ = cv2.calibrateCamera(obj, ptsL, size, None, None, flags=flags)
     rmsR, KR, DR, *_ = cv2.calibrateCamera(obj, ptsR, size, None, None, flags=flags)
     rms, KL, DL, KR, DR, R, T, *_ = cv2.stereoCalibrate(
@@ -222,7 +229,7 @@ def main():
         f_rectified=float(P1[0, 0]),
         stereo_rotation_deg=deg(R), rect_rot_left_deg=deg(R1), rect_rot_right_deg=deg(R2),
         distortion_left=distortion_px(KL, DL), distortion_right=distortion_px(KR, DR),
-        free_k3=bool(a.free_k3), corner_coverage=cover, max_corner_radius=float(rad.max()),
+        dist_model=a.dist_model, corner_coverage=cover, max_corner_radius=float(rad.max()),
         extrapolated_frame_frac=beyond,
         # normalised the way the training code writes K: fx/W, fy/H, cx/W, cy/H
         K_norm_left=[KL[0, 0] / OUT_W, KL[1, 1] / OUT_H, KL[0, 2] / OUT_W, KL[1, 2] / OUT_H],
