@@ -156,6 +156,10 @@ def main():
     ap.add_argument("--min-corners", type=int, default=10)
     ap.add_argument("--blur-pct", type=float, default=40.0, help="drop the blurriest N%%")
     ap.add_argument("--max-views", type=int, default=60)
+    ap.add_argument("--free-k3", action="store_true",
+                    help="fit k3. Default fixes it at 0: the board does not reach the frame "
+                         "corners, so a free k3 is unconstrained there and EXTRAPOLATES wildly "
+                         "(two OpenCV versions disagreed 5.4 vs 14.7 px mean at r=600-900).")
     ap.add_argument("--out", default="outputs/stereo_calib")
     a = ap.parse_args()
 
@@ -171,8 +175,18 @@ def main():
     size = (OUT_W, OUT_H)
     print("calibrating on %d views, %d corner pairs" % (len(views), sum(len(o) for o in obj)))
 
-    rmsL, KL, DL, *_ = cv2.calibrateCamera(obj, ptsL, size, None, None)
-    rmsR, KR, DR, *_ = cv2.calibrateCamera(obj, ptsR, size, None, None)
+    # How far out did the board actually go? Any correction beyond this radius is
+    # extrapolation, and the frame corner is at r=906 from the optical axis.
+    rad = np.concatenate([np.linalg.norm(p - [OUT_W / 2, OUT_H / 2], axis=1) for p in ptsL])
+    cover = [(lo, hi, int(((rad >= lo) & (rad < hi)).sum()))
+             for lo, hi in ((0, 200), (200, 400), (400, 600), (600, 900))]
+    print("corner coverage by radius: " +
+          "  ".join("%d-%d: %d" % (lo, hi, n) for lo, hi, n in cover))
+    print("max corner radius %.0f px (frame corner is at ~906)" % rad.max())
+
+    flags = 0 if a.free_k3 else cv2.CALIB_FIX_K3
+    rmsL, KL, DL, *_ = cv2.calibrateCamera(obj, ptsL, size, None, None, flags=flags)
+    rmsR, KR, DR, *_ = cv2.calibrateCamera(obj, ptsR, size, None, None, flags=flags)
     rms, KL, DL, KR, DR, R, T, *_ = cv2.stereoCalibrate(
         obj, ptsL, ptsR, KL, DL, KR, DR, size,
         flags=cv2.CALIB_FIX_INTRINSIC,
@@ -198,6 +212,7 @@ def main():
         f_rectified=float(P1[0, 0]),
         stereo_rotation_deg=deg(R), rect_rot_left_deg=deg(R1), rect_rot_right_deg=deg(R2),
         distortion_left=distortion_px(KL, DL), distortion_right=distortion_px(KR, DR),
+        free_k3=bool(a.free_k3), corner_coverage=cover, max_corner_radius=float(rad.max()),
         # normalised the way the training code writes K: fx/W, fy/H, cx/W, cy/H
         K_norm_left=[KL[0, 0] / OUT_W, KL[1, 1] / OUT_H, KL[0, 2] / OUT_W, KL[1, 2] / OUT_H],
         K_norm_right=[KR[0, 0] / OUT_W, KR[1, 1] / OUT_H, KR[0, 2] / OUT_W, KR[1, 2] / OUT_H],
