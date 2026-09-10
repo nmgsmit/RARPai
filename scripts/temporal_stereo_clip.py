@@ -79,7 +79,7 @@ def stereo_pass(video, start, seconds, fps, maps, min_disp, num_disp, scale, mat
         if (k + 1) % 10 == 0:
             print("    stereo %3d/%d" % (k + 1, n), flush=True)
     cap.release()
-    return lefts, disps, idx, src_fps, stride
+    return lefts, disps, idx, src_fps, stride, geom
 
 
 # ------------------------------------------------------------------ flow plumbing
@@ -181,30 +181,35 @@ def chain_candidates(t, disps, fwd, bwd, k_max, fb_tol, align):
 
 
 def fuse_frame(own, cands, min_support, mad_tol, temporal_median=False):
-    """-> (fused, filled, med, checkable, support).
+    """-> (fused, filled, med, checkable, support, tight).
 
     Median, not mean: a chain that quietly tracked the wrong point produces an outlier, and with
     4-8 candidates the median ignores it where a mean would split the difference. The MAD gate
     then discards pixels whose candidates never agreed in the first place -- no support, no fill.
+
+    `support` (how many candidates survived the flow gate) and `tight` (did they agree) come back
+    so the REMAINING holes can be attributed: no neighbour had an answer / too few / they
+    disagreed. Without that split there is no way to tell a hard occlusion from a tuning problem.
     """
     own_ok = np.isfinite(own)
     if not cands:
         z = np.zeros(own.shape, bool)
-        return own.copy(), z, np.full_like(own, np.nan), z, np.zeros(own.shape, np.uint8)
+        return own.copy(), z, np.full_like(own, np.nan), z, np.zeros(own.shape, np.uint8), z
     stack = np.stack(cands)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         support = np.isfinite(stack).sum(0).astype(np.uint8)
         med = np.nanmedian(stack, 0)
         mad = np.nanmedian(np.abs(stack - med), 0)
-    good = (support >= min_support) & np.isfinite(med) & (np.nan_to_num(mad, nan=1e9) <= mad_tol)
+    tight = np.isfinite(med) & (np.nan_to_num(mad, nan=1e9) <= mad_tol)
+    good = (support >= min_support) & tight
     fused = np.where(own_ok, own, np.where(good, med, np.nan))
     if temporal_median:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             allmed = np.nanmedian(np.concatenate([stack, own[None]]), 0)
         fused = np.where(own_ok & good, allmed, fused)
-    return fused, good & ~own_ok, med, good & own_ok, support
+    return fused, good & ~own_ok, med, good & own_ok, support, tight
 
 
 # ------------------------------------------------------------------ drawing
@@ -296,11 +301,16 @@ def main():
     os.makedirs(a.out, exist_ok=True)
 
     print("stereo pass: %.1f s from %.1f s at %g fps" % (a.seconds, a.start, a.fps), flush=True)
-    lefts, disps, idx, src_fps, stride = stereo_pass(
+    lefts, disps, idx, src_fps, stride, geom = stereo_pass(
         a.video, a.start, a.seconds, a.fps, maps, a.min_disp, a.num_disp, a.scale, matcher)
     n = len(disps)
     print("  %d frames (source %.2f fps, stride %d -> %.2f fps)"
           % (n, src_fps, stride, src_fps / stride), flush=True)
+    # Ceiling. Outside the rectified overlap, and in the GUI banner, NO method can produce a
+    # depth -- so every percentage below is also reported over `geom`, where the fraction of
+    # holes closed is a fraction of the holes that were ever closable.
+    print("  geometrically valid area: %.1f%% of the frame (the ceiling)"
+          % (100 * geom.mean()), flush=True)
     if n < 3:
         raise SystemExit("need at least 3 frames")
 
@@ -312,9 +322,13 @@ def main():
     rows, fused_all, offs_all, flick, pool = [], [], [], [], []
     for t in range(n):
         cands, offs = chain_candidates(t, disps, fwd, bwd, a.window, a.fb_tol, a.align)
-        fused, filled, med, checkable, support = fuse_frame(
+        fused, filled, med, checkable, support, tight = fuse_frame(
             disps[t], cands, a.min_support, a.mad_tol, a.temporal_median)
         own_ok = np.isfinite(disps[t])
+        rem = geom & ~own_ok & ~filled              # holes that survived, and why
+        why = dict(no_cand=float((rem & (support == 0)).mean()),
+                   thin=float((rem & (support >= 1) & (support < a.min_support)).mean()),
+                   disagree=float((rem & (support >= a.min_support) & ~tight).mean()))
         agree = np.nan
         if checkable.any():
             zo = to_depth(disps[t][checkable], fB)
@@ -333,12 +347,15 @@ def main():
         offs_all.append(offs)
         rows.append(dict(frame=idx[t], own=float(own_ok.mean()),
                          fused=float(np.isfinite(fused).mean()), filled=float(filled.mean()),
-                         agree_mm=agree,
-                         support=float(support[filled].mean()) if filled.any() else 0.0))
+                         own_g=float(own_ok[geom].mean()),
+                         fused_g=float(np.isfinite(fused)[geom].mean()), agree_mm=agree,
+                         support=float(support[filled].mean()) if filled.any() else 0.0,
+                         **{"hole_" + k: v for k, v in why.items()}))
         print("  f%05d  own %5.1f%%  fused %5.1f%%  filled %4.1f%%  agree %s mm"
-              % (idx[t], 100 * rows[-1]["own"], 100 * rows[-1]["fused"],
-                 100 * rows[-1]["filled"], "%5.2f" % agree if np.isfinite(agree) else "   --"),
-              flush=True)
+              "   holes left: %4.1f%% nothing-there  %4.1f%% thin  %4.1f%% disagree"
+              % (idx[t], 100 * rows[-1]["own_g"], 100 * rows[-1]["fused_g"],
+                 100 * rows[-1]["filled"], "%5.2f" % agree if np.isfinite(agree) else "   --",
+                 100 * why["no_cand"], 100 * why["thin"], 100 * why["disagree"]), flush=True)
 
     lo, hi = np.percentile(np.concatenate(pool), [2, 98])
     print("depth range for colour: %.0f..%.0f mm" % (lo, hi), flush=True)
@@ -350,15 +367,15 @@ def main():
         z_own, z_fus = to_depth(disps[t], fB), to_depth(fused_all[t], fB)
         filled = (z_fus > 0) & ~(z_own > 0)
         tsec = (idx[t] - idx[0]) / src_fps
+        vo, vf = 100 * (z_own > 0)[geom].mean(), 100 * (z_fus > 0)[geom].mean()
         m2 = mosaic([(lefts[t], "rectified LEFT  %s  t=%.2fs" % (stem, tsec)),
                      (depth_panel(z_fus, lo, hi),
-                      "temporal stereo depth   valid %.1f%%" % (100 * (z_fus > 0).mean()))],
+                      "temporal stereo depth   %.1f%% of usable area" % vf)],
                     a.panel_scale, lo, hi)
         m3 = mosaic([(lefts[t], "rectified LEFT   t=%.2fs" % tsec),
-                     (depth_panel(z_own, lo, hi),
-                      "single pair   valid %.1f%%" % (100 * (z_own > 0).mean())),
+                     (depth_panel(z_own, lo, hi), "single pair   %.1f%% solved" % vo),
                      (depth_panel(z_fus, lo, hi, tint=filled),
-                      "+ temporal (cyan = filled)   valid %.1f%%" % (100 * (z_fus > 0).mean()))],
+                      "+ temporal (cyan = filled)   %.1f%% solved" % vf)],
                     a.panel_scale, lo, hi)
         if w2 is None:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -376,8 +393,8 @@ def main():
     w2.release()
     w3.release()
 
-    own = np.array([r["own"] for r in rows])
-    fus = np.array([r["fused"] for r in rows])
+    own = np.array([r["own_g"] for r in rows])
+    fus = np.array([r["fused_g"] for r in rows])
     ag = np.array([r["agree_mm"] for r in rows], float)
     off = np.abs(np.concatenate([o for o in offs_all if o]))
     summary = dict(
@@ -385,22 +402,31 @@ def main():
         frames=n, src_fps=src_fps, stride=stride, matcher=a.matcher, scale=a.scale,
         window=a.window, flow_scale=a.flow_scale, fb_tol=a.fb_tol, min_support=a.min_support,
         mad_tol=a.mad_tol, align=a.align, temporal_median=a.temporal_median, f_times_B=fB,
-        colour_range_mm=[float(lo), float(hi)],
+        colour_range_mm=[float(lo), float(hi)], geom_frac=float(geom.mean()),
+        note="valid_* are fractions of the geometrically usable area, not of the whole frame",
         valid_single=float(own.mean()), valid_single_p10=float(np.percentile(own, 10)),
         valid_fused=float(fus.mean()), valid_fused_p10=float(np.percentile(fus, 10)),
         valid_gain=float(fus.mean() - own.mean()),
         holes_closed=float((fus.mean() - own.mean()) / max(1e-9, 1 - own.mean())),
         agree_mm_median=float(np.nanmedian(ag)),
+        holes_left_no_candidate=float(np.mean([r["hole_no_cand"] for r in rows])),
+        holes_left_thin=float(np.mean([r["hole_thin"] for r in rows])),
+        holes_left_disagree=float(np.mean([r["hole_disagree"] for r in rows])),
         align_offset_px_median=float(np.median(off)) if off.size else None,
         align_offset_px_p95=float(np.percentile(off, 95)) if off.size else None,
         flicker_mm_median=float(np.median(flick)) if flick else None,
         per_frame=rows)
     with open(os.path.join(a.out, "stats.json"), "w") as fh:
         json.dump(summary, fh, indent=2)
-    print("\nsingle pair  valid %.1f%% (p10 %.1f%%)"
+    print("\n(percentages below are of the %.1f%% of the frame that is geometrically usable)"
+          % (100 * geom.mean()))
+    print("single pair  valid %.1f%% (p10 %.1f%%)"
           % (100 * own.mean(), 100 * np.percentile(own, 10)))
     print("+ temporal   valid %.1f%% (p10 %.1f%%)  -> %.0f%% of the holes closed"
           % (100 * fus.mean(), 100 * np.percentile(fus, 10), 100 * summary["holes_closed"]))
+    print("holes left: %.1f%% of frame no neighbour had one, %.1f%% too few, %.1f%% disagreed"
+          % (100 * summary["holes_left_no_candidate"], 100 * summary["holes_left_thin"],
+             100 * summary["holes_left_disagree"]))
     print("leave-one-out agreement (optimistic bound): median %.2f mm"
           % summary["agree_mm_median"])
     if summary["align_offset_px_median"] is not None:
