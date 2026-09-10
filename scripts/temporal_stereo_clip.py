@@ -28,6 +28,7 @@ from the frame itself. Where the own-frame stereo is *also* valid the two can be
 are, by construction, easier than the pixels being filled.
 """
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -43,6 +44,42 @@ from make_stereo_proxy_gt import (DEPTH_SCALE, colorize, ffs_matcher, match,   #
 
 
 # ------------------------------------------------------------------ per-frame stereo
+
+def cache_key(video, fields):
+    """Cache identity = the clip plus everything that changes the DISPARITY. Fusion knobs are
+    deliberately not in it: sweeping them is the whole point of having the cache."""
+    blob = json.dumps([os.path.basename(video)] + [round(f, 6) if isinstance(f, float) else f
+                                                   for f in fields], sort_keys=True)
+    return hashlib.blake2b(blob.encode(), digest_size=8).hexdigest()
+
+
+def load_cache(d):
+    man = os.path.join(d, "manifest.json")
+    if not os.path.isfile(man):
+        return None
+    with open(man) as fh:
+        m = json.load(fh)
+    lefts, disps = [], []
+    for i in m["idx"]:
+        p = os.path.join(d, "%07d" % i)
+        if not (os.path.isfile(p + "_left.png") and os.path.isfile(p + "_disp.npy")):
+            return None
+        lefts.append(cv2.imread(p + "_left.png"))
+        disps.append(np.load(p + "_disp.npy").astype(np.float32))
+    return lefts, disps, m["idx"], m["src_fps"], m["stride"]
+
+
+def save_cache(d, lefts, disps, idx, src_fps, stride):
+    os.makedirs(d, exist_ok=True)
+    for l, dp, i in zip(lefts, disps, idx):
+        p = os.path.join(d, "%07d" % i)
+        cv2.imwrite(p + "_left.png", l)
+        # float16: disparity here is 16..208 px, so the step is <=0.125 px, which at the
+        # shortest working distance is 0.015 mm of depth -- far below the ~1 mm calibration.
+        np.save(p + "_disp.npy", dp.astype(np.float16))
+    with open(os.path.join(d, "manifest.json"), "w") as fh:
+        json.dump(dict(idx=idx, src_fps=src_fps, stride=stride), fh)
+
 
 def stereo_pass(video, start, seconds, fps, maps, min_disp, num_disp, scale, matcher):
     """Sample a window at `fps` and run the ordinary single-pair pipeline on every frame.
@@ -159,6 +196,7 @@ def chain_candidates(t, disps, fwd, bwd, k_max, fb_tol, align):
     n = len(disps)
     h, w = disps[t].shape
     cands, offs = [], []
+    raw = np.zeros((h, w), np.uint8)        # candidates that HAD a value, before the flow gate
     for step, ahead, back in ((+1, fwd, bwd), (-1, bwd, fwd)):
         f = r = None
         for k in range(1, k_max + 1):
@@ -172,12 +210,13 @@ def chain_candidates(t, disps, fwd, bwd, k_max, fb_tol, align):
             keep = cv2.resize(((err <= fb_tol) & inb).astype(np.uint8), (w, h),
                               interpolation=cv2.INTER_NEAREST) > 0
             d = sample_nan(disps[s], upflow(f.copy(), w, h))
+            raw += np.isfinite(d)
             d[~keep] = np.nan
             both = np.isfinite(d) & np.isfinite(disps[t])
             off = float(np.median(disps[t][both] - d[both])) if both.sum() > 1000 else 0.0
             offs.append(off)
             cands.append(d + off if align else d)
-    return cands, offs
+    return cands, offs, raw
 
 
 def fuse_frame(own, cands, min_support, mad_tol, temporal_median=False):
@@ -221,35 +260,36 @@ def label(panel, text, size=0.62):
     return t
 
 
-def color_bar(lo, hi, width, height=26):
-    grad = np.linspace(1 / lo, 1 / hi, max(40, width - 160))[None, :].repeat(height, 0)
-    bar = colorize(grad, 1 / hi, 1 / lo)
-    bar = cv2.copyMakeBorder(bar, 8, 24, 80, 80, cv2.BORDER_CONSTANT, value=(20, 20, 20))
+def color_bar(lo, hi, width, cmap, height=26):
+    pad = 90
+    grad = np.linspace(1 / lo, 1 / hi, max(40, width - 2 * pad))[None, :].repeat(height, 0)
+    bar = colorize(grad, 1 / hi, 1 / lo, cmap)
+    bar = cv2.copyMakeBorder(bar, 8, 24, pad, pad, cv2.BORDER_CONSTANT, value=(20, 20, 20))
     for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         mm = 1.0 / (1 / lo + frac * (1 / hi - 1 / lo))
-        x = int(80 + frac * (width - 160))
-        cv2.putText(bar, "%.0f" % mm, (x - 13, height + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+        txt = "%.0f mm" % mm if frac == 1.0 else "%.0f" % mm
+        (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.48, 1)
+        x = int(pad + frac * (width - 2 * pad) - (tw if frac == 1.0 else tw // 2))
+        cv2.putText(bar, txt, (x, height + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
                     (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(bar, "mm", (bar.shape[1] - 72, height + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
-                (255, 255, 255), 1, cv2.LINE_AA)
     return bar if bar.shape[1] == width else cv2.resize(bar, (width, bar.shape[0]))
 
 
-def depth_panel(z, lo, hi, tint=None):
-    """Inverse-depth colour so NEAR = bright, matching gui_depth_measure. FIXED lo/hi for the
-    whole clip -- a per-frame percentile stretch makes the video flicker and hides real depth
-    change behind renormalisation."""
+def depth_panel(z, lo, hi, cmap, tint=None):
+    """Colour is INVERSE depth (near = the warm end, matching gui_depth_measure) on a range
+    FIXED for the whole clip -- a per-frame percentile stretch makes the video flicker and hides
+    real depth change behind renormalisation. Unsolved pixels stay black."""
     ok = z > 0
-    heat = colorize(np.where(ok, 1.0 / np.maximum(z, 1e-6), np.nan), 1 / hi, 1 / lo)
+    heat = colorize(np.where(ok, 1.0 / np.maximum(z, 1e-6), np.nan), 1 / hi, 1 / lo, cmap)
     if tint is not None and tint.any():
-        heat[tint] = (0.45 * heat[tint] + 0.55 * np.array([0, 255, 255])).astype(np.uint8)
+        heat[tint] = (0.35 * heat[tint] + 0.65 * np.array([255, 255, 255])).astype(np.uint8)
     return heat
 
 
-def mosaic(panels, scale, lo, hi):
+def mosaic(panels, scale, lo, hi, cmap):
     row = np.hstack([label(cv2.resize(p, (int(OUT_W * scale), int(OUT_H * scale))), txt)
                      for p, txt in panels])
-    return np.vstack([row, color_bar(lo, hi, row.shape[1])])
+    return np.vstack([row, color_bar(lo, hi, row.shape[1], cmap)])
 
 
 def to_depth(disp, fB):
@@ -287,22 +327,45 @@ def main():
     ap.add_argument("--temporal-median", action="store_true",
                     help="also replace VALID own pixels by the temporal median (de-flicker)")
     ap.add_argument("--panel-scale", type=float, default=0.46)
+    ap.add_argument("--cmap", default="turbo", choices=["turbo", "magma"],
+                    help="turbo separates the mid range this scene actually occupies; magma is "
+                         "the gui_depth_measure convention")
+    ap.add_argument("--pct", type=float, nargs=2, default=(2.0, 97.0),
+                    help="percentiles of the clip's own depths that set the fixed colour range")
+    ap.add_argument("--cache-dir", default="outputs/temporal_stereo/_disp_cache")
+    ap.add_argument("--no-cache", dest="cache", action="store_false")
     ap.add_argument("--save-depth", action="store_true",
                     help="write uint16 mm*16 PNGs in the proxy-GT layout")
     a = ap.parse_args()
 
-    matcher = sgbm_matcher
-    if a.matcher == "ffs":
-        matcher = ffs_matcher(a.ffs_root, a.ffs_model, a.ffs_iters, a.num_disp)
     with open(a.calib) as fh:
         cal = json.load(fh)
     fB = cal["f_times_B_rectified"]
     maps = (rect_maps(cal, False), rect_maps(cal, True))
     os.makedirs(a.out, exist_ok=True)
+    cmap = dict(turbo=cv2.COLORMAP_TURBO, magma=cv2.COLORMAP_MAGMA)[a.cmap]
+    geom = maps[0][2] & maps[1][2]
 
-    print("stereo pass: %.1f s from %.1f s at %g fps" % (a.seconds, a.start, a.fps), flush=True)
-    lefts, disps, idx, src_fps, stride, geom = stereo_pass(
-        a.video, a.start, a.seconds, a.fps, maps, a.min_disp, a.num_disp, a.scale, matcher)
+    # The matcher is ~95% of the runtime and depends on none of the fusion knobs, so its output
+    # is cached: a window/tolerance sweep then costs seconds on a CPU node instead of a GPU job.
+    cdir = os.path.join(a.cache_dir, cache_key(a.video, [a.start, a.seconds, a.fps, a.matcher,
+                                                         a.scale, a.min_disp, a.num_disp,
+                                                         a.ffs_iters if a.matcher == "ffs" else 0]))
+    hit = load_cache(cdir) if a.cache else None
+    if hit:
+        lefts, disps, idx, src_fps, stride = hit
+        print("stereo pass: %d frames from cache %s" % (len(disps), cdir), flush=True)
+    else:
+        matcher = sgbm_matcher
+        if a.matcher == "ffs":
+            matcher = ffs_matcher(a.ffs_root, a.ffs_model, a.ffs_iters, a.num_disp)
+        print("stereo pass: %.1f s from %.1f s at %g fps" % (a.seconds, a.start, a.fps),
+              flush=True)
+        lefts, disps, idx, src_fps, stride, geom = stereo_pass(
+            a.video, a.start, a.seconds, a.fps, maps, a.min_disp, a.num_disp, a.scale, matcher)
+        if a.cache:
+            save_cache(cdir, lefts, disps, idx, src_fps, stride)
+            print("  cached to %s" % cdir, flush=True)
     n = len(disps)
     print("  %d frames (source %.2f fps, stride %d -> %.2f fps)"
           % (n, src_fps, stride, src_fps / stride), flush=True)
@@ -321,12 +384,16 @@ def main():
           % (a.window, a.fb_tol, a.min_support, a.mad_tol, a.align), flush=True)
     rows, fused_all, offs_all, flick, pool = [], [], [], [], []
     for t in range(n):
-        cands, offs = chain_candidates(t, disps, fwd, bwd, a.window, a.fb_tol, a.align)
+        cands, offs, raw = chain_candidates(t, disps, fwd, bwd, a.window, a.fb_tol, a.align)
         fused, filled, med, checkable, support, tight = fuse_frame(
             disps[t], cands, a.min_support, a.mad_tol, a.temporal_median)
         own_ok = np.isfinite(disps[t])
-        rem = geom & ~own_ok & ~filled              # holes that survived, and why
-        why = dict(no_cand=float((rem & (support == 0)).mean()),
+        # Why each surviving hole survived. `blind` is the honest floor -- no frame in the
+        # window had an answer at that scene point, so no amount of tuning reaches it. The
+        # other three are knobs: the flow gate, --min-support, --mad-tol.
+        rem = geom & ~own_ok & ~filled
+        why = dict(blind=float((rem & (raw == 0)).mean()),
+                   flow=float((rem & (raw > 0) & (support == 0)).mean()),
                    thin=float((rem & (support >= 1) & (support < a.min_support)).mean()),
                    disagree=float((rem & (support >= a.min_support) & ~tight).mean()))
         agree = np.nan
@@ -352,12 +419,13 @@ def main():
                          support=float(support[filled].mean()) if filled.any() else 0.0,
                          **{"hole_" + k: v for k, v in why.items()}))
         print("  f%05d  own %5.1f%%  fused %5.1f%%  filled %4.1f%%  agree %s mm"
-              "   holes left: %4.1f%% nothing-there  %4.1f%% thin  %4.1f%% disagree"
+              "   left: %4.1f%% blind %4.1f%% flow %4.1f%% thin %4.1f%% disagree"
               % (idx[t], 100 * rows[-1]["own_g"], 100 * rows[-1]["fused_g"],
                  100 * rows[-1]["filled"], "%5.2f" % agree if np.isfinite(agree) else "   --",
-                 100 * why["no_cand"], 100 * why["thin"], 100 * why["disagree"]), flush=True)
+                 100 * why["blind"], 100 * why["flow"], 100 * why["thin"],
+                 100 * why["disagree"]), flush=True)
 
-    lo, hi = np.percentile(np.concatenate(pool), [2, 98])
+    lo, hi = np.percentile(np.concatenate(pool), list(a.pct))
     print("depth range for colour: %.0f..%.0f mm" % (lo, hi), flush=True)
 
     stem = os.path.splitext(os.path.basename(a.video))[0][-24:]
@@ -369,14 +437,14 @@ def main():
         tsec = (idx[t] - idx[0]) / src_fps
         vo, vf = 100 * (z_own > 0)[geom].mean(), 100 * (z_fus > 0)[geom].mean()
         m2 = mosaic([(lefts[t], "rectified LEFT  %s  t=%.2fs" % (stem, tsec)),
-                     (depth_panel(z_fus, lo, hi),
-                      "temporal stereo depth   %.1f%% of usable area" % vf)],
-                    a.panel_scale, lo, hi)
+                     (depth_panel(z_fus, lo, hi, cmap),
+                      "temporal stereo depth   %.1f%% of the frame solved" % vf)],
+                    a.panel_scale, lo, hi, cmap)
         m3 = mosaic([(lefts[t], "rectified LEFT   t=%.2fs" % tsec),
-                     (depth_panel(z_own, lo, hi), "single pair   %.1f%% solved" % vo),
-                     (depth_panel(z_fus, lo, hi, tint=filled),
-                      "+ temporal (cyan = filled)   %.1f%% solved" % vf)],
-                    a.panel_scale, lo, hi)
+                     (depth_panel(z_own, lo, hi, cmap), "single pair   %.1f%% solved" % vo),
+                     (depth_panel(z_fus, lo, hi, cmap, tint=filled),
+                      "+ temporal (white = filled)   %.1f%% solved" % vf)],
+                    a.panel_scale, lo, hi, cmap)
         if w2 is None:
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             w2 = cv2.VideoWriter(two, fourcc, a.fps, (m2.shape[1], m2.shape[0]))
@@ -409,7 +477,8 @@ def main():
         valid_gain=float(fus.mean() - own.mean()),
         holes_closed=float((fus.mean() - own.mean()) / max(1e-9, 1 - own.mean())),
         agree_mm_median=float(np.nanmedian(ag)),
-        holes_left_no_candidate=float(np.mean([r["hole_no_cand"] for r in rows])),
+        holes_left_blind=float(np.mean([r["hole_blind"] for r in rows])),
+        holes_left_flow=float(np.mean([r["hole_flow"] for r in rows])),
         holes_left_thin=float(np.mean([r["hole_thin"] for r in rows])),
         holes_left_disagree=float(np.mean([r["hole_disagree"] for r in rows])),
         align_offset_px_median=float(np.median(off)) if off.size else None,
@@ -424,9 +493,10 @@ def main():
           % (100 * own.mean(), 100 * np.percentile(own, 10)))
     print("+ temporal   valid %.1f%% (p10 %.1f%%)  -> %.0f%% of the holes closed"
           % (100 * fus.mean(), 100 * np.percentile(fus, 10), 100 * summary["holes_closed"]))
-    print("holes left: %.1f%% of frame no neighbour had one, %.1f%% too few, %.1f%% disagreed"
-          % (100 * summary["holes_left_no_candidate"], 100 * summary["holes_left_thin"],
-             100 * summary["holes_left_disagree"]))
+    print("holes left (%% of frame): %.1f blind (no frame in the window saw it), "
+          "%.1f flow-gated, %.1f too few, %.1f disagreed"
+          % (100 * summary["holes_left_blind"], 100 * summary["holes_left_flow"],
+             100 * summary["holes_left_thin"], 100 * summary["holes_left_disagree"]))
     print("leave-one-out agreement (optimistic bound): median %.2f mm"
           % summary["agree_mm_median"])
     if summary["align_offset_px_median"] is not None:
