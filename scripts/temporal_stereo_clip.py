@@ -1,0 +1,416 @@
+"""Temporal stereo: fill the holes ONE pair cannot see, using the neighbouring frames.
+
+A single stereo pair leaves ~18% of the frame undetermined (measured: C-Fast-FoundationStereo
+plus the left-right check, on the da Vinci SBS stills). Those holes are not noise -- they are
+occlusions, specular highlights and textureless blood-covered tissue, i.e. places where *this*
+pair carries no correspondence at all. But the endoscope and the tissue move, so a pixel with no
+answer now very often had one 100 ms ago. This script transfers it along optical flow:
+
+    20 fps window -> per-frame disparity (with holes) -> DIS flow chains -> temporal fusion
+
+    python scripts/temporal_stereo_clip.py --video ../data/3D_ProxyGT/<clip>.mp4 \
+        --start 12 --seconds 5 --matcher ffs --out outputs/temporal_stereo/demo
+
+WHAT IS ASSUMED. Warping a neighbour's disparity into this frame assumes the tracked scene
+point's DEPTH is unchanged over |dt| <= window/fps. That is false under camera motion (a 1 mm
+push moves every depth by 1 mm), which is why --align-median exists: the median own-vs-warped
+disparity offset is removed before fusing, so a global push/pull cannot bias the fill. What
+survives is the local *shape*, which is exactly what the holes are missing.
+
+WHY NOT JUST INPAINT THE HOLES. Because that invents geometry. Every filled pixel here comes
+from a real stereo correspondence in another frame, gated by (a) forward-backward flow
+consistency, (b) at least --min-support independent frames agreeing, (c) their spread being
+tight. A filled pixel is a measurement moved, not a guess.
+
+HOW THE QUALITY IS MEASURED (leave-one-out). The fusion is computed from neighbours ONLY, never
+from the frame itself. Where the own-frame stereo is *also* valid the two can be compared -- the
+"agree" column. It is an OPTIMISTIC bound on fill quality: pixels where own stereo succeeded
+are, by construction, easier than the pixels being filled.
+"""
+import argparse
+import json
+import os
+import sys
+import warnings
+
+import cv2
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from calibrate_stereo_charuco import OUT_W, OUT_H                              # noqa: E402
+from make_stereo_proxy_gt import (DEPTH_SCALE, colorize, ffs_matcher, match,   # noqa: E402
+                                  rect_maps, sgbm_matcher, specular_mask)
+
+
+# ------------------------------------------------------------------ per-frame stereo
+
+def stereo_pass(video, start, seconds, fps, maps, min_disp, num_disp, scale, matcher):
+    """Sample a window at `fps` and run the ordinary single-pair pipeline on every frame.
+
+    Frames are read SEQUENTIALLY (grab-and-skip) rather than by seeking each index: on H.264 a
+    per-frame seek re-decodes from the previous keyframe, and this window is contiguous anyway.
+    """
+    (mxL, myL, vL), (mxR, myR, vR) = maps
+    geom = vL & vR
+    cap = cv2.VideoCapture(video)
+    if not cap.isOpened():
+        raise SystemExit("cannot open %s" % video)
+    src_fps = cap.get(cv2.CAP_PROP_FPS) or 59.94
+    stride = max(1, int(round(src_fps / fps)))
+    i0 = int(round(start * src_fps))
+    n = max(1, int(round(seconds * src_fps / stride)))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, i0)
+    lefts, disps, idx = [], [], []
+    for k in range(n):
+        if k:
+            for _ in range(stride - 1):
+                cap.grab()
+        ok, fr = cap.read()
+        if not ok or fr.shape[1] != 1920:
+            break
+        left = cv2.remap(fr, mxL, myL, cv2.INTER_CUBIC)
+        right = cv2.remap(fr, mxR, myR, cv2.INTER_CUBIC)
+        d = match(matcher, left, right, min_disp, num_disp, scale)
+        d[~geom] = np.nan
+        d[specular_mask(left)] = np.nan
+        lefts.append(left)
+        disps.append(d.astype(np.float32))
+        idx.append(i0 + k * stride)
+        if (k + 1) % 10 == 0:
+            print("    stereo %3d/%d" % (k + 1, n), flush=True)
+    cap.release()
+    return lefts, disps, idx, src_fps, stride
+
+
+# ------------------------------------------------------------------ flow plumbing
+
+def _grid(shape):
+    h, w = shape[:2]
+    return np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+
+
+def dense_flows(grays, scale):
+    """Consecutive DIS flows, forward and backward, at `scale` of full resolution.
+
+    Half resolution on purpose: the flow FIELD only has to say which scene point a pixel is, and
+    it is smooth; the disparity it carries is sampled at full resolution. DIS rather than
+    Farneback -- same opencv main module, no new dependency, and several times faster at this
+    size, which matters because a 5 s window needs 2*(N-1) flows.
+    """
+    dis = cv2.DISOpticalFlow_create(cv2.DISOPTICAL_FLOW_PRESET_MEDIUM)
+    dis.setUseSpatialPropagation(True)
+    sm = [cv2.resize(g, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) for g in grays]
+    fwd = [dis.calc(sm[i], sm[i + 1], None) for i in range(len(sm) - 1)]
+    bwd = [dis.calc(sm[i + 1], sm[i], None) for i in range(len(sm) - 1)]
+    return fwd, bwd
+
+
+def compose(f1, f2):
+    """flow a->b composed with flow b->c  ->  flow a->c, i.e. f1(p) + f2(p + f1(p))."""
+    gx, gy = _grid(f1.shape)
+    return f1 + cv2.remap(f2, gx + f1[..., 0], gy + f1[..., 1], cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+def fb_error(f, r):
+    """Round-trip error of a chain: f is t->s, r is s->t. Also returns the in-bounds mask.
+
+    This is the occlusion detector. Where the scene point genuinely is not visible in frame s,
+    the flow lands on whatever occluded it, and the way back does not return to where it
+    started -- so the disparity that would be carried over is rejected before it is used.
+    """
+    h, w = f.shape[:2]
+    gx, gy = _grid(f.shape)
+    mx, my = gx + f[..., 0], gy + f[..., 1]
+    e = f + cv2.remap(r, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    inb = (mx >= 0) & (mx <= w - 1) & (my >= 0) & (my <= h - 1)
+    return np.hypot(e[..., 0], e[..., 1]), inb
+
+
+def upflow(flow, w, h):
+    f = cv2.resize(flow, (w, h), interpolation=cv2.INTER_LINEAR)
+    f[..., 0] *= w / float(flow.shape[1])
+    f[..., 1] *= h / float(flow.shape[0])
+    return f
+
+
+def sample_nan(field, flow):
+    """Sample `field` at p + flow(p). NaN-safe: normalised interpolation, and a pixel is only
+    accepted when ALL FOUR source neighbours were valid -- otherwise a hole's edge bleeds a
+    plausible-looking value one pixel outwards on every hop."""
+    gx, gy = _grid(flow.shape)
+    mx, my = gx + flow[..., 0], gy + flow[..., 1]
+    ok = np.isfinite(field).astype(np.float32)
+    v = cv2.remap(np.nan_to_num(field), mx, my, cv2.INTER_LINEAR,
+                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    w = cv2.remap(ok, mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return np.where(w > 0.999, v / np.maximum(w, 1e-6), np.nan)
+
+
+# ------------------------------------------------------------------ temporal fusion
+
+def chain_candidates(t, disps, fwd, bwd, k_max, fb_tol, align):
+    """Every neighbour's disparity warped into frame t, gated by flow consistency.
+
+    Chains are built INCREMENTALLY -- t->t+k is (t->t+k-1) composed with the next one-step flow
+    -- so a +-k window costs O(k) composes, not O(k^2). Both directions of every chain are kept
+    because the round-trip check in `fb_error` is what rejects occlusions.
+    """
+    n = len(disps)
+    h, w = disps[t].shape
+    cands, offs = [], []
+    for step, ahead, back in ((+1, fwd, bwd), (-1, bwd, fwd)):
+        f = r = None
+        for k in range(1, k_max + 1):
+            s = t + step * k
+            if not 0 <= s < n:
+                break
+            j = t + k - 1 if step > 0 else t - k        # index of the one-step flow to append
+            f = ahead[j] if k == 1 else compose(f, ahead[j])
+            r = back[j] if k == 1 else compose(back[j], r)
+            err, inb = fb_error(f, r)
+            keep = cv2.resize(((err <= fb_tol) & inb).astype(np.uint8), (w, h),
+                              interpolation=cv2.INTER_NEAREST) > 0
+            d = sample_nan(disps[s], upflow(f.copy(), w, h))
+            d[~keep] = np.nan
+            both = np.isfinite(d) & np.isfinite(disps[t])
+            off = float(np.median(disps[t][both] - d[both])) if both.sum() > 1000 else 0.0
+            offs.append(off)
+            cands.append(d + off if align else d)
+    return cands, offs
+
+
+def fuse_frame(own, cands, min_support, mad_tol, temporal_median=False):
+    """-> (fused, filled, med, checkable, support).
+
+    Median, not mean: a chain that quietly tracked the wrong point produces an outlier, and with
+    4-8 candidates the median ignores it where a mean would split the difference. The MAD gate
+    then discards pixels whose candidates never agreed in the first place -- no support, no fill.
+    """
+    own_ok = np.isfinite(own)
+    if not cands:
+        z = np.zeros(own.shape, bool)
+        return own.copy(), z, np.full_like(own, np.nan), z, np.zeros(own.shape, np.uint8)
+    stack = np.stack(cands)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        support = np.isfinite(stack).sum(0).astype(np.uint8)
+        med = np.nanmedian(stack, 0)
+        mad = np.nanmedian(np.abs(stack - med), 0)
+    good = (support >= min_support) & np.isfinite(med) & (np.nan_to_num(mad, nan=1e9) <= mad_tol)
+    fused = np.where(own_ok, own, np.where(good, med, np.nan))
+    if temporal_median:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            allmed = np.nanmedian(np.concatenate([stack, own[None]]), 0)
+        fused = np.where(own_ok & good, allmed, fused)
+    return fused, good & ~own_ok, med, good & own_ok, support
+
+
+# ------------------------------------------------------------------ drawing
+
+def label(panel, text, size=0.62):
+    t = cv2.copyMakeBorder(panel, 38, 8, 8, 8, cv2.BORDER_CONSTANT, value=(20, 20, 20))
+    cv2.putText(t, text, (14, 26), cv2.FONT_HERSHEY_SIMPLEX, size, (255, 255, 255), 1,
+                cv2.LINE_AA)
+    return t
+
+
+def color_bar(lo, hi, width, height=26):
+    grad = np.linspace(1 / lo, 1 / hi, max(40, width - 160))[None, :].repeat(height, 0)
+    bar = colorize(grad, 1 / hi, 1 / lo)
+    bar = cv2.copyMakeBorder(bar, 8, 24, 80, 80, cv2.BORDER_CONSTANT, value=(20, 20, 20))
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        mm = 1.0 / (1 / lo + frac * (1 / hi - 1 / lo))
+        x = int(80 + frac * (width - 160))
+        cv2.putText(bar, "%.0f" % mm, (x - 13, height + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(bar, "mm", (bar.shape[1] - 72, height + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                (255, 255, 255), 1, cv2.LINE_AA)
+    return bar if bar.shape[1] == width else cv2.resize(bar, (width, bar.shape[0]))
+
+
+def depth_panel(z, lo, hi, tint=None):
+    """Inverse-depth colour so NEAR = bright, matching gui_depth_measure. FIXED lo/hi for the
+    whole clip -- a per-frame percentile stretch makes the video flicker and hides real depth
+    change behind renormalisation."""
+    ok = z > 0
+    heat = colorize(np.where(ok, 1.0 / np.maximum(z, 1e-6), np.nan), 1 / hi, 1 / lo)
+    if tint is not None and tint.any():
+        heat[tint] = (0.45 * heat[tint] + 0.55 * np.array([0, 255, 255])).astype(np.uint8)
+    return heat
+
+
+def mosaic(panels, scale, lo, hi):
+    row = np.hstack([label(cv2.resize(p, (int(OUT_W * scale), int(OUT_H * scale))), txt)
+                     for p, txt in panels])
+    return np.vstack([row, color_bar(lo, hi, row.shape[1])])
+
+
+def to_depth(disp, fB):
+    with np.errstate(divide="ignore", invalid="ignore"):
+        z = fB / disp
+    return np.where(np.isfinite(z) & (z > 0), z, 0.0)
+
+
+# ------------------------------------------------------------------ main
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--calib", default="calib/stereo_calib.json")
+    ap.add_argument("--video", required=True)
+    ap.add_argument("--out", default="outputs/temporal_stereo/demo")
+    ap.add_argument("--start", type=float, default=0.0, help="seconds into the clip")
+    ap.add_argument("--seconds", type=float, default=5.0)
+    ap.add_argument("--fps", type=float, default=20.0)
+    ap.add_argument("--min-disp", type=int, default=16)
+    ap.add_argument("--num-disp", type=int, default=192)
+    ap.add_argument("--scale", type=float, default=0.5, help="matcher resolution, see proxy GT")
+    ap.add_argument("--matcher", default="ffs", choices=["sgbm", "ffs"])
+    ap.add_argument("--ffs-root", default="~/Fast-FoundationStereo")
+    ap.add_argument("--ffs-model",
+                    default="~/Fast-FoundationStereo/weights/c-fast/model_best_bp2_serialize.pth")
+    ap.add_argument("--ffs-iters", type=int, default=8)
+    ap.add_argument("--window", type=int, default=4,
+                    help="+-k frames fused (4 = +-0.2 s at 20 fps)")
+    ap.add_argument("--flow-scale", type=float, default=0.5)
+    ap.add_argument("--fb-tol", type=float, default=1.5, help="px round-trip flow error allowed")
+    ap.add_argument("--min-support", type=int, default=2, help="neighbours that must agree")
+    ap.add_argument("--mad-tol", type=float, default=1.5, help="px spread allowed among them")
+    ap.add_argument("--no-align", dest="align", action="store_false",
+                    help="do NOT remove the median own-vs-warped disparity offset")
+    ap.add_argument("--temporal-median", action="store_true",
+                    help="also replace VALID own pixels by the temporal median (de-flicker)")
+    ap.add_argument("--panel-scale", type=float, default=0.46)
+    ap.add_argument("--save-depth", action="store_true",
+                    help="write uint16 mm*16 PNGs in the proxy-GT layout")
+    a = ap.parse_args()
+
+    matcher = sgbm_matcher
+    if a.matcher == "ffs":
+        matcher = ffs_matcher(a.ffs_root, a.ffs_model, a.ffs_iters, a.num_disp)
+    with open(a.calib) as fh:
+        cal = json.load(fh)
+    fB = cal["f_times_B_rectified"]
+    maps = (rect_maps(cal, False), rect_maps(cal, True))
+    os.makedirs(a.out, exist_ok=True)
+
+    print("stereo pass: %.1f s from %.1f s at %g fps" % (a.seconds, a.start, a.fps), flush=True)
+    lefts, disps, idx, src_fps, stride = stereo_pass(
+        a.video, a.start, a.seconds, a.fps, maps, a.min_disp, a.num_disp, a.scale, matcher)
+    n = len(disps)
+    print("  %d frames (source %.2f fps, stride %d -> %.2f fps)"
+          % (n, src_fps, stride, src_fps / stride), flush=True)
+    if n < 3:
+        raise SystemExit("need at least 3 frames")
+
+    print("flow pass: %d DIS flows at scale %g" % (2 * (n - 1), a.flow_scale), flush=True)
+    fwd, bwd = dense_flows([cv2.cvtColor(l, cv2.COLOR_BGR2GRAY) for l in lefts], a.flow_scale)
+
+    print("fusion: window +-%d, fb-tol %.1f px, min-support %d, mad-tol %.1f px, align=%s"
+          % (a.window, a.fb_tol, a.min_support, a.mad_tol, a.align), flush=True)
+    rows, fused_all, offs_all, flick, pool = [], [], [], [], []
+    for t in range(n):
+        cands, offs = chain_candidates(t, disps, fwd, bwd, a.window, a.fb_tol, a.align)
+        fused, filled, med, checkable, support = fuse_frame(
+            disps[t], cands, a.min_support, a.mad_tol, a.temporal_median)
+        own_ok = np.isfinite(disps[t])
+        agree = np.nan
+        if checkable.any():
+            zo = to_depth(disps[t][checkable], fB)
+            zm = to_depth(np.maximum(med[checkable], 1e-6), fB)
+            agree = float(np.median(np.abs(zo - zm)))
+        if t:                                   # 1-frame depth jitter, measured along the flow
+            prev = sample_nan(disps[t - 1], upflow(bwd[t - 1].copy(), OUT_W, OUT_H))
+            b = np.isfinite(prev) & own_ok
+            if b.sum() > 1000:
+                flick.append(float(np.median(np.abs(to_depth(disps[t][b], fB)
+                                                    - to_depth(prev[b], fB)))))
+        z = to_depth(fused, fB)
+        if (z > 0).any():
+            pool.append(z[z > 0][::37])
+        fused_all.append(fused.astype(np.float32))
+        offs_all.append(offs)
+        rows.append(dict(frame=idx[t], own=float(own_ok.mean()),
+                         fused=float(np.isfinite(fused).mean()), filled=float(filled.mean()),
+                         agree_mm=agree,
+                         support=float(support[filled].mean()) if filled.any() else 0.0))
+        print("  f%05d  own %5.1f%%  fused %5.1f%%  filled %4.1f%%  agree %s mm"
+              % (idx[t], 100 * rows[-1]["own"], 100 * rows[-1]["fused"],
+                 100 * rows[-1]["filled"], "%5.2f" % agree if np.isfinite(agree) else "   --"),
+              flush=True)
+
+    lo, hi = np.percentile(np.concatenate(pool), [2, 98])
+    print("depth range for colour: %.0f..%.0f mm" % (lo, hi), flush=True)
+
+    stem = os.path.splitext(os.path.basename(a.video))[0][-24:]
+    two, three = os.path.join(a.out, "depth.mp4"), os.path.join(a.out, "compare.mp4")
+    w2 = w3 = None
+    for t in range(n):
+        z_own, z_fus = to_depth(disps[t], fB), to_depth(fused_all[t], fB)
+        filled = (z_fus > 0) & ~(z_own > 0)
+        tsec = (idx[t] - idx[0]) / src_fps
+        m2 = mosaic([(lefts[t], "rectified LEFT  %s  t=%.2fs" % (stem, tsec)),
+                     (depth_panel(z_fus, lo, hi),
+                      "temporal stereo depth   valid %.1f%%" % (100 * (z_fus > 0).mean()))],
+                    a.panel_scale, lo, hi)
+        m3 = mosaic([(lefts[t], "rectified LEFT   t=%.2fs" % tsec),
+                     (depth_panel(z_own, lo, hi),
+                      "single pair   valid %.1f%%" % (100 * (z_own > 0).mean())),
+                     (depth_panel(z_fus, lo, hi, tint=filled),
+                      "+ temporal (cyan = filled)   valid %.1f%%" % (100 * (z_fus > 0).mean()))],
+                    a.panel_scale, lo, hi)
+        if w2 is None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            w2 = cv2.VideoWriter(two, fourcc, a.fps, (m2.shape[1], m2.shape[0]))
+            w3 = cv2.VideoWriter(three, fourcc, a.fps, (m3.shape[1], m3.shape[0]))
+            cv2.imwrite(os.path.join(a.out, "figure.png"), m3)
+        w2.write(m2)
+        w3.write(m3)
+        if a.save_depth:
+            for sub in ("images", "depth"):
+                os.makedirs(os.path.join(a.out, sub), exist_ok=True)
+            cv2.imwrite(os.path.join(a.out, "images", "%07d.png" % idx[t]), lefts[t])
+            cv2.imwrite(os.path.join(a.out, "depth", "%07d.png" % idx[t]),
+                        np.clip(z_fus * DEPTH_SCALE, 0, 65535).astype(np.uint16))
+    w2.release()
+    w3.release()
+
+    own = np.array([r["own"] for r in rows])
+    fus = np.array([r["fused"] for r in rows])
+    ag = np.array([r["agree_mm"] for r in rows], float)
+    off = np.abs(np.concatenate([o for o in offs_all if o]))
+    summary = dict(
+        video=os.path.basename(a.video), start=a.start, seconds=a.seconds, fps=a.fps,
+        frames=n, src_fps=src_fps, stride=stride, matcher=a.matcher, scale=a.scale,
+        window=a.window, flow_scale=a.flow_scale, fb_tol=a.fb_tol, min_support=a.min_support,
+        mad_tol=a.mad_tol, align=a.align, temporal_median=a.temporal_median, f_times_B=fB,
+        colour_range_mm=[float(lo), float(hi)],
+        valid_single=float(own.mean()), valid_single_p10=float(np.percentile(own, 10)),
+        valid_fused=float(fus.mean()), valid_fused_p10=float(np.percentile(fus, 10)),
+        valid_gain=float(fus.mean() - own.mean()),
+        holes_closed=float((fus.mean() - own.mean()) / max(1e-9, 1 - own.mean())),
+        agree_mm_median=float(np.nanmedian(ag)),
+        align_offset_px_median=float(np.median(off)) if off.size else None,
+        align_offset_px_p95=float(np.percentile(off, 95)) if off.size else None,
+        flicker_mm_median=float(np.median(flick)) if flick else None,
+        per_frame=rows)
+    with open(os.path.join(a.out, "stats.json"), "w") as fh:
+        json.dump(summary, fh, indent=2)
+    print("\nsingle pair  valid %.1f%% (p10 %.1f%%)"
+          % (100 * own.mean(), 100 * np.percentile(own, 10)))
+    print("+ temporal   valid %.1f%% (p10 %.1f%%)  -> %.0f%% of the holes closed"
+          % (100 * fus.mean(), 100 * np.percentile(fus, 10), 100 * summary["holes_closed"]))
+    print("leave-one-out agreement (optimistic bound): median %.2f mm"
+          % summary["agree_mm_median"])
+    if summary["align_offset_px_median"] is not None:
+        print("own-vs-warped disparity offset: median %.3f px, p95 %.3f px"
+              % (summary["align_offset_px_median"], summary["align_offset_px_p95"]))
+    if summary["flicker_mm_median"] is not None:
+        print("frame-to-frame depth jitter along the flow: median %.2f mm"
+              % summary["flicker_mm_median"])
+    print("wrote %s, %s, figure.png, stats.json" % (two, three))
+
+
+if __name__ == "__main__":
+    main()
