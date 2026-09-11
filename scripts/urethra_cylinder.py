@@ -59,19 +59,27 @@ def proj(X, K):
 
 # ------------------------------------------------------------------ fit + roof
 
-def fit_cylinder(P):
+def fit_cylinder(P, init=None, r_range=(2.5, 8.0)):
     """Robust least squares on (distance to axis - r).
 
     Only the camera-facing part of the tube is ever seen, so the start point matters: axis along
     the points' principal direction, radius from their spread ACROSS it, and the axis one radius
-    BEHIND the visible surface. ponytail: straight cylinder; a curved urethra biases the far end.
+    BEHIND the visible surface. init=(p, d, r) restarts from a previous fit instead.
+    The radius is held to r_range: a partial arc fits a fatter, flatter cylinder almost as well,
+    and the end-on 5e27 views ran to 8.5-11 mm that way. 2.5-8 mm brackets a urethra with room.
+    ponytail: straight cylinder; a curved urethra biases the far end.
     """
     c = P.mean(0)
-    d0 = np.linalg.svd(P - c, full_matrices=False)[2][0]
+    if init is None:
+        d0 = np.linalg.svd(P - c, full_matrices=False)[2][0]
+        across = unit(np.cross(d0, unit(c)))
+        r_sil = max(0.5, np.subtract(*np.percentile((P - c) @ across, [97, 3])) / 2)
+        off, r0 = r_sil * unit(c), r_sil
+    else:
+        (p0, d0, r0), r_sil = init, init[2]
+        off = p0 - c
     e1, e2 = basis(d0)
-    across = unit(np.cross(d0, unit(c)))
-    r0 = max(0.5, np.subtract(*np.percentile((P - c) @ across, [97, 3])) / 2)
-    off = r0 * unit(c)
+    r0 = float(np.clip(r0, r_range[0] + 1e-3, r_range[1] - 1e-3))
 
     def model(x):
         return unit(d0 + x[0] * e1 + x[1] * e2), c + x[2] * e1 + x[3] * e2
@@ -80,9 +88,10 @@ def fit_cylinder(P):
         d, p = model(x)
         return np.linalg.norm(np.cross(P - p, d), axis=1) - x[4]
 
-    s = least_squares(res, [0, 0, off @ e1, off @ e2, r0], loss="soft_l1", f_scale=0.3)
+    s = least_squares(res, [0, 0, off @ e1, off @ e2, r0], loss="soft_l1", f_scale=0.3,
+                      bounds=([-np.inf] * 4 + [r_range[0]], [np.inf] * 4 + [r_range[1]]))
     d, p = model(s.x)
-    return p, d, abs(s.x[4]), float(np.median(np.abs(res(s.x)))), r0
+    return p, d, float(s.x[4]), float(np.median(np.abs(res(s.x)))), r_sil
 
 
 def orient(p, d, P, uv, seg):
@@ -105,7 +114,8 @@ def nanmedian_filter(x, k=5):
 
 
 def gap_along(p, d, r, ts, zmap, seg, K, patch=2):
-    """Tube top line minus observed surface (mm) at axial positions ts, NaN where unknown."""
+    """Tube top line minus observed surface (mm) at axial positions ts (NaN where unknown), and
+    the segmentation class under each sample (-1 = outside the frame)."""
     H, W = zmap.shape
     A = p + ts[:, None] * d
     S = A + r * toward_camera(A, d)
@@ -113,42 +123,72 @@ def gap_along(p, d, r, ts, zmap, seg, K, patch=2):
     inside = ((uv[:, 0] >= patch) & (uv[:, 0] < W - patch - 1) &
               (uv[:, 1] >= patch) & (uv[:, 1] < H - patch - 1))
     zobs = np.full(len(ts), np.nan)
+    cls = np.full(len(ts), -1)
     for i in np.flatnonzero(inside):
         ui, vi = int(round(uv[i, 0])), int(round(uv[i, 1]))
-        if seg is not None and seg[vi, ui] == NONANAT:
-            continue                     # an instrument in front says nothing about the roof
+        cls[i] = 0 if seg is None else seg[vi, ui]
+        if cls[i] == NONANAT:
+            continue                     # an instrument in front says nothing about the tissue
         z = zmap[vi - patch:vi + patch + 1, ui - patch:ui + patch + 1]
         z = z[z > 0]
         if z.size:
             zobs[i] = np.median(z)
-    return S[:, 2] - zobs, inside
+    return S[:, 2] - zobs, inside, cls
 
 
-def march(p, d, r, t0, zmap, seg, K, ext, margin, step=0.2, zero_tol=0.5, run_mm=1.0):
-    """Walk the tube's top line from t0 distally and compare it with the observed surface."""
-    ts = np.arange(t0, t0 + ext, step)
-    raw, inside = gap_along(p, d, r, ts, zmap, seg, K)
+def march(p, d, r, t0, zmap, seg, K, ext, margin, sign=1, step=0.2, zero_tol=0.5, run_mm=1.0):
+    """Walk the tube's top line from t0 and find where the observed surface stops being the tube.
+
+    distal (sign +1): only a surface IN FRONT counts -- the roof.
+    proximal (-1):    in front (the prostate base: the same kind of step as the roof), BEHIND (an
+                      open, cut end), or the catheter, which leaves the cut end and would otherwise
+                      read as more tube.
+    If the tube was not seen in the last mm before the crossing (instrument / no depth), the
+    crossing is not where the tube ends but where it reappears: that end is HIDDEN.
+    """
+    ts = t0 + sign * np.arange(0, ext, step)
+    raw, inside, cls = gap_along(p, d, r, ts, zmap, seg, K)
     gap = nanmedian_filter(raw)
+    g = np.nan_to_num(gap, nan=0.0)
+    hit = (g > margin) if sign > 0 else ((np.abs(g) > margin) | (cls == CATHETER))
     k = max(1, int(round(run_mm / step)))
-    covered = np.nan_to_num(gap, nan=-np.inf) > margin
-    run = np.flatnonzero(np.convolve(covered, np.ones(k), "valid") == k)
-    out = dict(ts=ts, gap=gap, found=False)
+    run = np.flatnonzero(np.convolve(hit, np.ones(k), "valid") == k)
+    out = dict(ts=ts, gap=gap, found=False, hidden=False)
     if run.size:
-        # the margin only makes the detection robust; the END is where the gap left ~0, so walk
-        # back -- otherwise a shallow roof would push the end point distally by margin/slope
-        j = run[0]
-        while j > 0 and gap[j - 1] > zero_tol:
-            j -= 1
-        out.update(found=True, t_end=float(ts[j]), status="roof")
+        j = i = run[0]
+        t_cross = float(ts[i])
+        if cls[i] != CATHETER:
+            # the margin only makes the detection robust; the end is where the gap LEAVES zero.
+            # Walk back to ~0, then put the crossing where the line through that sample and the
+            # first sustained one hits zero -- a threshold alone lands ~zero_tol/slope past it,
+            # and with both ends measured this way the two offsets would add up in SUL
+            while j > 0 and ((g[j - 1] > zero_tol) if sign > 0 else (abs(g[j - 1]) > zero_tol)):
+                j -= 1
+            t_cross = float(ts[j])
+            if i > j and g[i] != g[j]:
+                t_cross = float(ts[j] + np.clip(g[j] / (g[j] - g[i]), -1, 1) * (ts[i] - ts[j]))
+        front = bool(np.isfinite(gap[i:i + k]).any() and np.nanmedian(gap[i:i + k]) > 0)
+        kind = ("catheter" if cls[i] == CATHETER else
+                ("roof" if sign > 0 else "base") if front else "open end")
+        if kind == "base" and cls[i] == PROSTATE:
+            kind = "base (prostate)"
+        out.update(found=True, t=t_cross, kind=kind, status=kind,
+                   hidden=bool(j >= k and not np.isfinite(raw[j - k:j]).any()))
     elif not inside.all():
-        out["status"] = "left frame at +%.1f mm" % (ts[np.argmin(inside)] - t0)
+        out["status"] = "left frame at %+.1f mm" % (sign * (ts[np.argmin(inside)] - t0))
     else:
-        out["status"] = "not covered within %g mm" % ext
+        out["status"] = "nothing within %g mm" % ext
     return out
 
 
-def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500):
-    """One frame -> cylinder, start, end, SUL (or None when there is too little urethra)."""
+def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40, inlier_mm=1.0):
+    """One frame -> cylinder, start, end, SUL (or None when there is too little urethra).
+
+    The mask is only a rough WHERE. A first fit runs on its eroded core; then every depth point near
+    the mask (instrument and catheter excluded) that lies on that surface is re-selected and the fit
+    repeated, so the DEPTH decides what the tube is. Both ends come from the depth as well: walk the
+    tube's top line each way until the surface stops being the tube.
+    """
     fx, fy, cx, cy = K
     ok = (seg == URETHRA) & (zmap > 0)
     # fit on the eroded core: silhouette pixels mix tube and background depth
@@ -164,21 +204,31 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500):
         z = zmap[v, u]
         return np.stack([(u - cx) * z / fx, (v - cy) * z / fy, z], 1), np.stack([u, v], 1) * 1.0
 
-    P, uv = pts(core, 20000)
+    P, puv = pts(core, 20000)
     p, d, r, res, r_sil = fit_cylinder(P)
-    d, rule = orient(p, d, P, uv, seg)
-    t_start = float(np.percentile((pts(ok, 40000)[0] - p) @ d, 1))
-    # The start is only a measurement if the tube really ENDS there. An instrument lying over the
-    # proximal urethra truncates the mask and drags the start distally -- on 5e27 SUL tracked the
-    # mask's size at rho 0.92. Same test as the roof, run backwards: something in front = hidden.
-    # ponytail: on an end-on stump (5e27) this also fires on clean cut ends -- the cylinder is
-    # ill-posed there, so no end check is trustworthy; the method needs the urethra side-on.
-    back, _ = gap_along(p, d, r, t_start - np.arange(0.5, 3.01, 0.25), zmap, seg, K)
-    start_ok = bool(np.isfinite(back).any() and np.nanmedian(back) <= margin)
-    out = dict(p=p, d=d, r=r, r_sil=r_sil, res=res, rule=rule, t_start=t_start, n=len(P),
-               start_ok=start_ok,
-               **march(p, d, r, float(np.median((P - p) @ d)), zmap, seg, K, ext, margin))
-    out["sul"] = out["t_end"] - t_start if out["found"] else float("nan")
+    roi = (cv2.dilate(ok.astype(np.uint8), np.ones((2 * roi_px + 1,) * 2, np.uint8)).astype(bool)
+           & (zmap > 0) & ~np.isin(seg, (NONANAT, CATHETER)))
+    Q, quv = pts(roi, 40000)
+    S, suv = P, puv
+    for _ in range(3):
+        on = np.abs(np.linalg.norm(np.cross(Q - p, d), axis=1) - r) < inlier_mm
+        if on.sum() < min_px // 2:
+            break
+        S, suv = Q[on], quv[on]
+        p, d, r, res, _ = fit_cylinder(S, init=(p, d, r))
+    d, rule = orient(p, d, S, suv, seg)
+    t0 = float(np.median((S - p) @ d))
+    end = march(p, d, r, t0, zmap, seg, K, ext, margin, sign=+1)
+    beg = march(p, d, r, t0, zmap, seg, K, ext, margin, sign=-1)
+    t_mask = float(np.percentile((P - p) @ d, 1))      # where the MASK starts (eroded core)
+    out = dict(p=p, d=d, r=r, r_sil=r_sil, res=res, rule=rule, n=len(S),
+               t_start=beg["t"] if beg["found"] else t_mask, t_mask_start=t_mask,
+               t_end=end.get("t"), found=end["found"], status=end["status"],
+               ts=end["ts"], gap=end["gap"], ts_back=beg["ts"], gap_back=beg["gap"],
+               start_found=beg["found"], start_kind=beg["status"],
+               start_ok=beg["found"] and not beg["hidden"] and not end["hidden"])
+    out["sul"] = out["t_end"] - out["t_start"] if end["found"] and beg["found"] else float("nan")
+    out["sul_mask"] = out["t_end"] - t_mask if end["found"] else float("nan")
     return out
 
 
@@ -195,8 +245,9 @@ def tube_line(fr, t0, t1, side, K, n=80):
 
 def draw(img, seg, fr, K):
     out = img.copy()
-    m = seg == URETHRA
-    out[m] = (0.55 * out[m] + 0.45 * np.array([0, 255, 255])).astype(np.uint8)
+    for c, col in ((URETHRA, (0, 255, 255)), (PROSTATE, (255, 0, 255))):   # yellow, magenta
+        m = seg == c
+        out[m] = (0.55 * out[m] + 0.45 * np.array(col)).astype(np.uint8)
     if fr is None:
         return out
     t_end = fr["t_end"] if fr["found"] else fr["ts"][-1]
@@ -206,10 +257,11 @@ def draw(img, seg, fr, K):
     far = tube_line(fr, t_end, t_end + 15, 0, K, 40)
     for a, b in zip(far[:-1:2], far[1::2]):             # dashed: the tube carrying on underneath
         cv2.line(out, tuple(map(int, a)), tuple(map(int, b)), (230, 230, 230), 2, cv2.LINE_AA)
-    cv2.circle(out, tuple(map(int, tube_line(fr, fr["t_start"], fr["t_start"], 0, K, 1)[0])),
-               11, (0, 255, 0), -1 if fr["start_ok"] else 3)      # hollow = start hidden
+    dot = lambda t: tuple(map(int, tube_line(fr, t, t, 0, K, 1)[0]))
+    cv2.circle(out, dot(fr["t_mask_start"]), 8, (255, 255, 255), 2)       # where the MASK starts
+    cv2.circle(out, dot(fr["t_start"]), 11, (0, 255, 0), -1 if fr["start_ok"] else 3)
     if fr["found"]:
-        cv2.circle(out, tuple(map(int, tube_line(fr, t_end, t_end, 0, K, 1)[0])), 11, (0, 0, 255), -1)
+        cv2.circle(out, dot(t_end), 11, (0, 0, 255), -1)
     return out
 
 
@@ -219,38 +271,45 @@ def label(panel, text):
     return t
 
 
-def profile(fr, w, h, margin, gmin=-3.0, gmax=12.0):
+def profile(fr, w, h, margin, gmin=-6.0, gmax=12.0):
     img = np.full((h, w, 3), 24, np.uint8)
     if fr is None:
         cv2.putText(img, "no urethra in this frame", (20, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (200, 200, 200), 1, cv2.LINE_AA)
         return img
     L, R, T, B = 70, 20, 34, 30
-    x0, xmax = fr["t_start"], max(fr["ts"][-1] - fr["t_start"], 1.0)
-    X = lambda t: int(L + (t - x0) / xmax * (w - L - R))
+    x0, x1 = float(fr["ts_back"].min()), float(fr["ts"].max())
+    X = lambda t: int(L + (t - x0) / max(x1 - x0, 1.0) * (w - L - R))
     Y = lambda g: int(T + (gmax - np.clip(g, gmin, gmax)) / (gmax - gmin) * (h - T - B))
     cv2.line(img, (L, Y(0)), (w - R, Y(0)), (120, 120, 120), 1)
-    for xx in range(L, w - R, 12):
-        cv2.line(img, (xx, Y(margin)), (xx + 5, Y(margin)), (0, 140, 255), 1)
-    for g in (0, 5, 10):
-        cv2.putText(img, "%d" % g, (L - 30, Y(g) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
-    for mm in range(0, int(xmax) + 1, 5):
-        cv2.putText(img, "%d" % mm, (X(x0 + mm) - 6, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+    for mg in (margin, -margin):
+        for xx in range(L, w - R, 12):
+            cv2.line(img, (xx, Y(mg)), (xx + 5, Y(mg)), (0, 140, 255), 1)
+    for g in (-5, 0, 5, 10):
+        cv2.putText(img, "%d" % g, (L - 34, Y(g) + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+    ts0 = fr["t_start"]
+    for mm in range(int(np.ceil((x0 - ts0) / 5)) * 5, int(x1 - ts0) + 1, 5):
+        cv2.putText(img, "%d" % mm, (X(ts0 + mm) - 6, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (200, 200, 200), 1)
-    ok = np.isfinite(fr["gap"])
-    pts = np.array([[X(t), Y(np.nan_to_num(g))] for t, g in zip(fr["ts"], fr["gap"])], np.int32)
-    for s, e in zip(*[np.flatnonzero(np.diff(np.r_[0, ok.astype(int), 0]) == k) for k in (1, -1)]):
-        cv2.polylines(img, [pts[s:e]], False, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.line(img, (X(fr["t_start"]), T), (X(fr["t_start"]), h - B), (0, 255, 0), 2)
+    for tt, gg in ((fr["ts_back"], fr["gap_back"]), (fr["ts"], fr["gap"])):
+        ok = np.isfinite(gg)
+        pts = np.array([[X(t), Y(np.nan_to_num(g))] for t, g in zip(tt, gg)], np.int32)
+        for s, e in zip(*[np.flatnonzero(np.diff(np.r_[0, ok.astype(int), 0]) == k) for k in (1, -1)]):
+            cv2.polylines(img, [pts[s:e]], False, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.line(img, (X(fr["t_mask_start"]), T), (X(fr["t_mask_start"]), h - B), (160, 160, 160), 1)
+    cv2.line(img, (X(ts0), T), (X(ts0), h - B), (0, 255, 0), 2)
     if fr["found"]:
         cv2.line(img, (X(fr["t_end"]), T), (X(fr["t_end"]), h - B), (0, 0, 255), 2)
-    msg = ("SUL %.1f mm   (start -> roof, along the axis)   r %.1f mm" % (fr["sul"], fr["r"])
-           if fr["found"] else "end not found: %s   r %.1f mm" % (fr["status"], fr["r"]))
-    if not fr["start_ok"]:
-        msg += "   START HIDDEN - frame not counted"
-    cv2.putText(img, "gap = tube top - observed surface (mm) vs distance from start (mm);  orange = "
-                "margin.   " + msg, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
-                cv2.LINE_AA)
+    if fr["found"] and fr["start_found"]:
+        msg = ("SUL %.1f mm   start: %s   (mask start would give %.1f)   r %.1f mm"
+               % (fr["sul"], fr["start_kind"], fr["sul_mask"], fr["r"]))
+        if not fr["start_ok"]:
+            msg += "   HIDDEN - not counted"
+    else:
+        msg = "end: %s   start: %s   r %.1f mm" % (fr["status"], fr["start_kind"], fr["r"])
+    cv2.putText(img, msg, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(img, "gap = tube top - surface (mm); x = mm from start; grey = mask start",
+                (L + 6, T + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1, cv2.LINE_AA)
     return img
 
 
@@ -322,7 +381,9 @@ def fig_time(rows, path):
     ok = np.array([r["start_ok"] for r in rows]) & np.isfinite(sul)
     ax[0].plot(t[ok], sul[ok], "o", ms=4, label="both ends observed")
     ax[0].plot(t[~ok], sul[~ok], "o", ms=4, mfc="none", color="grey",
-               label="start hidden (not counted)")
+               label="an end hidden (not counted)")
+    ax[0].plot(t, [r["sul_mask_mm"] for r in rows], "x", ms=4, color="0.6",
+               label="with the mask's start instead")
     if ok.any():
         m = np.median(sul[ok])
         ax[0].axhline(m, color="r", label="median %.1f mm (n=%d)" % (m, ok.sum()))
@@ -340,9 +401,11 @@ def fig_time(rows, path):
 
 # ------------------------------------------------------------------ self-test
 
-def render(K, W, H, p, d, r, t_roof, beta=1.0, bg=75.0, t_len=60.0):
-    """Ray-cast a tube (cut at t=0) on a background plane, with a roof that meets the tube's top
-    line at t_roof and rises toward the camera past it."""
+def render(K, W, H, p, d, r, t_roof, beta=1.0, bg=75.0, t_len=60.0, base=False):
+    """Ray-cast a tube on a background plane, with a roof meeting the tube's top line at t_roof and
+    rising toward the camera past it. base=False: the tube is cut at t=0 (an open end, background
+    behind). base=True: it carries on under a 'prostate' surface that meets the top line at t=0
+    and rises toward the camera proximally."""
     fx, fy, cx, cy = K
     u, v = np.meshgrid(np.arange(W), np.arange(H))
     D = np.stack([(u - cx) / fx, (v - cy) / fy, np.ones(u.shape)], -1)
@@ -351,37 +414,52 @@ def render(K, W, H, p, d, r, t_roof, beta=1.0, bg=75.0, t_len=60.0):
     disc = B * B - A2 * C
     lc = np.where(disc > 0, (B - np.sqrt(np.maximum(disc, 0))) / A2, np.inf)
     tc = (np.nan_to_num(lc, posinf=0)[..., None] * D - p) @ d
-    lc[(tc < 0) | (tc > t_len) | (lc <= 0)] = np.inf
-    Ar = p + t_roof * d
-    tw = toward_camera(Ar, d)
-    N = unit(np.cross(d + beta * tw, np.cross(d, tw)))
-    lr = ((Ar + r * tw) @ N) / (D @ N)
-    lr[~(((lr[..., None] * D - Ar) @ d) > 0) | (lr <= 0)] = np.inf
-    z = np.minimum(np.minimum(lc, lr), bg)
-    return z.astype(np.float32), np.where(lc <= np.minimum(lr, bg), URETHRA, 0).astype(np.uint8)
+    lc[(tc < (-30 if base else 0)) | (tc > t_len) | (lc <= 0)] = np.inf
+
+    def plane(t_at, sgn):          # meets the top line at t_at, rises toward the camera along sgn*d
+        A = p + t_at * d
+        tw = toward_camera(A, d)
+        N = unit(np.cross(sgn * d + beta * tw, np.cross(d, tw)))
+        lam = ((A + r * tw) @ N) / (D @ N)
+        lam[~((sgn * ((lam[..., None] * D - A) @ d)) > 0) | (lam <= 0)] = np.inf
+        return lam
+
+    lr = plane(t_roof, 1)
+    lb = plane(0.0, -1) if base else np.full(lc.shape, np.inf)
+    z = np.minimum.reduce([lc, lr, lb, np.full(lc.shape, bg)])
+    seg = np.where(lc == z, URETHRA, np.where(lb == z, PROSTATE, 0)).astype(np.uint8)
+    return z.astype(np.float32), seg
 
 
 def self_test():
     K, W, H = (285.8, 285.8, 150.9, 133.5), 335, 268        # the rectified K at quarter size
     d_true, p_true, r_true, t_roof = unit(np.array([0.15, -1.0, 0.3])), np.array([2.0, 12, 55]), 4.0, 18.0
+    rng = np.random.default_rng(0)
+    noisy = lambda z: z + rng.normal(0, 0.15, z.shape).astype(np.float32)   # ~stereo noise
+    run = lambda z, seg: analyse(z, seg, K, erode=2, min_px=200, roi_px=10)
     z, seg = render(K, W, H, p_true, d_true, r_true, t_roof)
-    z += np.random.default_rng(0).normal(0, 0.15, z.shape).astype(np.float32)   # ~stereo noise
-    fr = analyse(z, seg, K, erode=2, min_px=200)
+    z = noisy(z)
+    fr = run(z, seg)
     ang = np.degrees(np.arccos(np.clip(fr["d"] @ d_true, -1, 1)))
-    print("self-test: r %.2f (true %.1f)  axis error %.2f deg  SUL %.2f (true %.1f)  %s  rule=%s"
-          % (fr["r"], r_true, ang, fr["sul"], t_roof, fr["status"], fr["rule"]))
+    print("self-test cut end : r %.2f (true %.1f)  axis error %.2f deg  SUL %.2f (true %.1f)  start=%s"
+          % (fr["r"], r_true, ang, fr["sul"], t_roof, fr["start_kind"]))
     assert abs(fr["r"] - r_true) < 0.4, "radius"
     assert ang < 4, "axis direction (or orientation flipped)"
-    assert fr["found"] and abs(fr["sul"] - t_roof) < 1.5, "roof end point"
-    assert fr["start_ok"], "a clean cut end was flagged as hidden"
+    assert fr["found"] and fr["start_ok"] and fr["start_kind"] == "open end", "cut end"
+    assert abs(fr["sul"] - t_roof) < 1.5, "SUL, cut end"
+    zb, segb = render(K, W, H, p_true, d_true, r_true, t_roof, base=True)
+    frb = run(noisy(zb), segb)
+    print("self-test prostate: SUL %.2f (true %.1f)  start=%s  rule=%s"
+          % (frb["sul"], t_roof, frb["start_kind"], frb["rule"]))
+    assert frb["start_ok"] and frb["start_kind"].startswith("base"), "prostate base as the start"
+    assert abs(frb["sul"] - t_roof) < 1.5, "SUL, prostate base"
     z3, seg3 = z.copy(), seg.copy()
-    z3[172:], seg3[172:] = 40.0, 0          # an instrument across the proximal ~5 mm of the tube
-    fr3 = analyse(z3, seg3, K, erode=2, min_px=200)
-    print("self-test: instrument over the start -> start_ok=%s (its SUL would read %.1f)"
-          % (fr3["start_ok"], fr3["sul"]))
-    assert not fr3["start_ok"], "an instrument over the start was not flagged"
+    z3[172:], seg3[172:] = 40.0, NONANAT     # an instrument across the proximal ~5 mm
+    fr3 = run(z3, seg3)
+    print("self-test instrument over the start -> start_ok=%s (%s)" % (fr3["start_ok"], fr3["start_kind"]))
+    assert not fr3["start_ok"], "an instrument over the start was not caught"
     z2, seg2 = render(K, W, H, p_true, d_true, r_true, t_roof=500)      # no roof in view
-    fr2 = analyse(z2, seg2, K, erode=2, min_px=200)
+    fr2 = run(z2, seg2)
     assert not fr2["found"], "found a roof that is not there"
     print("self-test OK (no-roof case: %s)" % fr2["status"])
 
@@ -437,29 +515,34 @@ def main():
         rows.append(dict(frame=os.path.basename(pth)[:-4], time_s=round(k / a.fps, 3),
                          urethra_px=int((seg == URETHRA).sum()),
                          status="no urethra" if fr is None else fr["status"],
+                         start=None if fr is None else fr["start_kind"],
                          start_ok=fr is not None and fr["start_ok"],
                          sul_mm=float("nan") if fr is None else round(fr["sul"], 2),
+                         sul_mask_mm=float("nan") if fr is None else round(fr["sul_mask"], 2),
                          radius_mm=float("nan") if fr is None else round(fr["r"], 2),
                          # half the 3D width across the tube: what a CIRCULAR tube would need
                          radius_silhouette_mm=float("nan") if fr is None else round(fr["r_sil"], 2),
                          fit_resid_mm=float("nan") if fr is None else round(fr["res"], 3),
                          orient=None if fr is None else fr["rule"]))
-        print("  %s  px %6d  %-26s  start %-5s  SUL %s  r %s  resid %s" % (
-            rows[-1]["frame"], rows[-1]["urethra_px"], rows[-1]["status"], rows[-1]["start_ok"],
-            rows[-1]["sul_mm"], rows[-1]["radius_mm"], rows[-1]["fit_resid_mm"]), flush=True)
+        print("  %s  px %6d  end %-22s  start %-18s ok %-5s  SUL %s (mask %s)  r %s" % (
+            rows[-1]["frame"], rows[-1]["urethra_px"], rows[-1]["status"], rows[-1]["start"],
+            rows[-1]["start_ok"], rows[-1]["sul_mm"], rows[-1]["sul_mask_mm"],
+            rows[-1]["radius_mm"]), flush=True)
 
     with open(os.path.join(out, "frames.csv"), "w", newline="") as fh:
         wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
         wr.writeheader()
         wr.writerows(rows)
     sul = np.array([r["sul_mm"] for r in rows], float)
-    found = np.isfinite(sul)
-    good = found & np.array([r["start_ok"] for r in rows])      # both ends actually observed
+    sulm = np.array([r["sul_mask_mm"] for r in rows], float)
+    good = np.isfinite(sul) & np.array([r["start_ok"] for r in rows])   # both ends seen, not hidden
     summary = dict(run=a.run, frames=len(rows), fitted=sum(f[3] is not None for f in frames),
-                   end_found=int(found.sum()), both_ends_observed=int(good.sum()),
-                   sul_median_all_found_mm=float(np.median(sul[found])) if found.any() else None,
+                   end_found=int(sum(r["status"] == "roof" for r in rows)),
+                   both_ends_observed=int(good.sum()),
                    sul_median_mm=float(np.median(sul[good])) if good.any() else None,
                    sul_iqr_mm=[float(x) for x in np.percentile(sul[good], [25, 75])] if good.any() else None,
+                   sul_mask_start_median_mm=float(np.nanmedian(sulm)) if np.isfinite(sulm).any() else None,
+                   start_kinds={str(k): sum(r["start"] == k for r in rows) for k in set(r["start"] for r in rows)},
                    radius_median_mm=float(np.nanmedian([r["radius_mm"] for r in rows])),
                    margin_mm=a.margin, erode_px=a.erode)
     with open(os.path.join(out, "summary.json"), "w") as fh:
