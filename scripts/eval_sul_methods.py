@@ -3,8 +3,8 @@
 Reference: Nick's two ruler points back-projected with the STEREO depth (a 3D chord). It is the
 same number in every condition, so each method is judged against a fixed target.
 
-methods  A  mask ends          the two ends of the mask's mirror axis (sul_measure.mirror_axis, the
-                               repo's first SUL method) -> 3D chord through the depth
+methods  A  mask ends          the two ends of the mask along its main axis (the idea of the repo's
+                               first SUL method, sul_measure_depth.py) -> 3D chord through the depth
          B  first cylinder     the first delivered version, run from git (50834de): mask start, roof
                                end by walk-back, hidden-start check
          C  current cylinder   HEAD defaults: ROI refit, knee3 end, knee start near the mask, outward
@@ -58,18 +58,17 @@ def depth_near(z, mask, q, rad=9):
 
 
 def mask_ends(mask):
-    try:
-        from sul_measure import mirror_axis
-        ax = mirror_axis(mask)
-        return np.asarray(ax["p0"], float), np.asarray(ax["p1"], float)
-    except Exception as e:                                        # ponytail: PCA ends as fallback
-        print("  mirror_axis failed (%s): PCA ends" % e)
-        v, u = np.nonzero(mask)
-        P = np.stack([u, v], 1).astype(float)
-        c = P.mean(0)
-        a = np.linalg.eigh(np.cov((P - c).T))[1][:, -1]
-        t = (P - c) @ a
-        return c + np.percentile(t, 1) * a, c + np.percentile(t, 99) * a
+    """The two ends of the mask along its main axis: the mean position of the mask pixels in the
+    outer 1% at each end. Points ON the axis line fall off a tilted or curved mask (control clip:
+    every one of them missed the depth), and sul_measure.mirror_axis can't be imported here (its
+    module needs openpyxl), so this is the same idea done with the pixels themselves."""
+    v, u = np.nonzero(mask)
+    P = np.stack([u, v], 1).astype(float)
+    c = P.mean(0)
+    a = np.linalg.eigh(np.cov((P - c).T))[1][:, -1]
+    t = (P - c) @ a
+    lo, hi = np.percentile(t, [1, 99])
+    return P[t <= lo].mean(0), P[t >= hi].mean(0)
 
 
 def along(fr, K, q):
