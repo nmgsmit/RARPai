@@ -176,6 +176,40 @@ def knee(ts, g, i1, sign):
     return best[1], best[2]
 
 
+def knee3(ts, g, i1, sign, front):
+    """Continuous three-segment fit to g[0..i1] (two breaks) -> index where the STEEPEST of the
+    later two segments starts, or None if too few points or nothing steepens.
+
+    Real profiles bend twice -- flat along the visible tube, a slow rise, then the steep rise where
+    the tissue covers it. A one-break fit took the first bend; Nick marks the second (control clip:
+    first bend 16.5 mm, his end 25.5 mm). Picking the steepest later segment also covers a profile
+    with one clean step. ponytail: brute force over break pairs on every 2nd sample, ~1k small
+    least-squares per call; vectorise if it ever matters."""
+    idx = np.flatnonzero(np.isfinite(g[:i1 + 1]))
+    if len(idx) < 12:
+        return None
+    y = g[idx]
+    u = sign * (ts[idx] - ts[idx[0]])              # distance along the march, increasing
+    best = (np.inf, None)
+    cand = range(3, len(idx) - 3, 2)
+    for a in cand:
+        for b in cand:
+            if b < a + 3:
+                continue
+            X = np.stack([np.ones_like(u), u, np.maximum(0.0, u - u[a]), np.maximum(0.0, u - u[b])], 1)
+            coef = np.linalg.lstsq(X, y, rcond=None)[0]
+            sse = float(((X @ coef - y) ** 2).sum())
+            if sse < best[0]:
+                best = (sse, (a, b, coef))
+    if best[1] is None:
+        return None
+    a, b, c = best[1]
+    sd = 1.0 if front else -1.0                    # slopes measured toward the step
+    s1, s2, s3 = sd * c[1], sd * (c[1] + c[2]), sd * (c[1] + c[2] + c[3])
+    i, slope = (a, s2) if s2 >= s3 else (b, s3)
+    return int(idx[i]) if slope > max(s1, 0.0) else None
+
+
 def march(p, d, r, t0, zmap, seg, K, ext, margin, sign=1, rule="knee", step=0.2, zero_tol=0.5,
           run_mm=1.0):
     """Walk the tube's top line from t0 and find where the observed surface stops being the tube.
@@ -205,11 +239,17 @@ def march(p, d, r, t0, zmap, seg, K, ext, margin, sign=1, rule="knee", step=0.2,
         front = bool(np.isfinite(gap[i:i + k]).any() and np.nanmedian(gap[i:i + k]) > 0)
         if cls[i] != CATHETER:
             done = False
-            if rule == "knee":
-                # fit up to where the change is clearly established (3 x margin), at most 6 mm past
-                # the detection, so the second segment is the steep part and not the plateau
-                big = np.flatnonzero(np.abs(g[i:]) > 3 * margin)
-                e = min(i + (big[0] if big.size else len(ts)), i + int(6 / step), len(ts) - 1)
+            # fit up to where the change is clearly established (3 x margin), at most 6 mm past
+            # the detection, so the last segment is the steep part and not the plateau
+            big = np.flatnonzero(np.abs(g[i:]) > 3 * margin)
+            e = min(i + (big[0] if big.size else len(ts)), i + int(6 / step), len(ts) - 1)
+            if rule == "knee3":
+                # the steep part may start AFTER the first |gap| > margin: a slow drift can already
+                # cross the margin (control clip), so the break is allowed anywhere up to e
+                kj = knee3(ts, gap, e, sign, front)
+                if kj is not None:
+                    j, t_cross, done = kj, float(ts[kj]), True
+            elif rule == "knee":
                 kj, extra = knee(ts, gap, e, sign)
                 if kj is not None and kj <= i and extra * (1 if front else -1) > 0:
                     j, t_cross, done = kj, float(ts[kj]), True
@@ -590,6 +630,16 @@ def self_test():
     frz = analyse(zd, seg, K, erode=2, min_px=200, roi_px=10, end_rule="zero")
     print("self-test drift  : SUL knee %.2f  zero %.2f  (true %.1f)" % (frk["sul"], frz["sul"], t_roof))
     assert abs(frk["sul"] - t_roof) < 1.0, "knee end on a drifting surface"
+    tsyn = np.arange(0, 30, 0.2)                # flat, a 2 mm rise over 8 mm, steep from 18 mm
+    gsyn = np.where(tsyn < 10, 0.0, np.where(tsyn < 18, 0.25 * (tsyn - 10), 2 + 1.5 * (tsyn - 18)))
+    gsyn = gsyn + np.random.default_rng(1).normal(0, 0.1, gsyn.shape)
+    i1 = int(np.searchsorted(tsyn, 22))
+    k3, k1 = knee3(tsyn, gsyn, i1, 1, True), knee(tsyn, gsyn, i1, 1)[0]
+    k3r = knee3(-tsyn, gsyn, i1, -1, True)      # the same profile walked the other way (the start)
+    print("self-test 2 bends: knee3 %.1f  (proximal %.1f)  one-break knee %.1f  -- steep from 18.0"
+          % (tsyn[k3], -(-tsyn[k3r]), tsyn[k1]))
+    assert k3 is not None and abs(tsyn[k3] - 18) < 0.8, "knee3 must find the start of the steep rise"
+    assert k3r is not None and abs(tsyn[k3r] - 18) < 0.8, "knee3, proximal direction"
     zb, segb = render(K, W, H, p_true, d_true, r_true, t_roof, base=True)
     frb = run(noisy(zb), segb)
     print("self-test prostate: SUL %.2f (true %.1f)  start=%s  rule=%s"
@@ -622,9 +672,9 @@ def main():
     ap.add_argument("--fps", type=float, default=20.0)
     ap.add_argument("--masks", help="folder of hand masks <frame>.png from the labelling tool; "
                     "replaces the model, frames without a mask are skipped")
-    ap.add_argument("--end-rule", default="knee", choices=["knee", "zero"],
+    ap.add_argument("--end-rule", default="knee", choices=["knee3", "knee", "zero"],
                     help="where the roof crossing sits: knee of the gap profile, or where it leaves 0")
-    ap.add_argument("--start-rule", default="knee", choices=["knee", "zero"])
+    ap.add_argument("--start-rule", default="knee", choices=["knee3", "knee", "zero"])
     ap.add_argument("--points", help="CSV frame,ax,ay,bx,by: the annotator's start/end points")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
