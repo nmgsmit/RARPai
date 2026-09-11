@@ -159,3 +159,24 @@ attributed as `blind` (nothing in the window saw it — a floor, not a knob), `f
 Coverage is what improves (84.1% -> 88.9% on the measured window). Depth where the single pair
 already worked is left alone, and measured temporal jitter is only 0.13 mm, so do not expect the
 map to get *sharper* — it gets *more complete*.
+
+## Urethra end point / SUL from 3D (cylinder + where the roof covers it)
+
+```bash
+# 1. depth for a window where the urethra is visible, KEEPING the fused depth (images/ + depth/)
+sbatch --export=ALL,OUT=outputs/temporal_stereo/seg3_t30 jobs/temporal_stereo.sh --start 30 --seconds 5 --save-depth
+#    other clip: --export=ALL,CLIP=../data/3D_ProxyGT/<clip>.mp4,OUT=outputs/temporal_stereo/<name>
+
+# 2. urethra mask -> cylinder -> roof end point -> SUL
+sbatch --export=ALL,RUN=outputs/temporal_stereo/seg3_t30 jobs/urethra_cylinder.sh
+
+# no model, no data: synthetic tube under a roof (runs locally)
+python scripts/urethra_cylinder.py --self-test
+```
+
+Writes `$RUN/urethra_cyl/`: `overlay_h264.mp4` (mask yellow, cylinder cyan, start green, roof end
+red, depth, and the gap profile underneath), `fig_3d.png` (section along the tube + 3D),
+`sul_time.png`, `frames.csv`, `summary.json`. Quote `sul_median_mm` -- it uses only frames with
+BOTH ends observed. A hollow green dot / "START HIDDEN" = an instrument over the proximal urethra,
+that frame is not counted.
+
