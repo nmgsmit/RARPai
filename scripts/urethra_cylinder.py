@@ -121,13 +121,13 @@ def gap_along(p, d, r, ts, zmap, seg, K, patch=2):
         z = z[z > 0]
         if z.size:
             zobs[i] = np.median(z)
-    return S[:, 2] - zobs, inside, uv
+    return S[:, 2] - zobs, inside
 
 
 def march(p, d, r, t0, zmap, seg, K, ext, margin, step=0.2, zero_tol=0.5, run_mm=1.0):
     """Walk the tube's top line from t0 distally and compare it with the observed surface."""
     ts = np.arange(t0, t0 + ext, step)
-    raw, inside, _ = gap_along(p, d, r, ts, zmap, seg, K)
+    raw, inside = gap_along(p, d, r, ts, zmap, seg, K)
     gap = nanmedian_filter(raw)
     k = max(1, int(round(run_mm / step)))
     covered = np.nan_to_num(gap, nan=-np.inf) > margin
@@ -171,12 +171,10 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500):
     # The start is only a measurement if the tube really ENDS there. An instrument lying over the
     # proximal urethra truncates the mask and drags the start distally -- on 5e27 SUL tracked the
     # mask's size at rho 0.92. Same test as the roof, run backwards: something in front = hidden.
-    back, inb, buv = gap_along(p, d, r, t_start - np.arange(0.5, 3.01, 0.25), zmap, seg, K)
-    # ...except a catheter, which is the opposite of an occluder: it exits the CUT end. On an
-    # end-on stump (5e27) it points at the camera, so it sits in front of the top line as well.
-    cath = [seg[int(round(v)), int(round(u))] == CATHETER for u, v in buv[inb]]
-    start_ok = bool((cath and np.mean(cath) >= 0.5) or
-                    (np.isfinite(back).any() and np.nanmedian(back) <= margin))
+    # ponytail: on an end-on stump (5e27) this also fires on clean cut ends -- the cylinder is
+    # ill-posed there, so no end check is trustworthy; the method needs the urethra side-on.
+    back, _ = gap_along(p, d, r, t_start - np.arange(0.5, 3.01, 0.25), zmap, seg, K)
+    start_ok = bool(np.isfinite(back).any() and np.nanmedian(back) <= margin)
     out = dict(p=p, d=d, r=r, r_sil=r_sil, res=res, rule=rule, t_start=t_start, n=len(P),
                start_ok=start_ok,
                **march(p, d, r, float(np.median((P - p) @ d)), zmap, seg, K, ext, margin))
@@ -382,12 +380,6 @@ def self_test():
     print("self-test: instrument over the start -> start_ok=%s (its SUL would read %.1f)"
           % (fr3["start_ok"], fr3["sul"]))
     assert not fr3["start_ok"], "an instrument over the start was not flagged"
-    z4, seg4 = z.copy(), seg.copy()          # catheter out of the cut end, toward the camera
-    z4[199:223, 145:179], seg4[199:223, 145:179] = 45.0, CATHETER
-    fr4 = analyse(z4, seg4, K, erode=2, min_px=200)
-    print("self-test: catheter in front of the cut end -> start_ok=%s, SUL %.1f"
-          % (fr4["start_ok"], fr4["sul"]))
-    assert fr4["start_ok"], "a catheter at the cut end was read as an occluder"
     z2, seg2 = render(K, W, H, p_true, d_true, r_true, t_roof=500)      # no roof in view
     fr2 = analyse(z2, seg2, K, erode=2, min_px=200)
     assert not fr2["found"], "found a roof that is not there"
