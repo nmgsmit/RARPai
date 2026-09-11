@@ -239,38 +239,57 @@ def profile(fr, w, h, margin, gmin=-3.0, gmax=12.0):
 
 
 def fig_3d(img, zmap, seg, fr, K, path):
+    """Left: a longitudinal SECTION through the top of the tube -- the literal picture of the
+    question. Tube surface points follow the cylinder's top line; past the end the observed
+    points (the roof) rise above it. Right: the same slab plus the tube's flanks in 3D."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fx, fy, cx, cy = K
-    t_end = fr["t_end"] if fr["found"] else fr["ts"][-1]
-    box = np.concatenate([tube_line(fr, fr["t_start"], t_end + 12, s, K, 30) for s in (-1, 0, 1)])
-    (u0, v0), (u1, v1) = box.min(0) - 120, box.max(0) + 120
-    v, u = np.mgrid[max(0, v0):min(zmap.shape[0], v1):5, max(0, u0):min(zmap.shape[1], u1):5]
+    v, u = np.mgrid[0:zmap.shape[0]:2, 0:zmap.shape[1]:2]
     v, u = v.ravel(), u.ravel()
+    k = zmap[v, u] > 0
+    v, u = v[k], u[k]
     z = zmap[v, u]
-    k = z > 0
-    v, u, z = v[k], u[k], z[k]
-    X, Y = (u - cx) * z / fx, (v - cy) * z / fy
+    P = np.stack([(u - cx) * z / fx, (v - cy) * z / fy, z], 1)
+    p, d, r, t0 = fr["p"], fr["d"], fr["r"], fr["t_start"]
+    t1 = fr["t_end"] if fr["found"] else fr["ts"][-1]
+    n = toward_camera(p + 0.5 * (t0 + t1) * d, d)
+    m = np.cross(d, n)
+    q = P - p
+    t, h, l = q @ d - t0, q @ n, q @ m
+    ure = seg[v, u] == URETHRA
     col = img[v, u, ::-1] / 255.0
-    ts = np.linspace(fr["t_start"], t_end, 30)
-    ang = np.linspace(0, 2 * np.pi, 36)
-    e1, e2 = basis(fr["d"])
-    C = (fr["p"][None, None] + ts[:, None, None] * fr["d"] +
-         fr["r"] * (np.cos(ang)[None, :, None] * e1 + np.sin(ang)[None, :, None] * e2))
-    fig = plt.figure(figsize=(15, 7))
-    for i, (el, az) in enumerate(((-60, -90), (10, -40))):
-        ax = fig.add_subplot(1, 2, i + 1, projection="3d")
-        ax.scatter(X, z, -Y, c=col, s=2, depthshade=False)              # up is up
-        ax.plot_wireframe(C[..., 0], C[..., 2], -C[..., 1], color="cyan", lw=0.5, alpha=0.7)
-        for t, c in ((fr["t_start"], "lime"), (t_end, "red")):
-            s = fr["p"] + t * fr["d"] + fr["r"] * toward_camera(fr["p"] + t * fr["d"], fr["d"])
-            ax.scatter([s[0]], [s[2]], [-s[1]], c=c, s=120, depthshade=False, edgecolors="k")
-        ax.set_xlabel("X mm"), ax.set_ylabel("depth Z mm"), ax.set_zlabel("up mm")
-        ax.view_init(elev=el, azim=az)
-        ax.set_box_aspect((np.ptp(X), np.ptp(z), np.ptp(Y)))
-    fig.suptitle("urethra cylinder (cyan) in the stereo point cloud -- green = start, red = where "
-                 "the roof covers it.  SUL %.1f mm, r %.1f mm" % (fr["sul"], fr["r"]))
+    span = (t > -8) & (t < t1 - t0 + 15)
+    fig = plt.figure(figsize=(17, 6.5))
+    ax = fig.add_subplot(1, 2, 1)
+    sl = span & (np.abs(l) < 1.5)                   # thin slice along the tube's top line
+    ax.scatter(t[sl & ~ure], h[sl & ~ure], s=4, c=col[sl & ~ure], label="observed surface")
+    ax.scatter(t[sl & ure], h[sl & ure], s=4, c="gold", label="urethra mask")
+    ax.axhline(r, color="c", lw=2, label="cylinder top line (r %.1f mm)" % r)
+    ax.axhline(0, color="c", lw=1, ls=":", label="cylinder axis")
+    ax.axhline(-r, color="c", lw=1, ls="--")
+    ax.axvline(0, color="lime", lw=2, label="start (prostate side)")
+    ax.axvline(t1 - t0, color="red", lw=2, label="end: roof meets the tube")
+    ax.set_xlabel("distance along the urethra from the start (mm)")
+    ax.set_ylabel("height toward the camera (mm)")
+    ax.set_aspect("equal")
+    ax.legend(loc="lower right", fontsize=8)
+    ax.set_title("section through the top of the tube:  SUL %.1f mm" % fr["sul"])
+    ax = fig.add_subplot(1, 2, 2, projection="3d")
+    sl = span & (np.abs(l) < r + 4) & (np.abs(h) < r + 12)
+    idx = np.flatnonzero(sl)[::3]
+    ax.scatter(t[idx], l[idx], h[idx], s=2, c=np.where(ure[idx, None], [1, 0.85, 0], col[idx]),
+               depthshade=False, alpha=0.5)
+    ts_ = np.linspace(0, t1 - t0, 25)
+    ang = np.linspace(0, 2 * np.pi, 40)
+    T, A = np.meshgrid(ts_, ang)
+    ax.plot_wireframe(T, r * np.sin(A), r * np.cos(A), color="c", lw=0.4, alpha=0.8)
+    for x, c in ((0, "lime"), (t1 - t0, "red")):
+        ax.scatter([x], [0], [r], c=c, s=150, edgecolors="k", depthshade=False)
+    ax.set_xlabel("along urethra mm"), ax.set_ylabel("lateral mm"), ax.set_zlabel("toward camera mm")
+    ax.set_box_aspect((np.ptp(t[idx]), np.ptp(l[idx]), np.ptp(h[idx])))
+    ax.view_init(elev=25, azim=-60)
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     plt.close(fig)
