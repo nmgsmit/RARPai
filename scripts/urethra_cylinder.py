@@ -34,6 +34,27 @@ from make_stereo_proxy_gt import DEPTH_SCALE, colorize   # noqa: E402
 
 # compact ids of outputs/ureth_fn, trained with --keep-classes 1,2,4,5
 URETHRA, PROSTATE, CATHETER, NONANAT = 1, 2, 3, 4
+# labelling-tool ids (transfer_atlas_mod palette, the "nick" scheme) -> the ids above, BY NAME.
+# 3 = dorsal venous plexus has no id here: background, as for ureth_fn (trained without it).
+TOOL2ID = {1: URETHRA, 2: PROSTATE, 4: CATHETER, 5: NONANAT}
+
+
+def load_mask(path, shape):
+    """Hand mask from the labelling tool. The PNGs are mode "P": the label is the palette INDEX,
+    so read it with PIL as-is -- cv2 would expand the palette to colours and .convert("L") would
+    turn id 1 into its yellow's luminance (the bug that once cost a training run)."""
+    from PIL import Image
+    im = Image.open(path)
+    m = np.array(im)
+    if m.ndim != 2:
+        raise SystemExit("%s: mode %s is not a label PNG (need palette or grey ids)" % (path, im.mode))
+    if m.shape != tuple(shape):
+        raise SystemExit("%s: %s but the frame is %s -- annotate the rectified images/ frames"
+                         % (path, m.shape, tuple(shape)))
+    out = np.zeros(m.shape, np.uint8)
+    for tool, c in TOOL2ID.items():
+        out[m == tool] = c
+    return out
 
 
 def unit(x):
@@ -443,6 +464,17 @@ def render(K, W, H, p, d, r, t_roof, beta=1.0, bg=75.0, t_len=60.0, base=False):
 
 
 def self_test():
+    import tempfile
+    from PIL import Image
+    im = Image.new("P", (6, 1))
+    im.putdata(list(range(6)))
+    im.putpalette([0, 0, 0, 255, 255, 0, 255, 0, 255, 0, 0, 255, 0, 255, 0, 128, 128, 128])
+    with tempfile.TemporaryDirectory() as tmp:
+        f = os.path.join(tmp, "0000000.png")
+        im.save(f)
+        got = load_mask(f, (1, 6))[0].tolist()
+    print("self-test masks : tool ids 0-5 ->", got)
+    assert got == [0, URETHRA, PROSTATE, 0, CATHETER, NONANAT], "hand-mask id mapping"
     K, W, H = (285.8, 285.8, 150.9, 133.5), 335, 268        # the rectified K at quarter size
     d_true, p_true, r_true, t_roof = unit(np.array([0.15, -1.0, 0.3])), np.array([2.0, 12, 55]), 4.0, 18.0
     rng = np.random.default_rng(0)
@@ -488,6 +520,8 @@ def main():
                     help="mm the surface must sit in front of the tube to count as covered")
     ap.add_argument("--ext", type=float, default=30.0, help="mm to follow the axis past mid-tube")
     ap.add_argument("--fps", type=float, default=20.0)
+    ap.add_argument("--masks", help="folder of hand masks <frame>.png from the labelling tool; "
+                    "replaces the model, frames without a mask are skipped")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
@@ -495,20 +529,21 @@ def main():
     if not a.run:
         raise SystemExit("need --run (or --self-test)")
 
-    import torch
-    from PIL import Image
-    from overlay_dir import MetaFormerFPN, _keep_largest, predict
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    sd = torch.load(a.checkpoint, map_location="cpu", weights_only=True)
-    model = MetaFormerFPN(num_classes=sd["FPN.segmentation_head.0.bias"].shape[0],
-                          pretrained="ImageNet", pretrained_weights=None)
-    model.load_state_dict(sd)
-    model.to(dev).eval()
+    if not a.masks:
+        import torch
+        from PIL import Image
+        from overlay_dir import MetaFormerFPN, _keep_largest, predict
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        sd = torch.load(a.checkpoint, map_location="cpu", weights_only=True)
+        model = MetaFormerFPN(num_classes=sd["FPN.segmentation_head.0.bias"].shape[0],
+                              pretrained="ImageNet", pretrained_weights=None)
+        model.load_state_dict(sd)
+        model.to(dev).eval()
 
     with open(a.calib) as fh:
         P1 = np.array(json.load(fh)["P1"])
     K = (P1[0, 0], P1[1, 1], P1[0, 2], P1[1, 2])
-    out = os.path.join(a.run, "urethra_cyl")
+    out = os.path.join(a.run, "urethra_cyl_hand" if a.masks else "urethra_cyl")
     os.makedirs(out, exist_ok=True)
     imgs = sorted(glob.glob(os.path.join(a.run, "images", "*.png")))
     if not imgs:
@@ -516,11 +551,17 @@ def main():
 
     frames, rows = [], []
     for k, pth in enumerate(imgs):
+        mpath = os.path.join(a.masks, os.path.basename(pth)[:-4] + ".png") if a.masks else None
+        if mpath and not os.path.isfile(mpath):
+            continue                     # hand masks cover a subset; k keeps time_s true
         img = cv2.imread(pth)
         zmap = cv2.imread(pth.replace(os.sep + "images" + os.sep, os.sep + "depth" + os.sep),
                           cv2.IMREAD_UNCHANGED).astype(np.float32) / DEPTH_SCALE
-        seg = _keep_largest(predict(model, Image.fromarray(img[..., ::-1]),
-                                    (a.img_size, a.img_size), dev), URETHRA)
+        if mpath:
+            seg = load_mask(mpath, img.shape[:2])     # as drawn: no keep-largest on a human mask
+        else:
+            seg = _keep_largest(predict(model, Image.fromarray(img[..., ::-1]),
+                                        (a.img_size, a.img_size), dev), URETHRA)
         fr = analyse(zmap, seg, K, a.erode, a.ext, a.margin)
         frames.append((img, zmap, seg, fr))
         rows.append(dict(frame=os.path.basename(pth)[:-4], time_s=round(k / a.fps, 3),
@@ -540,6 +581,9 @@ def main():
             rows[-1]["start_ok"], rows[-1]["sul_mm"], rows[-1]["sul_mask_mm"],
             rows[-1]["radius_mm"]), flush=True)
 
+    if not rows:
+        raise SystemExit("no mask in %s matches a frame in %s/images (expect <frame>.png, e.g. %s.png)"
+                         % (a.masks, a.run, os.path.basename(imgs[0])[:-4]))
     with open(os.path.join(out, "frames.csv"), "w", newline="") as fh:
         wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
         wr.writeheader()

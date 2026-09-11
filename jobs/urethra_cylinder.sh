@@ -20,7 +20,11 @@ RUN=${RUN:?set RUN=<temporal stereo output dir>}
 python scripts/urethra_cylinder.py --run "$RUN" "$@" || exit 1
 
 module load FFmpeg/6.0-GCCcore-12.3.0
-# SLOW=N plays the video N x slower (encode only; the analysis and its time axis are untouched)
-ffmpeg -y -loglevel error -i "$RUN/urethra_cyl/overlay.mp4" -vf "setpts=${SLOW:-1}*PTS" \
-    -c:v libx264 -pix_fmt yuv420p -crf 20 -movflags +faststart "$RUN/urethra_cyl/overlay_h264.mp4"
-echo "encoded $RUN/urethra_cyl/overlay_h264.mp4"
+# SLOW=N plays the video N x slower (encode only; the analysis and its time axis are untouched).
+# urethra_cyl* = the model-mask run and, with --masks, the hand-mask run (urethra_cyl_hand).
+for D in "$RUN"/urethra_cyl*; do
+    [ -f "$D/overlay.mp4" ] || continue
+    ffmpeg -y -loglevel error -i "$D/overlay.mp4" -vf "setpts=${SLOW:-1}*PTS" \
+        -c:v libx264 -pix_fmt yuv420p -crf 20 -movflags +faststart "$D/overlay_h264.mp4"
+    echo "encoded $D/overlay_h264.mp4"
+done
