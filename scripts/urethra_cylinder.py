@@ -104,10 +104,9 @@ def nanmedian_filter(x, k=5):
         return np.nanmedian(np.lib.stride_tricks.sliding_window_view(pad, k), 1)
 
 
-def march(p, d, r, t0, zmap, seg, K, ext, margin, step=0.2, zero_tol=0.5, run_mm=1.0, patch=2):
-    """Walk the tube's top line from t0 distally and compare it with the observed surface."""
+def gap_along(p, d, r, ts, zmap, seg, K, patch=2):
+    """Tube top line minus observed surface (mm) at axial positions ts, NaN where unknown."""
     H, W = zmap.shape
-    ts = np.arange(t0, t0 + ext, step)
     A = p + ts[:, None] * d
     S = A + r * toward_camera(A, d)
     uv = proj(S, K)
@@ -122,7 +121,14 @@ def march(p, d, r, t0, zmap, seg, K, ext, margin, step=0.2, zero_tol=0.5, run_mm
         z = z[z > 0]
         if z.size:
             zobs[i] = np.median(z)
-    gap = nanmedian_filter(S[:, 2] - zobs)
+    return S[:, 2] - zobs, inside
+
+
+def march(p, d, r, t0, zmap, seg, K, ext, margin, step=0.2, zero_tol=0.5, run_mm=1.0):
+    """Walk the tube's top line from t0 distally and compare it with the observed surface."""
+    ts = np.arange(t0, t0 + ext, step)
+    raw, inside = gap_along(p, d, r, ts, zmap, seg, K)
+    gap = nanmedian_filter(raw)
     k = max(1, int(round(run_mm / step)))
     covered = np.nan_to_num(gap, nan=-np.inf) > margin
     run = np.flatnonzero(np.convolve(covered, np.ones(k), "valid") == k)
@@ -162,7 +168,13 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500):
     p, d, r, res, r_sil = fit_cylinder(P)
     d, rule = orient(p, d, P, uv, seg)
     t_start = float(np.percentile((pts(ok, 40000)[0] - p) @ d, 1))
+    # The start is only a measurement if the tube really ENDS there. An instrument lying over the
+    # proximal urethra truncates the mask and drags the start distally -- on 5e27 SUL tracked the
+    # mask's size at rho 0.92. Same test as the roof, run backwards: something in front = hidden.
+    back, _ = gap_along(p, d, r, t_start - np.arange(0.5, 3.01, 0.25), zmap, seg, K)
+    start_ok = bool(np.isfinite(back).any() and np.nanmedian(back) <= margin)
     out = dict(p=p, d=d, r=r, r_sil=r_sil, res=res, rule=rule, t_start=t_start, n=len(P),
+               start_ok=start_ok,
                **march(p, d, r, float(np.median((P - p) @ d)), zmap, seg, K, ext, margin))
     out["sul"] = out["t_end"] - t_start if out["found"] else float("nan")
     return out
@@ -193,7 +205,7 @@ def draw(img, seg, fr, K):
     for a, b in zip(far[:-1:2], far[1::2]):             # dashed: the tube carrying on underneath
         cv2.line(out, tuple(map(int, a)), tuple(map(int, b)), (230, 230, 230), 2, cv2.LINE_AA)
     cv2.circle(out, tuple(map(int, tube_line(fr, fr["t_start"], fr["t_start"], 0, K, 1)[0])),
-               11, (0, 255, 0), -1)
+               11, (0, 255, 0), -1 if fr["start_ok"] else 3)      # hollow = start hidden
     if fr["found"]:
         cv2.circle(out, tuple(map(int, tube_line(fr, t_end, t_end, 0, K, 1)[0])), 11, (0, 0, 255), -1)
     return out
@@ -232,6 +244,8 @@ def profile(fr, w, h, margin, gmin=-3.0, gmax=12.0):
         cv2.line(img, (X(fr["t_end"]), T), (X(fr["t_end"]), h - B), (0, 0, 255), 2)
     msg = ("SUL %.1f mm   (start -> roof, along the axis)   r %.1f mm" % (fr["sul"], fr["r"])
            if fr["found"] else "end not found: %s   r %.1f mm" % (fr["status"], fr["r"]))
+    if not fr["start_ok"]:
+        msg += "   START HIDDEN - frame not counted"
     cv2.putText(img, "gap = tube top - observed surface (mm) vs distance from start (mm);  orange = "
                 "margin.   " + msg, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1,
                 cv2.LINE_AA)
@@ -303,11 +317,14 @@ def fig_time(rows, path):
     sul = np.array([r["sul_mm"] for r in rows], float)
     rad = np.array([r["radius_mm"] for r in rows], float)
     fig, ax = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    ax[0].plot(t, sul, "o", ms=4)
-    if np.isfinite(sul).any():
-        m = np.nanmedian(sul)
-        ax[0].axhline(m, color="r", label="median %.1f mm (n=%d)" % (m, np.isfinite(sul).sum()))
-        ax[0].legend()
+    ok = np.array([r["start_ok"] for r in rows]) & np.isfinite(sul)
+    ax[0].plot(t[ok], sul[ok], "o", ms=4, label="both ends observed")
+    ax[0].plot(t[~ok], sul[~ok], "o", ms=4, mfc="none", color="grey",
+               label="start hidden (not counted)")
+    if ok.any():
+        m = np.median(sul[ok])
+        ax[0].axhline(m, color="r", label="median %.1f mm (n=%d)" % (m, ok.sum()))
+    ax[0].legend()
     ax[0].set_ylabel("SUL mm")
     ax[1].plot(t, rad, "o", ms=4, color="tab:green")
     ax[1].set_ylabel("fitted radius mm")
@@ -354,6 +371,13 @@ def self_test():
     assert abs(fr["r"] - r_true) < 0.4, "radius"
     assert ang < 4, "axis direction (or orientation flipped)"
     assert fr["found"] and abs(fr["sul"] - t_roof) < 1.5, "roof end point"
+    assert fr["start_ok"], "a clean cut end was flagged as hidden"
+    z3, seg3 = z.copy(), seg.copy()
+    z3[172:], seg3[172:] = 40.0, 0          # an instrument across the proximal ~5 mm of the tube
+    fr3 = analyse(z3, seg3, K, erode=2, min_px=200)
+    print("self-test: instrument over the start -> start_ok=%s (its SUL would read %.1f)"
+          % (fr3["start_ok"], fr3["sul"]))
+    assert not fr3["start_ok"], "an instrument over the start was not flagged"
     z2, seg2 = render(K, W, H, p_true, d_true, r_true, t_roof=500)      # no roof in view
     fr2 = analyse(z2, seg2, K, erode=2, min_px=200)
     assert not fr2["found"], "found a roof that is not there"
@@ -411,24 +435,27 @@ def main():
         rows.append(dict(frame=os.path.basename(pth)[:-4], time_s=round(k / a.fps, 3),
                          urethra_px=int((seg == URETHRA).sum()),
                          status="no urethra" if fr is None else fr["status"],
+                         start_ok=fr is not None and fr["start_ok"],
                          sul_mm=float("nan") if fr is None else round(fr["sul"], 2),
                          radius_mm=float("nan") if fr is None else round(fr["r"], 2),
                          # half the 3D width across the tube: what a CIRCULAR tube would need
                          radius_silhouette_mm=float("nan") if fr is None else round(fr["r_sil"], 2),
                          fit_resid_mm=float("nan") if fr is None else round(fr["res"], 3),
                          orient=None if fr is None else fr["rule"]))
-        print("  %s  px %6d  %-26s  SUL %s  r %s  resid %s" % (
-            rows[-1]["frame"], rows[-1]["urethra_px"], rows[-1]["status"], rows[-1]["sul_mm"],
-            rows[-1]["radius_mm"], rows[-1]["fit_resid_mm"]), flush=True)
+        print("  %s  px %6d  %-26s  start %-5s  SUL %s  r %s  resid %s" % (
+            rows[-1]["frame"], rows[-1]["urethra_px"], rows[-1]["status"], rows[-1]["start_ok"],
+            rows[-1]["sul_mm"], rows[-1]["radius_mm"], rows[-1]["fit_resid_mm"]), flush=True)
 
     with open(os.path.join(out, "frames.csv"), "w", newline="") as fh:
         wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
         wr.writeheader()
         wr.writerows(rows)
     sul = np.array([r["sul_mm"] for r in rows], float)
-    good = np.isfinite(sul)
+    found = np.isfinite(sul)
+    good = found & np.array([r["start_ok"] for r in rows])      # both ends actually observed
     summary = dict(run=a.run, frames=len(rows), fitted=sum(f[3] is not None for f in frames),
-                   end_found=int(good.sum()),
+                   end_found=int(found.sum()), both_ends_observed=int(good.sum()),
+                   sul_median_all_found_mm=float(np.median(sul[found])) if found.any() else None,
                    sul_median_mm=float(np.median(sul[good])) if good.any() else None,
                    sul_iqr_mm=[float(x) for x in np.percentile(sul[good], [25, 75])] if good.any() else None,
                    radius_median_mm=float(np.nanmedian([r["radius_mm"] for r in rows])),
@@ -457,7 +484,7 @@ def main():
     vw.release()
 
     if good.any():                          # the 3D figure on the frame closest to the median SUL
-        i = int(np.nanargmin(np.abs(sul - np.median(sul[good]))))
+        i = int(np.argmin(np.where(good, np.abs(sul - np.median(sul[good])), np.inf)))
         img, zmap, seg, fr = frames[i]
         fig_3d(img, zmap, seg, fr, K, os.path.join(out, "fig_3d.png"))
         panel = label(cv2.resize(draw(img, seg, fr, K), (1005, 804)), "frame %s" % rows[i]["frame"])
