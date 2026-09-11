@@ -276,7 +276,7 @@ def march(p, d, r, t0, zmap, seg, K, ext, margin, sign=1, rule="knee", step=0.2,
 
 
 def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40, inlier_mm=1.0,
-            end_rule="knee", start_rule="knee"):
+            end_rule="knee3", start_rule="knee"):
     """One frame -> cylinder, start, end, SUL (or None when there is too little urethra).
 
     The mask is only a rough WHERE. A first fit runs on its eroded core; then every depth point near
@@ -672,7 +672,7 @@ def main():
     ap.add_argument("--fps", type=float, default=20.0)
     ap.add_argument("--masks", help="folder of hand masks <frame>.png from the labelling tool; "
                     "replaces the model, frames without a mask are skipped")
-    ap.add_argument("--end-rule", default="knee", choices=["knee3", "knee", "zero"],
+    ap.add_argument("--end-rule", default="knee3", choices=["knee3", "knee", "zero"],
                     help="where the roof crossing sits: knee of the gap profile, or where it leaves 0")
     ap.add_argument("--start-rule", default="knee", choices=["knee3", "knee", "zero"])
     ap.add_argument("--points", help="CSV frame,ax,ay,bx,by: the annotator's start/end points")
@@ -698,7 +698,7 @@ def main():
         P1 = np.array(json.load(fh)["P1"])
     K = (P1[0, 0], P1[1, 1], P1[0, 2], P1[1, 2])
     out = os.path.join(a.run, ("urethra_cyl_hand" if a.masks else "urethra_cyl") +
-                       ("" if (a.end_rule, a.start_rule) == ("knee", "knee")
+                       ("" if (a.end_rule, a.start_rule) == ("knee3", "knee")
                         else "_end-%s_start-%s" % (a.end_rule, a.start_rule)))
     os.makedirs(out, exist_ok=True)
     imgs = sorted(glob.glob(os.path.join(a.run, "images", "*.png")))
