@@ -31,7 +31,6 @@ python scripts/temporal_stereo_clip.py \
     --out "$OUT" \
     --start 12 --seconds 5 --fps 20 \
     --matcher ffs --scale 0.5 \
-    --window 4 --min-support 2 \
     "$@"
 
 module load FFmpeg/6.0-GCCcore-12.3.0

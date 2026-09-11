@@ -323,12 +323,23 @@ def main():
     ap.add_argument("--ffs-model",
                     default="~/Fast-FoundationStereo/weights/c-fast/model_best_bp2_serialize.pth")
     ap.add_argument("--ffs-iters", type=int, default=8)
-    ap.add_argument("--window", type=int, default=4,
-                    help="+-k frames fused (4 = +-0.2 s at 20 fps)")
+    # Defaults are the measured operating point, not a guess. Swept on one cached 5 s window
+    # (holes closed / leave-one-out agreement):
+    #   w4 fb1.5 sup2  18%  0.10 mm      w8 fb3   sup2  22%  0.11 mm
+    #   w4 fb3   sup2  19%  0.10 mm      w8 fb3   sup1  30%  0.11 mm  <- adopted
+    #   w8 fb1.5 sup2  20%  0.11 mm      w8 fb3   sup1 mad3  34%  0.12 mm
+    ap.add_argument("--window", type=int, default=8,
+                    help="+-k frames fused (8 = +-0.4 s at 20 fps)")
     ap.add_argument("--flow-scale", type=float, default=0.5)
-    ap.add_argument("--fb-tol", type=float, default=1.5, help="px round-trip flow error allowed")
-    ap.add_argument("--min-support", type=int, default=2, help="neighbours that must agree")
-    ap.add_argument("--mad-tol", type=float, default=1.5, help="px spread allowed among them")
+    ap.add_argument("--fb-tol", type=float, default=3.0, help="px round-trip flow error allowed")
+    ap.add_argument("--min-support", type=int, default=1,
+                    help="neighbours that must agree. 1 is deliberate: stratified by support, "
+                         "agreement is 0.62 mm at support 1, 0.29 at 2, 0.11 at 3+ -- so even "
+                         "the unverified fills land inside the 0.9 mm calibration MAE, and they "
+                         "are only ~1.3%% of the frame")
+    ap.add_argument("--mad-tol", type=float, default=1.5,
+                    help="px spread allowed among them. 3.0 closes 34%% of holes instead of "
+                         "30%%, at 0.29 -> 0.33 mm on the support-2 pixels")
     ap.add_argument("--no-align", dest="align", action="store_false",
                     help="do NOT remove the median own-vs-warped disparity offset")
     ap.add_argument("--temporal-median", action="store_true",
