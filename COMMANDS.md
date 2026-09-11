@@ -124,3 +124,38 @@ hidden by a small screen.
 - The .npz files are NOT the bottleneck: writing one (448x560 float32, ~1 MB) is under a
   millisecond uncompressed, reading one is a few ms - both negligible next to the multi-second
   CPU forward pass. Storage format was never the cause; the timing tag now proves it either way.
+
+## Temporal stereo on a 3D clip (depth from the video, not one frame)
+
+```bash
+# default: 5 s at 20 fps from the seg3 clip, FoundationStereo, +-8 frames fused
+sbatch jobs/temporal_stereo.sh
+
+# a different window of the same clip, and keep the fused depth as proxy GT
+sbatch jobs/temporal_stereo.sh --start 30 --seconds 4 --save-depth
+
+# another clip / output folder
+CLIP=../data/3D_ProxyGT/<other>.mp4 OUT=outputs/temporal_stereo/other sbatch --export=ALL,CLIP,OUT jobs/temporal_stereo.sh
+```
+
+Writes into `$OUT`: `depth.mp4` (video | depth), `compare.mp4` (video | single pair | temporal,
+white = filled from other frames, grey = still unsolved), `figure.png` (first frame of the same
+three panels), `stats.json`.  `*_h264.mp4` are the same clips re-encoded so they play in a
+browser — send those, not the `mp4v` originals.
+
+**The matcher output is cached**, so re-running with different fusion settings does NOT need a
+GPU. Tune on a CPU node:
+
+```bash
+sbatch --partition=genoa --gpus-per-node=0 --export=ALL,OUT=outputs/temporal_stereo/try1 jobs/temporal_stereo.sh --window 8 --fb-tol 3.0 --min-support 1
+```
+
+Read in the log: `single pair valid X%` vs `+ temporal valid Y%` (both over the geometrically
+usable area, not the whole frame), `% of the holes closed`, and `agree ... by support` — the
+leave-one-out error of the transferred values, split by how many frames agreed. Holes left are
+attributed as `blind` (nothing in the window saw it — a floor, not a knob), `flow`, `thin`,
+`disagree`; only the last three respond to tuning.
+
+Coverage is what improves (84.1% -> 88.9% on the measured window). Depth where the single pair
+already worked is left alone, and measured temporal jitter is only 0.13 mm, so do not expect the
+map to get *sharper* — it gets *more complete*.

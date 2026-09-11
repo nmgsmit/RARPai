@@ -3,6 +3,50 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-11 - DEPTH 3D: TEMPORAL stereo - a video closes 30% of one pair's holes, but does NOT sharpen it
+
+- `scripts/temporal_stereo_clip.py` + `jobs/temporal_stereo.sh`. Sample one window at 20 fps
+  (59.94/3), run the existing per-frame matcher, then warp every neighbour's disparity into the
+  current frame along DIS optical-flow chains and take the median of what survives three gates:
+  forward-backward flow consistency, >= `--min-support` frames agreeing, tight MAD.
+- RESULT on 5 s of the seg3 clip, FFS at scale 0.5, 100 frames: **84.1% -> 88.9%** of the usable
+  area solved, i.e. **30% of the holes closed**, leave-one-out agreement **0.11 mm**. Biggest
+  gain exactly where the single pair is worst: the 5 worst frames go 46.5->62.9, 47.6->58.6,
+  53.6->62.4, 55.4->56.4, 58.1->66.9%. Mean gain 4.7 pts, max 16.4.
+- **The win is COVERAGE, not precision.** Measured frame-to-frame depth jitter along the flow is
+  only 0.13 mm, so there was almost no temporal noise to average away, and by default valid
+  pixels keep their own-frame value (`--temporal-median` changes that; it is off). Anyone
+  expecting a video to make the depth *sharper* should be told it makes it *more complete*.
+- Ceiling is reported honestly: `geom` (rectified overlap minus GUI banner) is 98.7% of the
+  frame and NO method reaches the rest, so every percentage is over `geom`.
+- WHY EACH REMAINING HOLE SURVIVES, counted separately - this is what drove the tuning.
+  4.2% of the frame `blind` (no frame in the window saw that point - the real floor), 4.7%
+  `flow`-gated, 0.0% `thin`, 2.1% `disagree`. The first guess lumped these together as "nothing
+  there" and hid the fact that more was gated by my own thresholds than was genuinely occluded.
+- SWEEP on one cached window (holes closed / agreement): w4 fb1.5 sup2 18%/0.10mm; w4 fb3 sup2
+  19%; w8 fb1.5 sup2 20%; w8 fb3 sup2 22%; **w8 fb3 sup1 30%/0.11mm (adopted)**; w8 fb3 sup1
+  mad3 34%/0.12mm. Defaults pinned to the adopted row.
+- `--min-support 1` needed justifying, and pooled agreement could not do it. STRATIFIED BY
+  SUPPORT: **0.62 mm at support 1, 0.29 at 2, 0.11 at 3+**. So an uncorroborated fill is ~6x
+  worse than a well-supported one and still inside the 0.9 mm calibration MAE (STEREO_REPORT
+  §3), and it is only 1.3% of the frame. That is the trade, stated rather than assumed.
+- `--align-median` (default ON) removes the median own-vs-warped disparity offset per pair
+  before fusing, because depth-constant-along-the-flow is false under camera motion. Median
+  offset 0.14 px but **p95 29.9 px** - a few pairs really do move a lot, which is why the
+  alignment exists and why the MAD gate has to come after it.
+- Agreement is LEAVE-ONE-OUT by construction (fusion never sees the frame it fills) but still an
+  **optimistic bound**: it can only be evaluated where own stereo also succeeded, i.e. on the
+  easy pixels. Do not quote it as the error of the filled pixels.
+- The matcher is ~95% of runtime and depends on no fusion knob, so disparity is cached under
+  `outputs/temporal_stereo/_disp_cache/<key>` (float16, 0.125 px step = 0.015 mm). A sweep is
+  then a CPU job: the six configs above cost one GPU run plus CPU minutes.
+- Drawing decisions that were wrong first: per-frame percentile colour stretch (flickers, hides
+  real depth change - now one FIXED range for the clip); magma (the 23-115 mm span collapsed
+  into one dark purple - now turbo); black holes (invisible against turbo's dark violet far end,
+  where most holes are - now neutral grey 90,90,90, a colour no colormap here produces).
+- `--save-depth` writes the fused result in the proxy-GT layout (uint16 mm*16), so this is a
+  drop-in better GT generator, not only a demo.
+
 ## 2026-09-09 - DEPTH 3D: the surgical footage picks the distortion model, no re-record needed
 
 - PROBLEM: the ChArUco clip never reaches past r~592 while the frame corner is at r=906, so 26%

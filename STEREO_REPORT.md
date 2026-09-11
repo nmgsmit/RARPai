@@ -378,7 +378,86 @@ specular mask) rather than on the raw output.
 
 ---
 
-## 10. Method notes for writing up
+## 10. Temporal stereo — one video closes 30% of a single pair's holes
+
+A single rectified pair leaves part of every frame undetermined after the left-right check:
+measured over this window, **84.1% of the usable area is solved, p10 71.3%**. The holes are
+structural, not noise — occlusion, specular highlights, and textureless blood-covered tissue.
+The endoscope and the tissue move, so a point with no correspondence *now* usually had one a
+fraction of a second ago.
+
+[scripts/temporal_stereo_clip.py](scripts/temporal_stereo_clip.py) samples a window at 20 fps
+(every 3rd frame of 59.94), runs the same per-frame matcher, then warps every neighbour's
+disparity into the current frame along DIS optical-flow chains and takes the median of whatever
+survives three gates: forward–backward flow consistency, at least `--min-support` frames
+agreeing, and a tight MAD among them.
+
+![Temporal fill](docs/stereo/fig7_temporal_fill.png)
+
+*Figure 7 — Left: rectified left eye. Middle: single-pair depth, grey = unsolved. Right: after
+temporal fusion, white = pixels filled from other frames. Colour is inverse depth on one range
+fixed for the whole clip (23–115 mm).*
+
+### Result (5 s, 100 frames, seg3 clip, C-Fast-FoundationStereo at scale 0.5)
+
+| | single pair | + temporal |
+|---|---|---|
+| usable area solved | 84.1% | **88.9%** |
+| p10 across frames | 71.3% | **74.4%** |
+| holes closed | — | **29.8%** |
+
+Percentages are over the **geometrically usable area** (98.7% of the frame — the rest is outside
+the rectified overlap or inside the GUI banner, where no method can produce depth). The gain is
+largest exactly where the single pair is weakest: the five worst frames go 46.5→62.9, 47.6→58.6,
+53.6→62.4, 55.4→56.4 and 58.1→66.9%, against a mean gain of 4.7 points.
+
+### It improves COVERAGE, not precision
+
+Frame-to-frame depth jitter along the flow is **0.13 mm**, so there was almost no temporal noise
+to average away, and by default a pixel that the single pair already solved keeps its own value
+(`--temporal-median` overrides this and is off). A video makes the depth map *more complete*, not
+*sharper* — worth stating explicitly, because the opposite is the intuitive expectation.
+
+### How trustworthy is a filled pixel
+
+The fusion never sees the frame it fills, so where own stereo *also* succeeded the two can be
+compared directly. Stratified by how many frames agreed:
+
+| candidates agreeing | median \|ΔZ\| |
+|---|---|
+| 1 | 0.62 mm |
+| 2 | 0.29 mm |
+| 3 or more | 0.11 mm |
+
+An uncorroborated fill is ~6× worse than a well-supported one and still inside the **0.9 mm
+calibration MAE** (§3), which is what justifies `--min-support 1`; those pixels are 1.3% of the
+frame. **This is an optimistic bound** — it can only be evaluated where own stereo succeeded,
+i.e. on the easier pixels — so it is not the error of the filled pixels themselves.
+
+Every filled pixel is a *measurement moved*, never an interpolation: it comes from a real stereo
+correspondence in another frame. That is the reason for the gates rather than an inpainting step,
+and the reason `--align-median` removes each pair's median own-vs-warped disparity offset first
+— depth-constant-along-the-flow is false under camera motion (median offset 0.14 px here, but
+**p95 29.9 px**).
+
+### What is left, and whether tuning can reach it
+
+| remaining hole | % of frame | reachable? |
+|---|---|---|
+| blind — no frame in the window saw that point | 4.2 | no, this is the floor |
+| flow-gated — a neighbour had an answer, the round trip refused it | 4.7 | yes, `--fb-tol` |
+| disagreed | 2.1 | yes, `--mad-tol` |
+
+Swept on one cached window (holes closed / agreement): `w4 fb1.5 sup2` 18%/0.10 mm, `w8 fb3 sup2`
+22%/0.11, **`w8 fb3 sup1` 30%/0.11 (adopted)**, `w8 fb3 sup1 mad3` 34%/0.12. The matcher output
+is cached, so a sweep costs one GPU run plus CPU minutes.
+
+`--save-depth` writes the fused result in the proxy-GT layout (uint16, mm×16), so this is a
+drop-in replacement for the single-frame generator in §9, not only a demonstration.
+
+---
+
+## 11. Method notes for writing up
 
 - The SBS layout, the 2.125 scale, and the banner-as-ruler trick are all **measurements**, with
   `fx/fy = 1.0000` as the independent cross-check (Figures 1–2).
