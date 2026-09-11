@@ -264,6 +264,26 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40,
     return out
 
 
+def hand_measure(zmap, a_uv, b_uv, K, fr, patch=3):
+    """The annotator's two ruler points -> 3D (depth patch median) -> their SUL as a chord. With a
+    fitted cylinder, both are also projected on its axis: start/end error along the axis in mm,
+    method minus annotator, the more proximal of the pair being the start."""
+    fx, fy, cx, cy = K
+    X = []
+    for u, v in (a_uv, b_uv):
+        ui, vi = int(round(u)), int(round(v))
+        z = zmap[max(0, vi - patch):vi + patch + 1, max(0, ui - patch):ui + patch + 1]
+        z = z[z > 0]
+        zz = float(np.median(z)) if z.size else float("nan")
+        X.append(np.array([(u - cx) * zz / fx, (v - cy) * zz / fy, zz]))
+    out = dict(hand_sul=float(np.linalg.norm(X[0] - X[1])))
+    if fr is not None and np.isfinite(X[0]).all() and np.isfinite(X[1]).all():
+        ta, tb = sorted(float((x - fr["p"]) @ fr["d"]) for x in X)
+        out.update(hand_t=(ta, tb), hand_sul_axis=tb - ta, start_err=fr["t_start"] - ta,
+                   end_err=fr["t_end"] - tb if fr["found"] else float("nan"))
+    return out
+
+
 # ------------------------------------------------------------------ drawing
 
 def tube_line(fr, t0, t1, side, K, n=80):
@@ -275,11 +295,14 @@ def tube_line(fr, t0, t1, side, K, n=80):
     return np.round(proj(X, K)).astype(np.int32)
 
 
-def draw(img, seg, fr, K):
+def draw(img, seg, fr, K, hand=None):
     out = img.copy()
     for c, col in ((URETHRA, (0, 255, 255)), (PROSTATE, (255, 0, 255))):   # yellow, magenta
         m = seg == c
         out[m] = (0.55 * out[m] + 0.45 * np.array(col)).astype(np.uint8)
+    for q in (hand or ()):                    # the annotator's own start/end: blue crosses
+        cv2.drawMarker(out, tuple(int(round(x)) for x in q), (255, 128, 0), cv2.MARKER_CROSS, 30, 4,
+                       cv2.LINE_AA)
     if fr is None:
         return out
     t_end = fr["t_end"] if fr["found"] else fr["ts"][-1]
@@ -303,7 +326,7 @@ def label(panel, text):
     return t
 
 
-def profile(fr, w, h, margin, gmin=-6.0, gmax=12.0):
+def profile(fr, w, h, margin, hand_t=None, gmin=-6.0, gmax=12.0):
     img = np.full((h, w, 3), 24, np.uint8)
     if fr is None:
         cv2.putText(img, "no urethra in this frame", (20, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
@@ -332,6 +355,10 @@ def profile(fr, w, h, margin, gmin=-6.0, gmax=12.0):
     cv2.line(img, (X(ts0), T), (X(ts0), h - B), (0, 255, 0), 2)
     if fr["found"]:
         cv2.line(img, (X(fr["t_end"]), T), (X(fr["t_end"]), h - B), (0, 0, 255), 2)
+    for tt in (hand_t or ()):                 # the annotator's start/end, dashed blue
+        if x0 <= tt <= x1:
+            for yy in range(T, h - B, 10):
+                cv2.line(img, (X(tt), yy), (X(tt), yy + 5), (255, 128, 0), 2)
     if fr["found"] and fr["start_found"]:
         msg = ("SUL %.1f mm   start: %s   (mask start would give %.1f)   r %.1f mm"
                % (fr["sul"], fr["start_kind"], fr["sul_mask"], fr["r"]))
@@ -416,6 +443,9 @@ def fig_time(rows, path):
                label="an end hidden (not counted)")
     ax[0].plot(t, [r["sul_mask_mm"] for r in rows], "x", ms=4, color="0.6",
                label="with the mask's start instead")
+    hs = np.array([r.get("hand_sul_mm", np.nan) for r in rows], float)
+    if np.isfinite(hs).any():
+        ax[0].plot(t, hs, "+", ms=10, mew=2, color="tab:blue", label="your ruler points (3D chord)")
     if ok.any():
         m = np.median(sul[ok])
         ax[0].axhline(m, color="r", label="median %.1f mm (n=%d)" % (m, ok.sum()))
@@ -490,6 +520,13 @@ def self_test():
     assert ang < 4, "axis direction (or orientation flipped)"
     assert fr["found"] and fr["start_ok"] and fr["start_kind"] == "open end", "cut end"
     assert abs(fr["sul"] - t_roof) < 1.5, "SUL, cut end"
+    ends = [p_true + t * d_true + r_true * toward_camera(p_true + t * d_true, d_true)
+            for t in (0.5, t_roof - 0.5)]              # just inside, so the patch is all tube
+    hm = hand_measure(z, *proj(np.array(ends), K), K, fr, patch=1)
+    print("self-test points: hand SUL %.2f (true %.1f)  start err %+.2f  end err %+.2f mm"
+          % (hm["hand_sul"], t_roof - 1, hm["start_err"], hm["end_err"]))
+    assert abs(hm["hand_sul"] - (t_roof - 1)) < 1.0, "hand chord"
+    assert abs(hm["start_err"]) < 1.5 and abs(hm["end_err"]) < 1.5, "hand vs method along the axis"
     zb, segb = render(K, W, H, p_true, d_true, r_true, t_roof, base=True)
     frb = run(noisy(zb), segb)
     print("self-test prostate: SUL %.2f (true %.1f)  start=%s  rule=%s"
@@ -522,6 +559,7 @@ def main():
     ap.add_argument("--fps", type=float, default=20.0)
     ap.add_argument("--masks", help="folder of hand masks <frame>.png from the labelling tool; "
                     "replaces the model, frames without a mask are skipped")
+    ap.add_argument("--points", help="CSV frame,ax,ay,bx,by: the annotator's start/end points")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
@@ -549,7 +587,13 @@ def main():
     if not imgs:
         raise SystemExit("no %s/images/*.png -- run temporal_stereo_clip.py with --save-depth" % a.run)
 
-    frames, rows = [], []
+    pts = {}
+    if a.points:                          # frame,ax,ay,bx,by -- the annotator's two ruler points
+        with open(a.points) as fh:
+            for r in csv.DictReader(fh):
+                pts[r["frame"]] = (np.array([float(r["ax"]), float(r["ay"])]),
+                                   np.array([float(r["bx"]), float(r["by"])]))
+    frames, rows, hands = [], [], []
     for k, pth in enumerate(imgs):
         mpath = os.path.join(a.masks, os.path.basename(pth)[:-4] + ".png") if a.masks else None
         if mpath and not os.path.isfile(mpath):
@@ -564,6 +608,9 @@ def main():
                                         (a.img_size, a.img_size), dev), URETHRA)
         fr = analyse(zmap, seg, K, a.erode, a.ext, a.margin)
         frames.append((img, zmap, seg, fr))
+        name = os.path.basename(pth)[:-4]
+        hd = dict(uv=pts[name], **hand_measure(zmap, *pts[name], K, fr)) if name in pts else {}
+        hands.append(hd)
         rows.append(dict(frame=os.path.basename(pth)[:-4], time_s=round(k / a.fps, 3),
                          urethra_px=int((seg == URETHRA).sum()),
                          status="no urethra" if fr is None else fr["status"],
@@ -575,7 +622,11 @@ def main():
                          # half the 3D width across the tube: what a CIRCULAR tube would need
                          radius_silhouette_mm=float("nan") if fr is None else round(fr["r_sil"], 2),
                          fit_resid_mm=float("nan") if fr is None else round(fr["res"], 3),
-                         orient=None if fr is None else fr["rule"]))
+                         orient=None if fr is None else fr["rule"],
+                         hand_sul_mm=round(hd.get("hand_sul", float("nan")), 2),
+                         hand_sul_axis_mm=round(hd.get("hand_sul_axis", float("nan")), 2),
+                         start_err_mm=round(hd.get("start_err", float("nan")), 2),
+                         end_err_mm=round(hd.get("end_err", float("nan")), 2)))
         print("  %s  px %6d  end %-22s  start %-18s ok %-5s  SUL %s (mask %s)  r %s" % (
             rows[-1]["frame"], rows[-1]["urethra_px"], rows[-1]["status"], rows[-1]["start"],
             rows[-1]["start_ok"], rows[-1]["sul_mm"], rows[-1]["sul_mask_mm"],
@@ -600,6 +651,17 @@ def main():
                    start_kinds={str(k): sum(r["start"] == k for r in rows) for k in set(r["start"] for r in rows)},
                    radius_median_mm=float(np.nanmedian([r["radius_mm"] for r in rows])),
                    margin_mm=a.margin, erode_px=a.erode)
+    if pts:
+        col = lambda k: np.array([r[k] for r in rows], float)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            summary.update(
+                frames_with_points=int(np.isfinite(col("hand_sul_mm")).sum()),
+                hand_sul_median_mm=float(np.nanmedian(col("hand_sul_mm"))),
+                hand_sul_along_axis_median_mm=float(np.nanmedian(col("hand_sul_axis_mm"))),
+                start_err_median_abs_mm=float(np.nanmedian(np.abs(col("start_err_mm")))),
+                end_err_median_abs_mm=float(np.nanmedian(np.abs(col("end_err_mm")))),
+                end_err_median_signed_mm=float(np.nanmedian(col("end_err_mm"))))
     with open(os.path.join(out, "summary.json"), "w") as fh:
         json.dump(summary, fh, indent=2)
     print(json.dumps(summary, indent=2))
@@ -607,16 +669,16 @@ def main():
     zs = np.concatenate([f[1][f[1] > 0][::97] for f in frames])
     lo, hi = np.percentile(zs, [2, 97])
     vw = None
-    for img, zmap, seg, fr in frames:
+    for (img, zmap, seg, fr), hd in zip(frames, hands):
         heat = colorize(np.where(zmap > 0, 1.0 / np.maximum(zmap, 1e-6), np.nan), 1 / hi, 1 / lo,
                         cv2.COLORMAP_TURBO)
         heat[zmap <= 0] = (90, 90, 90)
         small = lambda x: cv2.resize(x, (670, 536), interpolation=cv2.INTER_AREA)
-        top = np.hstack([label(small(draw(img, seg, fr, K)), "urethra mask (yellow), cylinder (cyan),"
+        top = np.hstack([label(small(draw(img, seg, fr, K, hd.get("uv"))), "urethra mask (yellow), cylinder (cyan),"
                                                               " start (green), roof end (red)"),
-                         label(small(draw(heat, seg, fr, K)), "stereo depth %.0f-%.0f mm, grey = none"
+                         label(small(draw(heat, seg, fr, K, hd.get("uv"))), "stereo depth %.0f-%.0f mm, grey = none"
                                % (lo, hi))])
-        frame = np.vstack([top, profile(fr, top.shape[1], 240, a.margin)])
+        frame = np.vstack([top, profile(fr, top.shape[1], 240, a.margin, hd.get("hand_t"))])
         if vw is None:
             vw = cv2.VideoWriter(os.path.join(out, "overlay.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
                                  a.fps, (frame.shape[1], frame.shape[0]))
@@ -626,10 +688,11 @@ def main():
     if good.any():                          # the 3D figure on the frame closest to the median SUL
         i = int(np.argmin(np.where(good, np.abs(sul - np.median(sul[good])), np.inf)))
         img, zmap, seg, fr = frames[i]
+        hd = hands[i]
         fig_3d(img, zmap, seg, fr, K, os.path.join(out, "fig_3d.png"))
-        panel = label(cv2.resize(draw(img, seg, fr, K), (1005, 804)), "frame %s" % rows[i]["frame"])
+        panel = label(cv2.resize(draw(img, seg, fr, K, hd.get("uv")), (1005, 804)), "frame %s" % rows[i]["frame"])
         cv2.imwrite(os.path.join(out, "frame_median.png"),
-                    np.vstack([panel, profile(fr, panel.shape[1], 240, a.margin)]))
+                    np.vstack([panel, profile(fr, panel.shape[1], 240, a.margin, hd.get("hand_t"))]))
     fig_time(rows, os.path.join(out, "sul_time.png"))
     print("wrote %s/{overlay.mp4, fig_3d.png, frame_median.png, sul_time.png, frames.csv, summary.json}"
           % out)

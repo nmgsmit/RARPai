@@ -188,3 +188,7 @@ from `OTHERS/annotate_urethra/<clip>/masks/`), uploaded next to the run. Writes
 scp -r "OTHERS/annotate_urethra/short_seg3_14s/masks" snellius:~/RARPai/outputs/temporal_stereo/noocc_seg3_14s/hand_masks
 sbatch --export=ALL,RUN=outputs/temporal_stereo/noocc_seg3_14s,SLOW=10 jobs/urethra_cylinder.sh --masks outputs/temporal_stereo/noocc_seg3_14s/hand_masks --fps 59.94
 ```
+
+Add `--points outputs/temporal_stereo/<run>/hand_points.csv` (frame,ax,ay,bx,by -- your ruler start/end,
+converted from `scale_objects.json`) for blue crosses, your SUL as a 3D chord, and start/end errors
+along the fitted axis in `frames.csv` / `summary.json`.
