@@ -322,11 +322,15 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40,
     # open end, catheter) wins; no step but the depth is seen -> keep the mask's start; the depth
     # past the mask's start unknown (instrument / no depth) -> the start is hidden.
     beg = march(p, d, r, t_mask + 3.0, zmap, seg, K, 8.0, margin, sign=-1, rule=start_rule)
-    if beg["found"]:
+    # OUTWARD ONLY: the depth may move the start past the mask's edge (to the catheter, the prostate
+    # step), never into it -- the mask shows urethra there. On the long 5e27 clip a gradual junction
+    # put the depth start 4.2 mm inside the mask in 19/28 frames (+3.6 mm vs Nick; the mask's edge
+    # was -0.5). Cost: a mask that overshoots the start can no longer be pulled back inward.
+    if beg["found"] and beg["t"] <= t_mask:
         t_start, kind, hidden = beg["t"], beg["status"], beg["hidden"]
     else:
         past = beg["ts"] < t_mask
-        t_start, kind = t_mask, "mask (no step)"
+        t_start, kind = t_mask, "mask (step inside)" if beg["found"] else "mask (no step)"
         hidden = not (past.any() and np.isfinite(beg["gap"][past]).mean() >= 0.5)
     out = dict(p=p, d=d, r=r, r_sil=r_sil, res=res, rule=rule, n=len(S),
                t_start=t_start, t_mask_start=t_mask,
@@ -646,6 +650,14 @@ def self_test():
           % (frb["sul"], t_roof, frb["start_kind"], frb["rule"]))
     assert frb["start_ok"] and frb["start_kind"].startswith("base"), "prostate base as the start"
     assert abs(frb["sul"] - t_roof) < 1.5, "SUL, prostate base"
+    tb = (np.stack([(uu - cx) * zb / fx, (vv - cy) * zb / fy, zb], -1) - p_true) @ d_true
+    segb2 = segb.copy()                      # a mask that runs 2 mm past the junction onto the prostate
+    segb2[(segb == PROSTATE) & (tb > -2) & (tb < 0)] = URETHRA
+    frb2 = run(noisy(zb), segb2)
+    print("self-test mask past the start: start=%s  t_start-t_mask %.2f  SUL %.2f"
+          % (frb2["start_kind"], frb2["t_start"] - frb2["t_mask_start"], frb2["sul"]))
+    assert frb2["start_kind"] == "mask (step inside)" and frb2["t_start"] == frb2["t_mask_start"], \
+        "outward-only: a depth step inside the mask must give way to the mask's edge"
     z3, seg3 = z.copy(), seg.copy()
     z3[172:], seg3[172:] = 40.0, NONANAT     # an instrument across the proximal ~5 mm
     fr3 = run(z3, seg3)
