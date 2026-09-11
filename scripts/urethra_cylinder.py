@@ -219,15 +219,26 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40,
     d, rule = orient(p, d, S, suv, seg)
     t0 = float(np.median((S - p) @ d))
     end = march(p, d, r, t0, zmap, seg, K, ext, margin, sign=+1)
-    beg = march(p, d, r, t0, zmap, seg, K, ext, margin, sign=-1)
     t_mask = float(np.percentile((P - p) @ d, 1))      # where the MASK starts (eroded core)
+    # The start is searched only NEAR the mask's start: 3 mm inside it to 5 mm past it. Walking
+    # the whole tube from mid-way stopped at the first bump -- an instrument jaw lying on it, or
+    # where a curved urethra leaves the straight cylinder -- and cut seg3 from 23.9 to 12.6 mm.
+    # So the mask places the start and the depth sharpens the border: a step there (prostate base,
+    # open end, catheter) wins; no step but the depth is seen -> keep the mask's start; the depth
+    # past the mask's start unknown (instrument / no depth) -> the start is hidden.
+    beg = march(p, d, r, t_mask + 3.0, zmap, seg, K, 8.0, margin, sign=-1)
+    if beg["found"]:
+        t_start, kind, hidden = beg["t"], beg["status"], beg["hidden"]
+    else:
+        past = beg["ts"] < t_mask
+        t_start, kind = t_mask, "mask (no step)"
+        hidden = not (past.any() and np.isfinite(beg["gap"][past]).mean() >= 0.5)
     out = dict(p=p, d=d, r=r, r_sil=r_sil, res=res, rule=rule, n=len(S),
-               t_start=beg["t"] if beg["found"] else t_mask, t_mask_start=t_mask,
+               t_start=t_start, t_mask_start=t_mask,
                t_end=end.get("t"), found=end["found"], status=end["status"],
                ts=end["ts"], gap=end["gap"], ts_back=beg["ts"], gap_back=beg["gap"],
-               start_found=beg["found"], start_kind=beg["status"],
-               start_ok=beg["found"] and not beg["hidden"] and not end["hidden"])
-    out["sul"] = out["t_end"] - out["t_start"] if end["found"] and beg["found"] else float("nan")
+               start_found=True, start_kind=kind, start_ok=not hidden and not end["hidden"])
+    out["sul"] = out["t_end"] - t_start if end["found"] else float("nan")
     out["sul_mask"] = out["t_end"] - t_mask if end["found"] else float("nan")
     return out
 
