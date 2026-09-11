@@ -278,9 +278,16 @@ def color_bar(lo, hi, width, cmap, height=26):
 def depth_panel(z, lo, hi, cmap, tint=None):
     """Colour is INVERSE depth (near = the warm end, matching gui_depth_measure) on a range
     FIXED for the whole clip -- a per-frame percentile stretch makes the video flicker and hides
-    real depth change behind renormalisation. Unsolved pixels stay black."""
+    real depth change behind renormalisation.
+
+    Unsolved pixels are NEUTRAL GREY, which no colormap here ever produces. Black was the first
+    choice and it was wrong: turbo's far end is a very dark violet, so holes in the deep cavity
+    -- where they mostly are -- were nearly invisible, which is the opposite of what a figure
+    about hole filling should do.
+    """
     ok = z > 0
     heat = colorize(np.where(ok, 1.0 / np.maximum(z, 1e-6), np.nan), 1 / hi, 1 / lo, cmap)
+    heat[~ok] = (90, 90, 90)
     if tint is not None and tint.any():
         heat[tint] = (0.35 * heat[tint] + 0.65 * np.array([255, 255, 255])).astype(np.uint8)
     return heat
@@ -396,11 +403,18 @@ def main():
                    flow=float((rem & (raw > 0) & (support == 0)).mean()),
                    thin=float((rem & (support >= 1) & (support < a.min_support)).mean()),
                    disagree=float((rem & (support >= a.min_support) & ~tight).mean()))
-        agree = np.nan
+        # Agreement STRATIFIED BY SUPPORT. The pooled number is dominated by pixels many frames
+        # agreed on, so it cannot say whether a pixel filled from a SINGLE candidate is safe --
+        # which is exactly the question --min-support asks.
+        agree, strat = np.nan, {}
         if checkable.any():
             zo = to_depth(disps[t][checkable], fB)
             zm = to_depth(np.maximum(med[checkable], 1e-6), fB)
             agree = float(np.median(np.abs(zo - zm)))
+            sup_c = support[checkable]
+            for lvl, sel in ((1, sup_c == 1), (2, sup_c == 2), (3, sup_c >= 3)):
+                if sel.sum() > 500:
+                    strat[lvl] = float(np.median(np.abs(zo[sel] - zm[sel])))
         if t:                                   # 1-frame depth jitter, measured along the flow
             prev = sample_nan(disps[t - 1], upflow(bwd[t - 1].copy(), OUT_W, OUT_H))
             b = np.isfinite(prev) & own_ok
@@ -417,6 +431,8 @@ def main():
                          own_g=float(own_ok[geom].mean()),
                          fused_g=float(np.isfinite(fused)[geom].mean()), agree_mm=agree,
                          support=float(support[filled].mean()) if filled.any() else 0.0,
+                         filled_sup1=float((filled & (support == 1)).mean()),
+                         **{"agree_mm_sup%d" % k: v for k, v in strat.items()},
                          **{"hole_" + k: v for k, v in why.items()}))
         print("  f%05d  own %5.1f%%  fused %5.1f%%  filled %4.1f%%  agree %s mm"
               "   left: %4.1f%% blind %4.1f%% flow %4.1f%% thin %4.1f%% disagree"
@@ -477,6 +493,11 @@ def main():
         valid_gain=float(fus.mean() - own.mean()),
         holes_closed=float((fus.mean() - own.mean()) / max(1e-9, 1 - own.mean())),
         agree_mm_median=float(np.nanmedian(ag)),
+        agree_mm_by_support={
+            k: float(np.nanmedian([r[k] for r in rows if k in r]))
+            for k in ("agree_mm_sup1", "agree_mm_sup2", "agree_mm_sup3")
+            if any(k in r for r in rows)},
+        filled_from_one_candidate=float(np.mean([r["filled_sup1"] for r in rows])),
         holes_left_blind=float(np.mean([r["hole_blind"] for r in rows])),
         holes_left_flow=float(np.mean([r["hole_flow"] for r in rows])),
         holes_left_thin=float(np.mean([r["hole_thin"] for r in rows])),
@@ -497,8 +518,12 @@ def main():
           "%.1f flow-gated, %.1f too few, %.1f disagreed"
           % (100 * summary["holes_left_blind"], 100 * summary["holes_left_flow"],
              100 * summary["holes_left_thin"], 100 * summary["holes_left_disagree"]))
-    print("leave-one-out agreement (optimistic bound): median %.2f mm"
-          % summary["agree_mm_median"])
+    print("leave-one-out agreement (optimistic bound): median %.2f mm, by support %s"
+          % (summary["agree_mm_median"],
+             "  ".join("%s %.2f mm" % (k[-4:], v)
+                       for k, v in sorted(summary["agree_mm_by_support"].items()))))
+    print("of the filled pixels, %.1f%% of the frame rested on a single candidate"
+          % (100 * summary["filled_from_one_candidate"]))
     if summary["align_offset_px_median"] is not None:
         print("own-vs-warped disparity offset: median %.3f px, p95 %.3f px"
               % (summary["align_offset_px_median"], summary["align_offset_px_p95"]))
