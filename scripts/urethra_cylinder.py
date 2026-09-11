@@ -157,13 +157,37 @@ def gap_along(p, d, r, ts, zmap, seg, K, patch=2):
     return S[:, 2] - zobs, inside, cls
 
 
-def march(p, d, r, t0, zmap, seg, K, ext, margin, sign=1, step=0.2, zero_tol=0.5, run_mm=1.0):
+def knee(ts, g, i1, sign):
+    """Breakpoint of a continuous two-segment line fitted to g[0..i1]: where the gap stops being
+    flat-ish and starts to rise. The first segment has its own slope, so a slow drift before the
+    step (a curved urethra, a gently bulging surface) is absorbed instead of triggering it.
+    -> (index, extra slope after the knee) or (None, 0.0) with too few points."""
+    idx = np.flatnonzero(np.isfinite(g[:i1 + 1]))
+    if len(idx) < 8:
+        return None, 0.0
+    t, y = ts[idx], g[idx]
+    best = (np.inf, None, 0.0)
+    for c in range(3, len(idx) - 2):
+        X = np.stack([np.ones_like(t), t - t[c], np.maximum(0.0, sign * (t - t[c]))], 1)
+        coef = np.linalg.lstsq(X, y, rcond=None)[0]
+        sse = float(((X @ coef - y) ** 2).sum())
+        if sse < best[0]:
+            best = (sse, int(idx[c]), float(coef[2]))
+    return best[1], best[2]
+
+
+def march(p, d, r, t0, zmap, seg, K, ext, margin, sign=1, rule="knee", step=0.2, zero_tol=0.5,
+          run_mm=1.0):
     """Walk the tube's top line from t0 and find where the observed surface stops being the tube.
 
     distal (sign +1): only a surface IN FRONT counts -- the roof.
     proximal (-1):    in front (the prostate base: the same kind of step as the roof), BEHIND (an
                       open, cut end), or the catheter, which leaves the cut end and would otherwise
                       read as more tube.
+    Detection is a sustained |gap| > margin; WHERE the crossing is depends on `rule`:
+      knee -- the breakpoint of a two-segment fit (where the steep change starts). Nick marks the
+              end there; the zero rule landed 3.5-5.8 mm before it on seg3, on the slow drift.
+      zero -- where the gap leaves ~0: walk back to |gap| <= zero_tol, interpolate to 0.
     If the tube was not seen in the last mm before the crossing (instrument / no depth), the
     crossing is not where the tube ends but where it reappears: that end is HIDDEN.
     """
@@ -178,17 +202,26 @@ def march(p, d, r, t0, zmap, seg, K, ext, margin, sign=1, step=0.2, zero_tol=0.5
     if run.size:
         j = i = run[0]
         t_cross = float(ts[i])
-        if cls[i] != CATHETER:
-            # the margin only makes the detection robust; the end is where the gap LEAVES zero.
-            # Walk back to ~0, then put the crossing where the line through that sample and the
-            # first sustained one hits zero -- a threshold alone lands ~zero_tol/slope past it,
-            # and with both ends measured this way the two offsets would add up in SUL
-            while j > 0 and ((g[j - 1] > zero_tol) if sign > 0 else (abs(g[j - 1]) > zero_tol)):
-                j -= 1
-            t_cross = float(ts[j])
-            if i > j and g[i] != g[j]:
-                t_cross = float(ts[j] + np.clip(g[j] / (g[j] - g[i]), -1, 1) * (ts[i] - ts[j]))
         front = bool(np.isfinite(gap[i:i + k]).any() and np.nanmedian(gap[i:i + k]) > 0)
+        if cls[i] != CATHETER:
+            done = False
+            if rule == "knee":
+                # fit up to where the change is clearly established (3 x margin), at most 6 mm past
+                # the detection, so the second segment is the steep part and not the plateau
+                big = np.flatnonzero(np.abs(g[i:]) > 3 * margin)
+                e = min(i + (big[0] if big.size else len(ts)), i + int(6 / step), len(ts) - 1)
+                kj, extra = knee(ts, gap, e, sign)
+                if kj is not None and kj <= i and extra * (1 if front else -1) > 0:
+                    j, t_cross, done = kj, float(ts[kj]), True
+            if not done:
+                # the margin only makes the detection robust; the end is where the gap LEAVES zero.
+                # Walk back to ~0, then put the crossing where the line through that sample and the
+                # first sustained one hits zero (a threshold alone lands ~zero_tol/slope past it)
+                while j > 0 and ((g[j - 1] > zero_tol) if sign > 0 else (abs(g[j - 1]) > zero_tol)):
+                    j -= 1
+                t_cross = float(ts[j])
+                if i > j and g[i] != g[j]:
+                    t_cross = float(ts[j] + np.clip(g[j] / (g[j] - g[i]), -1, 1) * (ts[i] - ts[j]))
         kind = ("catheter" if cls[i] == CATHETER else
                 ("roof" if sign > 0 else "base") if front else "open end")
         if kind == "base" and cls[i] == PROSTATE:
@@ -202,7 +235,8 @@ def march(p, d, r, t0, zmap, seg, K, ext, margin, sign=1, step=0.2, zero_tol=0.5
     return out
 
 
-def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40, inlier_mm=1.0):
+def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40, inlier_mm=1.0,
+            end_rule="knee", start_rule="knee"):
     """One frame -> cylinder, start, end, SUL (or None when there is too little urethra).
 
     The mask is only a rough WHERE. A first fit runs on its eroded core; then every depth point near
@@ -239,7 +273,7 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40,
         p, d, r, res, _ = fit_cylinder(S, init=(p, d, r))
     d, rule = orient(p, d, S, suv, seg)
     t0 = float(np.median((S - p) @ d))
-    end = march(p, d, r, t0, zmap, seg, K, ext, margin, sign=+1)
+    end = march(p, d, r, t0, zmap, seg, K, ext, margin, sign=+1, rule=end_rule)
     t_mask = float(np.percentile((P - p) @ d, 1))      # where the MASK starts (eroded core)
     # The start is searched only NEAR the mask's start: 3 mm inside it to 5 mm past it. Walking
     # the whole tube from mid-way stopped at the first bump -- an instrument jaw lying on it, or
@@ -247,7 +281,7 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40,
     # So the mask places the start and the depth sharpens the border: a step there (prostate base,
     # open end, catheter) wins; no step but the depth is seen -> keep the mask's start; the depth
     # past the mask's start unknown (instrument / no depth) -> the start is hidden.
-    beg = march(p, d, r, t_mask + 3.0, zmap, seg, K, 8.0, margin, sign=-1)
+    beg = march(p, d, r, t_mask + 3.0, zmap, seg, K, 8.0, margin, sign=-1, rule=start_rule)
     if beg["found"]:
         t_start, kind, hidden = beg["t"], beg["status"], beg["hidden"]
     else:
@@ -265,9 +299,17 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40,
 
 
 def hand_measure(zmap, a_uv, b_uv, K, fr, patch=3):
-    """The annotator's two ruler points -> 3D (depth patch median) -> their SUL as a chord. With a
-    fitted cylinder, both are also projected on its axis: start/end error along the axis in mm,
-    method minus annotator, the more proximal of the pair being the start."""
+    """The annotator's two ruler points.
+
+    chord      : both back-projected with the depth under them (patch median) -- the annotator's
+                 SUL as a straight 3D line between the surfaces they clicked.
+    along tube : each click is matched IN THE IMAGE to the nearest point of the fitted tube's top
+                 line. The depth under a click is often the prostate or the roof, which can sit ~9 mm
+                 in front of the tube; projecting that 3D point onto a tilted axis moved it by
+                 several mm (short clip: 15 px apart in the image, 4.4 mm apart along the axis).
+                 Start/end errors = method minus annotator along the axis, the more proximal click
+                 being the start; *_px = how far the click is from the tube line in the image.
+    """
     fx, fy, cx, cy = K
     X = []
     for u, v in (a_uv, b_uv):
@@ -277,10 +319,21 @@ def hand_measure(zmap, a_uv, b_uv, K, fr, patch=3):
         zz = float(np.median(z)) if z.size else float("nan")
         X.append(np.array([(u - cx) * zz / fx, (v - cy) * zz / fy, zz]))
     out = dict(hand_sul=float(np.linalg.norm(X[0] - X[1])))
-    if fr is not None and np.isfinite(X[0]).all() and np.isfinite(X[1]).all():
-        ta, tb = sorted(float((x - fr["p"]) @ fr["d"]) for x in X)
+    if fr is not None:
+        lo = min(float(fr["ts_back"].min()), fr["t_start"]) - 15
+        hi = max(float(fr["ts"].max()), fr["t_start"]) + 15
+        tt = np.arange(lo, hi, 0.1)
+        A = fr["p"] + tt[:, None] * fr["d"]
+        S = A + fr["r"] * toward_camera(A, fr["d"])
+        front = S[:, 2] > 1.0
+        tt, uv = tt[front], proj(S[front], K)
+        best = []
+        for q in (a_uv, b_uv):
+            dd = np.linalg.norm(uv - q, axis=1)
+            best.append((float(tt[np.argmin(dd)]), float(dd.min())))
+        (ta, pa), (tb, pb) = sorted(best)
         out.update(hand_t=(ta, tb), hand_sul_axis=tb - ta, start_err=fr["t_start"] - ta,
-                   end_err=fr["t_end"] - tb if fr["found"] else float("nan"))
+                   end_err=fr["t_end"] - tb if fr["found"] else float("nan"), start_px=pa, end_px=pb)
     return out
 
 
@@ -527,6 +580,16 @@ def self_test():
           % (hm["hand_sul"], t_roof - 1, hm["start_err"], hm["end_err"]))
     assert abs(hm["hand_sul"] - (t_roof - 1)) < 1.0, "hand chord"
     assert abs(hm["start_err"]) < 1.5 and abs(hm["end_err"]) < 1.5, "hand vs method along the axis"
+    fx, fy, cx, cy = K
+    vv, uu = np.mgrid[0:H, 0:W]
+    ta = (np.stack([(uu - cx) * z / fx, (vv - cy) * z / fy, z], -1) - p_true) @ d_true
+    zd = z.copy()                            # the surface creeps 0.8 mm forward over 6 mm, then the roof
+    m = (seg == URETHRA) & (ta > t_roof - 6) & (ta < t_roof)
+    zd[m] -= 0.8 * (ta[m] - (t_roof - 6)) / 6
+    frk = run(zd, seg)
+    frz = analyse(zd, seg, K, erode=2, min_px=200, roi_px=10, end_rule="zero")
+    print("self-test drift  : SUL knee %.2f  zero %.2f  (true %.1f)" % (frk["sul"], frz["sul"], t_roof))
+    assert abs(frk["sul"] - t_roof) < 1.0, "knee end on a drifting surface"
     zb, segb = render(K, W, H, p_true, d_true, r_true, t_roof, base=True)
     frb = run(noisy(zb), segb)
     print("self-test prostate: SUL %.2f (true %.1f)  start=%s  rule=%s"
@@ -559,6 +622,9 @@ def main():
     ap.add_argument("--fps", type=float, default=20.0)
     ap.add_argument("--masks", help="folder of hand masks <frame>.png from the labelling tool; "
                     "replaces the model, frames without a mask are skipped")
+    ap.add_argument("--end-rule", default="knee", choices=["knee", "zero"],
+                    help="where the roof crossing sits: knee of the gap profile, or where it leaves 0")
+    ap.add_argument("--start-rule", default="knee", choices=["knee", "zero"])
     ap.add_argument("--points", help="CSV frame,ax,ay,bx,by: the annotator's start/end points")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
@@ -581,7 +647,9 @@ def main():
     with open(a.calib) as fh:
         P1 = np.array(json.load(fh)["P1"])
     K = (P1[0, 0], P1[1, 1], P1[0, 2], P1[1, 2])
-    out = os.path.join(a.run, "urethra_cyl_hand" if a.masks else "urethra_cyl")
+    out = os.path.join(a.run, ("urethra_cyl_hand" if a.masks else "urethra_cyl") +
+                       ("" if (a.end_rule, a.start_rule) == ("knee", "knee")
+                        else "_end-%s_start-%s" % (a.end_rule, a.start_rule)))
     os.makedirs(out, exist_ok=True)
     imgs = sorted(glob.glob(os.path.join(a.run, "images", "*.png")))
     if not imgs:
@@ -606,7 +674,8 @@ def main():
         else:
             seg = _keep_largest(predict(model, Image.fromarray(img[..., ::-1]),
                                         (a.img_size, a.img_size), dev), URETHRA)
-        fr = analyse(zmap, seg, K, a.erode, a.ext, a.margin)
+        fr = analyse(zmap, seg, K, a.erode, a.ext, a.margin, end_rule=a.end_rule,
+                     start_rule=a.start_rule)
         frames.append((img, zmap, seg, fr))
         name = os.path.basename(pth)[:-4]
         hd = dict(uv=pts[name], **hand_measure(zmap, *pts[name], K, fr)) if name in pts else {}
@@ -626,7 +695,9 @@ def main():
                          hand_sul_mm=round(hd.get("hand_sul", float("nan")), 2),
                          hand_sul_axis_mm=round(hd.get("hand_sul_axis", float("nan")), 2),
                          start_err_mm=round(hd.get("start_err", float("nan")), 2),
-                         end_err_mm=round(hd.get("end_err", float("nan")), 2)))
+                         end_err_mm=round(hd.get("end_err", float("nan")), 2),
+                         start_px=round(hd.get("start_px", float("nan")), 1),
+                         end_px=round(hd.get("end_px", float("nan")), 1)))
         print("  %s  px %6d  end %-22s  start %-18s ok %-5s  SUL %s (mask %s)  r %s" % (
             rows[-1]["frame"], rows[-1]["urethra_px"], rows[-1]["status"], rows[-1]["start"],
             rows[-1]["start_ok"], rows[-1]["sul_mm"], rows[-1]["sul_mask_mm"],
@@ -650,7 +721,8 @@ def main():
                    sul_mask_start_median_mm=float(np.nanmedian(sulm)) if np.isfinite(sulm).any() else None,
                    start_kinds={str(k): sum(r["start"] == k for r in rows) for k in set(r["start"] for r in rows)},
                    radius_median_mm=float(np.nanmedian([r["radius_mm"] for r in rows])),
-                   margin_mm=a.margin, erode_px=a.erode)
+                   margin_mm=a.margin, erode_px=a.erode, end_rule=a.end_rule,
+                   start_rule=a.start_rule)
     if pts:
         col = lambda k: np.array([r[k] for r in rows], float)
         with warnings.catch_warnings():
