@@ -82,7 +82,7 @@ def fit_cylinder(P):
 
     s = least_squares(res, [0, 0, off @ e1, off @ e2, r0], loss="soft_l1", f_scale=0.3)
     d, p = model(s.x)
-    return p, d, abs(s.x[4]), float(np.median(np.abs(res(s.x))))
+    return p, d, abs(s.x[4]), float(np.median(np.abs(res(s.x)))), r0
 
 
 def orient(p, d, P, uv, seg):
@@ -159,10 +159,10 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500):
         return np.stack([(u - cx) * z / fx, (v - cy) * z / fy, z], 1), np.stack([u, v], 1) * 1.0
 
     P, uv = pts(core, 20000)
-    p, d, r, res = fit_cylinder(P)
+    p, d, r, res, r_sil = fit_cylinder(P)
     d, rule = orient(p, d, P, uv, seg)
     t_start = float(np.percentile((pts(ok, 40000)[0] - p) @ d, 1))
-    out = dict(p=p, d=d, r=r, res=res, rule=rule, t_start=t_start, n=len(P),
+    out = dict(p=p, d=d, r=r, r_sil=r_sil, res=res, rule=rule, t_start=t_start, n=len(P),
                **march(p, d, r, float(np.median((P - p) @ d)), zmap, seg, K, ext, margin))
     out["sul"] = out["t_end"] - t_start if out["found"] else float("nan")
     return out
@@ -224,7 +224,7 @@ def profile(fr, w, h, margin, gmin=-3.0, gmax=12.0):
         cv2.putText(img, "%d" % mm, (X(x0 + mm) - 6, h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (200, 200, 200), 1)
     ok = np.isfinite(fr["gap"])
-    pts = np.array([[X(t), Y(g)] for t, g in zip(fr["ts"], fr["gap"])], np.int32)
+    pts = np.array([[X(t), Y(np.nan_to_num(g))] for t, g in zip(fr["ts"], fr["gap"])], np.int32)
     for s, e in zip(*[np.flatnonzero(np.diff(np.r_[0, ok.astype(int), 0]) == k) for k in (1, -1)]):
         cv2.polylines(img, [pts[s:e]], False, (255, 255, 255), 2, cv2.LINE_AA)
     cv2.line(img, (X(fr["t_start"]), T), (X(fr["t_start"]), h - B), (0, 255, 0), 2)
@@ -394,6 +394,8 @@ def main():
                          status="no urethra" if fr is None else fr["status"],
                          sul_mm=float("nan") if fr is None else round(fr["sul"], 2),
                          radius_mm=float("nan") if fr is None else round(fr["r"], 2),
+                         # half the 3D width across the tube: what a CIRCULAR tube would need
+                         radius_silhouette_mm=float("nan") if fr is None else round(fr["r_sil"], 2),
                          fit_resid_mm=float("nan") if fr is None else round(fr["res"], 3),
                          orient=None if fr is None else fr["rule"]))
         print("  %s  px %6d  %-26s  SUL %s  r %s  resid %s" % (
