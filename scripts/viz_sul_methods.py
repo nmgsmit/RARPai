@@ -104,7 +104,7 @@ def strip(series, ref, i_now, w, h, title):
     draw(ref, INK, 2)
     for m in METHODS:
         draw(series[m], BGR[m], 2)
-    text(img, title, (L, 18), 0.46, MUTED)
+    text(img, title, (L + 66, 18), 0.46, MUTED)          # clear of the axis label
     text(img, "SUL mm", (6, 18), 0.4, MUTED)
     return img
 
@@ -188,13 +188,13 @@ def figure(rows, path):
             if err.size:
                 ax.plot([x - 0.34, x + 0.34], [np.median(err)] * 2, color=PRIM, lw=2.5, zorder=4)
                 ax.text(x, hi - 1.2, "%.1f" % np.median(np.abs(err)), ha="center", va="top",
-                        color=PRIM, fontsize=10, fontweight="semibold")
+                        color=PRIM, fontsize=10, fontweight="bold")
                 out = int((err > hi).sum() + (err < lo).sum())
                 if out:
                     ax.text(x, lo + 0.6, "%d off-scale" % out, ha="center", color=MUT, fontsize=8)
         ax.set_xticks(range(4), [m.split()[0] for m in METHODS], color=PRIM)
         for x, m in enumerate(METHODS):
-            ax.plot(x, lo - 2.0, "o", color=HEX[m], ms=7, clip_on=False)
+            ax.plot(x, lo - 1.2, "o", color=HEX[m], ms=6, clip_on=False)
         ax.set_title(title, color=SEC, fontsize=11, pad=16)
         ax.set_ylim(lo, hi)
         for s in ("top", "right"):
@@ -203,12 +203,13 @@ def figure(rows, path):
             ax.spines[s].set_color(BASE)
         ax.tick_params(colors=MUT, length=0)
     axes[0].set_ylabel("SUL minus your measurement (mm)", color=SEC)
-    axes[0].text(-0.45, hi - 1.2, "median |error|", color=SEC, fontsize=9, va="top")
     handles = [plt.Line2D([], [], marker=shape[c], color=MUT, ls="", mec=SURF, label=c) for c in CLIPS]
     fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, labelcolor=SEC,
                bbox_to_anchor=(0.5, -0.01))
     fig.suptitle("SUL error per frame, by method -- dot = one annotated frame, bar = median, "
                  "shape = clip", color=PRIM, fontsize=13)
+    fig.text(0.5, 0.905, "numbers along the top: median |error| in mm", ha="center", color=SEC,
+             fontsize=10)
     fig.tight_layout(rect=(0, 0.05, 1, 0.95))
     fig.savefig(path, dpi=130, facecolor=SURF)
     plt.close(fig)
@@ -237,7 +238,8 @@ def main():
         if r["mask"] == "hand" and r["depth"] in dict(DEPTHS):
             byclip[r["clip"]].append(r)
     for clip in CLIPS:
-        video(clip, byclip[clip], a.root, a.out, a.fps)
+        if byclip[clip]:
+            video(clip, byclip[clip], a.root, a.out, a.fps)
 
 
 if __name__ == "__main__":
