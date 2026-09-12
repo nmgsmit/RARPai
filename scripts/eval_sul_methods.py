@@ -71,6 +71,30 @@ def mask_ends(mask):
     return P[t <= lo].mean(0), P[t >= hi].mean(0)
 
 
+def orient2d(e0, e1, seg):
+    """Which mask end is the proximal one: the one nearer the prostate/catheter, else the lower
+    in the image (the same rule urethra_cylinder.orient uses, in 2D)."""
+    ref = np.argwhere(np.isin(seg, (cur.PROSTATE, cur.CATHETER)))
+    if len(ref) > 500:
+        q = ref.mean(0)[::-1]
+        return (e0, e1) if np.linalg.norm(e0 - q) < np.linalg.norm(e1 - q) else (e1, e0)
+    return (e0, e1) if e0[1] > e1[1] else (e1, e0)
+
+
+def top_uv(fr, t, K):
+    """Pixel of the tube's top line at axial position t -- where the method puts that end."""
+    if t is None or not np.isfinite(t):
+        return np.array([np.nan, np.nan])
+    A = fr["p"][None] + t * fr["d"][None]
+    S = A + fr["r"] * cur.toward_camera(A, fr["d"])
+    return cur.proj(S, K)[0] if S[0, 2] > 1 else np.array([np.nan, np.nan])
+
+
+def xy(s, e):
+    r2 = lambda v: None if v is None or not np.isfinite(v) else round(float(v), 1)
+    return dict(s_u=r2(s[0]), s_v=r2(s[1]), e_u=r2(e[0]), e_v=r2(e[1]))
+
+
 def along(fr, K, q):
     """t on fr's axis whose top-line point projects nearest to the click q (image matching)."""
     t_end = fr["t_end"] if fr.get("found") else fr["t_start"] + 30
@@ -144,20 +168,25 @@ def main():
                                 mono_scale=round(scale, 3))
                     # A: mask ends -> 3D chord
                     A0, A1 = (backproject(e, depth_near(z, um, e), K) for e in (e0, e1))
+                    as_, ae_ = orient2d(e0, e1, seg)
                     rows.append(dict(base, method="A mask ends", sul=float(np.linalg.norm(A0 - A1)),
-                                     counted=True, start_err=np.nan, end_err=np.nan))
+                                     counted=True, start_err=np.nan, end_err=np.nan, **xy(as_, ae_)))
                     # B: first delivered cylinder
                     fb = v1.analyse(z, seg, K)
                     if fb is not None:
                         se, ee = ends_err(fb, K, pa, pb)
                         rows.append(dict(base, method="B first cylinder", sul=fb["sul"],
-                                         counted=bool(fb["start_ok"]) and fb["found"], start_err=se, end_err=ee))
+                                         counted=bool(fb["start_ok"]) and fb["found"], start_err=se, end_err=ee,
+                                         **xy(top_uv(fb, fb["t_start"], K),
+                                              top_uv(fb, fb.get("t_end"), K))))
                     # C: current cylinder, and D: its axis with the mask's own ends
                     fc = cur.analyse(z, seg, K)
                     if fc is not None:
                         se, ee = ends_err(fc, K, pa, pb)
                         rows.append(dict(base, method="C current cylinder", sul=fc["sul"],
-                                         counted=bool(fc["start_ok"]) and fc["found"], start_err=se, end_err=ee))
+                                         counted=bool(fc["start_ok"]) and fc["found"], start_err=se, end_err=ee,
+                                         **xy(top_uv(fc, fc["t_start"], K),
+                                              top_uv(fc, fc.get("t_end"), K))))
                         core = cv2.erode((um & (z > 0)).astype(np.uint8), np.ones((15, 15), np.uint8)).astype(bool)
                         v, u = np.nonzero(core)
                         if len(u) > 200:
@@ -167,7 +196,8 @@ def main():
                             fd = dict(fc, t_start=float(t0), t_end=float(t1), found=True)
                             se, ee = ends_err(fd, K, pa, pb)
                             rows.append(dict(base, method="D mask along tube", sul=float(t1 - t0),
-                                             counted=True, start_err=se, end_err=ee))
+                                             counted=True, start_err=se, end_err=ee,
+                                             **xy(top_uv(fd, t0, K), top_uv(fd, t1, K))))
             print("  %-8s %s done (ref %.1f mm)" % (LABEL[run], name, ref), flush=True)
 
     keys = list(rows[0])

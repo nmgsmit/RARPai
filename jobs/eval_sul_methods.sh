@@ -17,3 +17,10 @@ module load Python/3.11.3-GCCcore-12.3.0
 source venv/bin/activate
 
 python scripts/eval_sul_methods.py "$@"
+python scripts/viz_sul_methods.py || exit 1
+
+module load FFmpeg/6.0-GCCcore-12.3.0
+for f in outputs/sul_eval/*_methods.mp4; do
+    ffmpeg -y -loglevel error -i "$f" -c:v libx264 -pix_fmt yuv420p -crf 20 -movflags +faststart         "${f%.mp4}_h264.mp4"
+    echo "encoded ${f%.mp4}_h264.mp4"
+done
