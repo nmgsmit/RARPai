@@ -1082,9 +1082,13 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
   to 5:4 content, split 5 val / 5 test / rest train. Output `../data/processed/depthclips_sharpest`,
   ranking in its `sharpness_rank.csv`. The only earlier ranking
   (`data/depthclips_ruler_NoGUI/sharpness_rank.csv`) covers the 64 ruler clips, not staging.
-- GUI masks: the staging mp4s were cut with the GUI already black and `data/templates` is deleted in
-  the Snellius checkout, so `full_gui_mask` can't be re-run. `<stem>_mask.png` = pixels black in
-  EVERY frame of the clip; misses transient popups. finetune_depth does not read masks today.
+- GUI masks: first version = pixels black in every frame (templates were missing on Snellius).
+  Templates restored the same day -> `--masks-only` rewrote them with `cut_cue_clips.full_gui_mask`
+  on the SOURCE frames (`/home/nsmit2/data/UMCdissectionvidNOgui/<video>.mp4`, frames S.. from the
+  clip name). Staging frames are blacked so templates can't match there; the NOgui sources only
+  lack the fixed HUD (5.1% black vs staging 5.9-6.3%), which full_gui_mask draws from geometry,
+  while cue bars/popups are still visible. Logged `covers_black` = share of near-black jpg px the
+  template mask covers. finetune_depth does not read masks today.
 - `finetune_depth.py`: `--scale-w 0` now selects best.pth on proxy_gt `ms_abs_rel`; epoch line
   prints `proxy_ms_abs_rel`. Overlap check: proxy-GT = 2 patients, in neither staging nor ruler.
 - Baseline, `endodac-ruler-range-sw05-3ep` (job 26688975, wandb r3p74r8y), proxy_gt ms_abs_rel
