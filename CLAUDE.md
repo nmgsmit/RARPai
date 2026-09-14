@@ -66,7 +66,8 @@ New experiment = copy an existing `jobs/*.sh`, change `--out`, `--run-name`, and
   black as a flat ~47 mm surface; dark tissue fails `mean > 0.04`). Mono: `cut_cue_clips.full_gui_mask`;
   SBS: `scripts/mask_sbs_gui.py`.
 - **Depth selection:** stereo proxy-GT (`--proxy-gt-dir`, metric `abs_rel`) is logged every epoch and
-  picks `best.pth`.
+  picks `best.pth`. With `--scale-w 0` (no metric anchor, relative depth) it picks on `ms_abs_rel`
+  (median-scaled shape) instead — compare such runs on `proxy_gt/ms_abs_rel` only.
 
 ## Gotchas
 - Code reaches Snellius only via GitHub: `git push` (local) → `git pull` (Snellius). Local edits are **not** live on the cluster until then.

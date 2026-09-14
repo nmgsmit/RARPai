@@ -1070,3 +1070,23 @@ restored on request from the identical workspace copies.
 that introduced it. Same numbers on Snellius torch 2.12+cu130 and local 2.14+cpu; neither
 `scale_loss` nor the geometry changed since. Now asserts the exact 3D value (1e-3) and
 3D > in-plane, like the in-plane line already did. No loss code touched.
+
+### DEPTH: sharpest-clip-per-patient set vs ruler clips, judged on proxy-GT SHAPE (2026-09-14)
+
+Question (Nick): does sharp, patient-diverse data make mono depth converge to the stereo proxy-GT
+better than the ruler clips? Those clips have no known-size objects -> `--scale-w 0` -> RELATIVE
+depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, never `abs_rel`.
+- `scripts/prep_sharpest_clips.py` (+ `jobs/prep_sharpest_clips.sh`, genoa): ranks every clip
+  > 1 MB in `/home/nsmit2/data/depth_clips_staging` (1069 of 1121) by rank_sharpness `sharp`
+  (var of Laplacian), keeps the top clip per PATIENT (uuid / RARP_NNN prefix; 77 patients), crops
+  to 5:4 content, split 5 val / 5 test / rest train. Output `../data/processed/depthclips_sharpest`,
+  ranking in its `sharpness_rank.csv`. The only earlier ranking
+  (`data/depthclips_ruler_NoGUI/sharpness_rank.csv`) covers the 64 ruler clips, not staging.
+- GUI masks: the staging mp4s were cut with the GUI already black and `data/templates` is deleted in
+  the Snellius checkout, so `full_gui_mask` can't be re-run. `<stem>_mask.png` = pixels black in
+  EVERY frame of the clip; misses transient popups. finetune_depth does not read masks today.
+- `finetune_depth.py`: `--scale-w 0` now selects best.pth on proxy_gt `ms_abs_rel`; epoch line
+  prints `proxy_ms_abs_rel`. Overlap check: proxy-GT = 2 patients, in neither staging nor ruler.
+- Baseline, `endodac-ruler-range-sw05-3ep` (job 26688975, wandb r3p74r8y), proxy_gt ms_abs_rel
+  ep0..3 = .1660 / .1640 / .1652 / .1656 -- flat. Run = `jobs/finetune_depth_sharpest.sh`
+  (sw05 settings, scale-w 0, 3 ep).

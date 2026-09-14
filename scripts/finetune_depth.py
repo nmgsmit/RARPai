@@ -1462,6 +1462,8 @@ def main():
         caption="epoch 0 (warm-start, before UMC fine-tune)"), "epoch": 0}
     best = float("inf")
     sel_name = "val_photo"          # -> scared_abs_rel, metric_val_abs_rel, proxy_gt_abs_rel (last available wins)
+    # No scale loss -> the depth is RELATIVE, so only its shape vs stereo counts (median-scaled).
+    pk = "ms_abs_rel" if args.scale_w == 0 else "abs_rel"
 
     def metric_sel(mres):
         """Select on the term being trained: the polyline error would pick the best TILT."""
@@ -1499,7 +1501,7 @@ def main():
     if pres0:
         pm0 = pres0[0]
         log0.update(proxy_logs(pres0, "epoch 0 [rgb | pred | stereo]"))
-        best, sel_name = pm0["abs_rel"], "proxy_gt_abs_rel"
+        best, sel_name = pm0[pk], f"proxy_gt_{pk}"
         print(f"[epoch 0] warm-start proxy_gt abs_rel={pm0['abs_rel']:.4f} (mm, unscaled)  "
               f"ms_abs_rel={pm0['ms_abs_rel']:.4f}  scale={pm0['scale_ratio_median']:.3f}  "
               f"(n={pm0['n']})", flush=True)
@@ -1534,14 +1536,15 @@ def main():
         pres = eval_proxy_now()
         if pres:
             logd.update(proxy_logs(pres, f"epoch {ep} [rgb | pred | stereo]"))
-            score, sel_name = pres[0]["abs_rel"], "proxy_gt_abs_rel"
+            score, sel_name = pres[0][pk], f"proxy_gt_{pk}"
         print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
               f"val_photo={va_logs['photo']:.4f}  {sel_name}={score:.4f}  "
               + (f"metric_scale={mres['scale']:.3f}  " if mres else "")
               + (f"track_slope={mres['track_slope']:.3f}  " if mres and "track_slope" in mres
                  else "")
               + (f"scared={sres[0]['abs_rel']:.4f}  " if sres is not None else "")
-              + (f"proxy_scale={pres[0]['scale_ratio_median']:.3f}  " if pres else "")
+              + (f"proxy_ms_abs_rel={pres[0]['ms_abs_rel']:.4f}  "
+                 f"proxy_scale={pres[0]['scale_ratio_median']:.3f}  " if pres else "")
               + (f"train_scale={tr_logs['scale']:.4f}  " if "scale" in tr_logs else "")
               + (f"cath_err={cres['err_mm']:+.3f}mm  " if cres else "")
               + f"pose_trans={tr_logs['pose_trans']:.4f}", flush=True)
