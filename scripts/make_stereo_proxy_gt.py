@@ -202,12 +202,13 @@ def preview(frame, maps, cal, min_disp, num_disp, scale, out, matcher=sgbm_match
     left, disp, z = frame_depth(frame, maps, cal, min_disp, num_disp, scale, matcher)
     ok = z > 0
     lo, hi = np.percentile(z[ok], [5, 95]) if ok.any() else (0, 1)
+    heat = colorize(np.where(ok, 1.0 / np.maximum(z, 1e-6), np.nan), 1 / hi, 1 / lo,
+                    cv2.COLORMAP_TURBO)
+    heat[~ok] = (90, 90, 90)                   # grey holes: black is a depth colour (see depth_jpg)
     tiles = []
     for panel, label in (
             (left, "rectified LEFT eye"),
-            # inverse depth so NEAR = bright, matching gui_depth_measure.colorize
-            (colorize(np.where(ok, 1.0 / np.maximum(z, 1e-6), np.nan), 1 / hi, 1 / lo),
-             "metric depth %.0f-%.0f mm  (bright = near)" % (lo, hi)),
+            (heat, "metric depth %.0f-%.0f mm  (red = near, grey = no depth)" % (lo, hi)),
             (np.dstack([(ok * 255).astype(np.uint8)] * 3),
              "valid  %.1f%% of frame" % (100 * ok.mean()))):
         t = cv2.resize(panel, (OUT_W // 2, OUT_H // 2))
@@ -229,11 +230,15 @@ def depth_jpg(left, z, path, name=""):
     if not ok.any():
         return
     lo, hi = np.percentile(z[ok], [2, 98])
-    # inverse depth so NEAR = bright, matching gui_depth_measure.colorize
-    heat = colorize(np.where(ok, 1.0 / np.maximum(z, 1e-6), np.nan), 1 / hi, 1 / lo)
+    # inverse depth so NEAR = warm. TURBO + GREY holes, as temporal_stereo_clip: with magma and
+    # black holes the far end is near-black too, so far tissue reads as "missing" and real holes
+    # hide in it.
+    heat = colorize(np.where(ok, 1.0 / np.maximum(z, 1e-6), np.nan), 1 / hi, 1 / lo,
+                    cv2.COLORMAP_TURBO)
+    heat[~ok] = (90, 90, 90)
     bar_h = 34
     grad = np.linspace(1 / lo, 1 / hi, OUT_W - 200)[None, :].repeat(bar_h, 0)
-    bar = colorize(grad, 1 / hi, 1 / lo)
+    bar = colorize(grad, 1 / hi, 1 / lo, cv2.COLORMAP_TURBO)
     bar = cv2.copyMakeBorder(bar, 6, 24, 100, 100, cv2.BORDER_CONSTANT, value=(20, 20, 20))
     for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
         mm = 1.0 / (1 / lo + frac * (1 / hi - 1 / lo))
@@ -246,7 +251,7 @@ def depth_jpg(left, z, path, name=""):
     left = np.vstack([left, np.full((bar.shape[0], OUT_W, 3), 20, np.uint8)])
     tiles = []
     for panel, label in ((left, "rectified LEFT   %s" % name),
-                         (heat, "metric depth  %.0f-%.0f mm  (bright = near)  valid %.1f%%"
+                         (heat, "metric depth  %.0f-%.0f mm  (red = near, grey = no depth)  valid %.1f%%"
                           % (lo, hi, 100 * ok.mean()))):
         t = cv2.copyMakeBorder(panel, 44, 10, 10, 10, cv2.BORDER_CONSTANT, value=(20, 20, 20))
         cv2.putText(t, label, (16, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.68, (255, 255, 255), 1,

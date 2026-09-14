@@ -18,6 +18,18 @@ sessions don't re-derive them. Keep entries one or two lines.
 - Leakage checked: surgeries 18de9c5a / 5e27066c are not in depthclips_ruler_NoGUI -> clean test.
 - `finetune_depth --smoke` fails in `_selfcheck_scale_loss` (1.28 vs 1.32), untouched by this
   change -- flagged as a separate task.
+- HOLES in the FFS stills (Nick: "many black spots"), 9 frames attributed: 10-29% of the frame is
+  hole, but outside-geom 1.3 + GUI 1.1-2.3 + specular 0.4-1.7 -- the rest (6-26% of the usable
+  area) is the LR check: half-occlusion bands LEFT of every foreground object, the left border
+  strip whose match falls off the right image (disparity ~100 px), and the textureless/glare
+  white instrument shaft. Correct for an eval GT -- do NOT inpaint. Half the "spots" were not
+  holes at all: magma's far end is near-black, same as the holes. `depth_jpg`/`preview` now
+  TURBO + grey (90,90,90) holes, as temporal_stereo_clip already did.
+- Temporal fusion (the earlier hole fix, +30% of holes) needs video: only 30/83 stills lie inside
+  a 3D_ProxyGT clip (seg2 4, seg3 14, 5e27 12); 53 have no source clip.
+- FIRST RUN (26683314, inplane config): EndoDAC warm-start proxy_gt abs_rel 0.218, scale 1.027
+  (near metric!); fine-tuning worsens it to 0.35-0.40, proxy_scale ~0.83 (pred ~20% too FAR),
+  agreeing with metric_scale 1.8 on the anchors. Through epoch 7, best.pth is still epoch 0.
 
 ## 2026-09-14 - DEPTH 3D: HUD/GUI stripped from the SBS proxy-GT stills (scripts/mask_sbs_gui.py)
 - Each SBS eye is un-squeezed into the MONO 1920x1080 frame (eye->mono affine + MONO_CROP), masked
