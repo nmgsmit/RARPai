@@ -102,8 +102,13 @@ def _start(clip_name):
 
 def _masks_job(job):
     imgdir, video, start = job
-    n = len(list(imgdir.glob("[0-9]*[0-9].jpg")))
-    return imgdir, write_masks(imgdir, gui_masks(video, start, n))
+    jpgs = sorted(imgdir.glob("[0-9]*[0-9].jpg"))
+    # The templates miss some popups/cue panels in the source frame (solid 334-474 px rectangles on
+    # 5/77 clips) that cut_cue_clips DID black at cut time. Black in EVERY frame of the clip is that
+    # cut-time GUI, so OR it in (dilate 3 = cut_cue_clips) -- tissue is never black in all frames.
+    cut = (np.stack([cv2.imread(str(j)) for j in jpgs]).max(axis=(0, 3)) <= 10).astype(np.uint8)
+    cut = cv2.dilate(cut, np.ones((7, 7), np.uint8)) * 255
+    return imgdir, write_masks(imgdir, [m | cut for m in gui_masks(video, start, len(jpgs))])
 
 
 def extract(clip, out):

@@ -1089,6 +1089,14 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
   lack the fixed HUD (5.1% black vs staging 5.9-6.3%), which full_gui_mask draws from geometry,
   while cue bars/popups are still visible. Logged `covers_black` = share of near-black jpg px the
   template mask covers. finetune_depth does not read masks today.
+- Template-only pass (job 26690902): covers_black median 1.000 but min .668 -- on 5/77 clips the
+  miss is ONE solid 334-474 px rectangle at rows ~900-1017 (a popup / cue panel the source-frame
+  match misses but cut-time masking blacked). Final mask = template | black-in-every-frame
+  (dilated 3). Tissue is never black in all frames of a clip, so this is cut-time GUI, not black.
+- RESULT (job 26690383, wandb 7zfhhion, 3 ep, scale-w 0, anchor-w 0.3): proxy_gt ms_abs_rel
+  .1660 / .1672 / .1660 / .1659 vs ruler .1660 / .1640 / .1652 / .1656. Neither converges; train
+  photo fell .073 -> .032 (val .031, ~3x below ruler) while shape stayed put. Suspect anchor-w 0.3
+  (L1 to the frozen warm-start) pins the shape; next A/B = same data, --anchor-w 0 / 0.1.
 - `finetune_depth.py`: `--scale-w 0` now selects best.pth on proxy_gt `ms_abs_rel`; epoch line
   prints `proxy_ms_abs_rel`. Overlap check: proxy-GT = 2 patients, in neither staging nor ruler.
 - Baseline, `endodac-ruler-range-sw05-3ep` (job 26688975, wandb r3p74r8y), proxy_gt ms_abs_rel
