@@ -1061,3 +1061,12 @@ Result: Nick/Veerle/Aron agree to 35-65 px mean tip distance at these frames, Vi
 catheter tip / urethral opening (~150 px chord), not the Retzius arch (~900 px chord). Her numbers
 measure a different target, not annotator disagreement. Her PNGs/CSVs were briefly deleted, then
 restored on request from the identical workspace copies.
+
+### `--smoke` tilt self-check: the 1.2x margin never held (2026-09-14)
+
+`_selfcheck_scale_loss` asserted 3D ratio > 1.2 x in-plane ratio for the depth ramp added in
+8153a28. For that fixed geometry (Z=50 -> 60 over u=30..50, fx=65.6) both are closed-form:
+3D = hypot(dX, dZ)/mm = 1.2808, in-plane = 55/50 = 1.1000, so 1.164x -- it failed from the commit
+that introduced it. Same numbers on Snellius torch 2.12+cu130 and local 2.14+cpu; neither
+`scale_loss` nor the geometry changed since. Now asserts the exact 3D value (1e-3) and
+3D > in-plane, like the in-plane line already did. No loss code touched.

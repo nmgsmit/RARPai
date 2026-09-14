@@ -650,7 +650,9 @@ def _selfcheck_scale_loss():
     _, r3d, _ = scale_loss(tilt, inv_K, batch, (h, w))
     _, rip, _ = scale_loss(tilt, inv_K, batch, (h, w), inplane=True)
     z_mean = Z + (u1 - u0) * 0.5 / 2                       # depth at u0 is Z, at u1 is Z + 10
-    assert r3d.item() > 1.2 * rip.item(), (r3d.item(), rip.item())
+    z1 = Z + (u1 - u0) * 0.5                               # exact 3D chord, not a guessed margin
+    r3d_true = np.hypot((u1 - w / 2) / fx * z1 - (u0 - w / 2) / fx * Z, z1 - Z) / mm
+    assert abs(r3d.item() - r3d_true) < 1e-3 and r3d.item() > rip.item(), (r3d.item(), r3d_true)
     assert abs(rip.item() - z_mean / Z) < 1e-3, (rip.item(), z_mean / Z)
 
 
