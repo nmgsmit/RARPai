@@ -1217,6 +1217,10 @@ def main():
     ap.add_argument("--scared-dir", default="../data/SCARED/stereo_gt",
                     help="calibrated-stereo SCARED GT (frames/ + gt_depths.npz) for the "
                          "end-of-training metric eval; build with scripts/export_scared_stereo_gt.py")
+    ap.add_argument("--proxy-gt-dir", default="../data/processed/proxy_gt_nogui_ffs",
+                    help="stereo proxy-GT test set (<stem>_left.png + <stem>_depth16.png, from "
+                         "make_stereo_proxy_gt.py): per-epoch convergence of the mono depth to "
+                         "stereo, in mm. When present it SELECTS best.pth. \"\" to skip")
     ap.add_argument("--no-scared", action="store_true",
                     help="skip the SCARED metric eval at the end of training")
     ap.add_argument("--workers", type=int, default=8)
@@ -1405,7 +1409,7 @@ def main():
     # Per-epoch SCARED eval drives checkpoint selection: the photometric proxy rewards
     # texture-copying and can improve while real geometry degrades, so select best.pth by
     # SCARED abs_rel (real GT, median-scaled). Falls back to val_photo when GT is absent.
-    from eval_scared import run_scared_eval                     # lazy: avoids import cycle
+    from eval_scared import run_proxy_gt_eval, run_scared_eval  # lazy: avoids import cycle
 
     def eval_scared_now():
         if args.no_scared:
@@ -1425,6 +1429,22 @@ def main():
         return eval_catheter_ref(depth_model, cath_ref, hw, device, args.min_depth,
                                  args.max_depth, k_full)
 
+    def eval_proxy_now():
+        """Mono depth vs the stereo proxy-GT, in mm. Outranks every other score for selection:
+        it is the only DENSE metric GT on this console. The frames are already 5:4 content
+        (rectified eye), so only the content-relative part of the side-crop applies, as SCARED."""
+        return run_proxy_gt_eval(depth_model, args.proxy_gt_dir, model_shape, device,
+                                 args.min_depth, args.max_depth,
+                                 side_crop=content_crop(args.side_crop_frac, args.black_bar_frac),
+                                 bottom_crop=args.bottom_crop_frac, top_crop=args.top_crop_frac)
+
+    def proxy_logs(pres, caption):
+        pm, pvis = pres
+        out = {f"proxy_gt/{k}": v for k, v in pm.items()}
+        if pvis:                                           # 1/4 res: 4 rows of 3x1340x1072 is big
+            out["proxy_gt/overlays"] = wandb.Image(np.concatenate(pvis, 0)[::4, ::4], caption=caption)
+        return out
+
     def eval_metric_now(loader):
         """Metric accuracy on the known-size objects. Unlike SCARED (median-scaled, so blind to
         scale) this is the only number that says whether the depth map is METRIC."""
@@ -1439,7 +1459,7 @@ def main():
         qualitative_panel(depth_model, panel, hw, device, args.min_depth, args.max_depth),
         caption="epoch 0 (warm-start, before UMC fine-tune)"), "epoch": 0}
     best = float("inf")
-    sel_name = "val_photo"          # -> scared_abs_rel, then metric_val_abs_rel, if available
+    sel_name = "val_photo"          # -> scared_abs_rel, metric_val_abs_rel, proxy_gt_abs_rel (last available wins)
 
     def metric_sel(mres):
         """Select on the term being trained: the polyline error would pick the best TILT."""
@@ -1473,6 +1493,16 @@ def main():
         log0.update({f"catheter/{k}": v for k, v in cres0.items()})
         print(f"[epoch 0] catheter err={cres0['err_mm']:+.3f} mm "
               f"(width {cres0['width_mm']:.2f} vs true, n={int(cres0['n'])})", flush=True)
+    pres0 = eval_proxy_now()
+    if pres0:
+        pm0 = pres0[0]
+        log0.update(proxy_logs(pres0, "epoch 0 [rgb | pred | stereo]"))
+        best, sel_name = pm0["abs_rel"], "proxy_gt_abs_rel"
+        print(f"[epoch 0] warm-start proxy_gt abs_rel={pm0['abs_rel']:.4f} (mm, unscaled)  "
+              f"ms_abs_rel={pm0['ms_abs_rel']:.4f}  scale={pm0['scale_ratio_median']:.3f}  "
+              f"(n={pm0['n']})", flush=True)
+    elif args.proxy_gt_dir:
+        print(f"[proxy_gt] skipped -- no *_depth16.png in {args.proxy_gt_dir}", flush=True)
     if best < float("inf"):
         torch.save(depth_model.state_dict(), outdir / "best.pth")   # warm-start eligible as best
         wandb.run.summary.update({f"best_{sel_name}": best, "best_epoch": 0})
@@ -1499,12 +1529,17 @@ def main():
         cres = eval_catheter_now()
         if cres:
             logd.update({f"catheter/{k}": v for k, v in cres.items()})
+        pres = eval_proxy_now()
+        if pres:
+            logd.update(proxy_logs(pres, f"epoch {ep} [rgb | pred | stereo]"))
+            score, sel_name = pres[0]["abs_rel"], "proxy_gt_abs_rel"
         print(f"epoch {ep}/{args.epochs}  train_photo={tr_logs['photo']:.4f}  "
               f"val_photo={va_logs['photo']:.4f}  {sel_name}={score:.4f}  "
               + (f"metric_scale={mres['scale']:.3f}  " if mres else "")
               + (f"track_slope={mres['track_slope']:.3f}  " if mres and "track_slope" in mres
                  else "")
               + (f"scared={sres[0]['abs_rel']:.4f}  " if sres is not None else "")
+              + (f"proxy_scale={pres[0]['scale_ratio_median']:.3f}  " if pres else "")
               + (f"train_scale={tr_logs['scale']:.4f}  " if "scale" in tr_logs else "")
               + (f"cath_err={cres['err_mm']:+.3f}mm  " if cres else "")
               + f"pose_trans={tr_logs['pose_trans']:.4f}", flush=True)

@@ -57,6 +57,17 @@ New experiment = copy an existing `jobs/*.sh`, change `--out`, `--run-name`, and
 - **CPU-only** (overlays, viz) → `--partition=genoa`
 - Some older finetune jobs still point at `genoa` (CPU) — switch to `gpu_h100` for real GPU runs.
 
+## Frames, black bars and GUI overlays (agreed with Nick 2026-09-14)
+- **Black side bars: crop once.** Every image past preprocessing is the 1340x1072 5:4 *content* frame
+  (mono: `source_crop.json` x289 y4; SBS: the eye rectangle -> rectified). Intrinsics are defined on
+  that frame. No pillarbox ever reaches a model, loss or eval; don't add new `--side-crop-frac` runs.
+- **GUI (HUD banner + tab, popups, cue bars): black pixels AND a mask file.** Save `<stem>_mask.png`
+  (255 = GUI) next to every image. Consumers read the mask; black is never the signal (stereo reads
+  black as a flat ~47 mm surface; dark tissue fails `mean > 0.04`). Mono: `cut_cue_clips.full_gui_mask`;
+  SBS: `scripts/mask_sbs_gui.py`.
+- **Depth selection:** stereo proxy-GT (`--proxy-gt-dir`, metric `abs_rel`) is logged every epoch and
+  picks `best.pth`.
+
 ## Gotchas
 - Code reaches Snellius only via GitHub: `git push` (local) → `git pull` (Snellius). Local edits are **not** live on the cluster until then.
 - Never train on the login node — always inside an sbatch job.

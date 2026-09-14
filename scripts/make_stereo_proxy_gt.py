@@ -18,6 +18,8 @@ theoretical: disparity depth off raw coordinates was 9% biased; rectified, 0.8%.
 
     python scripts/make_stereo_proxy_gt.py --preview out.png --video ../data/3D_ProxyGT/<clip>.mp4
     python scripts/make_stereo_proxy_gt.py --src ../data/3D_ProxyGT --dst ../data/processed/proxy_gt
+    # GUI-stripped stills (mask_sbs_gui.py first) -> the convergence test set finetune_depth reads
+    sbatch jobs/proxy_gt_ffs.sh --src ../data/3D_ProxyGT/proxyGTimg_nogui --dst ../data/processed/proxy_gt_nogui_ffs
 
 Depth is stored as uint16 PNG in 1/16 mm (0 = invalid), which is ~0.06mm quantisation
 against ~1mm calibration accuracy, and a fraction of the size of float arrays.
@@ -157,13 +159,32 @@ def match(matcher, left, right, min_disp, num_disp, scale=1.0):
     return dl
 
 
-def frame_depth(frame, maps, cal, min_disp, num_disp, scale, matcher=sgbm_matcher):
+def gui_rect_mask(gui, maps, disp, grow=4):
+    """True where a rectified LEFT pixel sees GUI, or where its right-eye match does.
+
+    `gui` is mask_sbs_gui.py's <stem>_mask.png over the raw SBS frame (255 = GUI). Blacked-out
+    GUI is identical in both eyes, so it matches as a flat surface at the screen plane (~47 mm)
+    and passes the LR check -- masking the DEPTH is the only thing that removes it. `grow` px
+    covers the 3-4 px the matcher window smears that plane into neighbouring tissue.
+    """
+    (mxL, myL, _), (mxR, myR, _) = maps
+    k = np.ones((2 * grow + 1,) * 2, np.uint8)
+    gl = cv2.dilate(cv2.remap(gui, mxL, myL, cv2.INTER_LINEAR), k) > 0
+    gr = cv2.dilate(cv2.remap(gui, mxR, myR, cv2.INTER_LINEAR), k) > 0
+    h, w = disp.shape
+    xr = np.clip(np.arange(w)[None, :] - np.nan_to_num(disp), 0, w - 1).astype(np.int32)
+    return gl | gr[np.arange(h)[:, None], xr]
+
+
+def frame_depth(frame, maps, cal, min_disp, num_disp, scale, matcher=sgbm_matcher, gui=None):
     (mxL, myL, vL), (mxR, myR, vR) = maps
     left = cv2.remap(frame, mxL, myL, cv2.INTER_CUBIC)
     right = cv2.remap(frame, mxR, myR, cv2.INTER_CUBIC)
     disp = match(matcher, left, right, min_disp, num_disp, scale)
     disp[~(vL & vR)] = np.nan
     disp[specular_mask(left)] = np.nan
+    if gui is not None:
+        disp[gui_rect_mask(gui, maps, disp)] = np.nan
     with np.errstate(divide="ignore", invalid="ignore"):
         z = cal["f_times_B_rectified"] / disp
     z[~np.isfinite(z) | (z <= 0)] = 0.0
@@ -236,21 +257,34 @@ def depth_jpg(left, z, path, name=""):
 
 
 def run_images(paths, dst, maps, cal, min_disp, num_disp, scale, matcher):
-    """Same pipeline as run_video, for individual SBS frames pasted in as PNGs."""
+    """Same pipeline as run_video, for individual SBS frames pasted in as PNGs.
+
+    A <stem>_mask.png next to a frame (mask_sbs_gui.py) invalidates the depth under the GUI.
+    Writes <stem>_left.png (rectified left eye = the mono model's input) + <stem>_left_mask.png
+    + <stem>_depth16.png: finetune_depth's proxy-GT eval reads exactly these three.
+    """
     os.makedirs(dst, exist_ok=True)
     for p in paths:
+        if p.endswith("_mask.png"):
+            continue
         fr = cv2.imread(p)
         if fr is None or fr.shape[1] != 1920:
             print("  skip %s (not a 1920x1080 SBS frame)" % os.path.basename(p))
             continue
-        left, _, z = frame_depth(fr, maps, cal, min_disp, num_disp, scale, matcher)
         stem = os.path.splitext(os.path.basename(p))[0]
+        mp = os.path.join(os.path.dirname(p), stem + "_mask.png")
+        gui = cv2.imread(mp, cv2.IMREAD_GRAYSCALE) if os.path.exists(mp) else None
+        left, _, z = frame_depth(fr, maps, cal, min_disp, num_disp, scale, matcher, gui)
+        cv2.imwrite(os.path.join(dst, stem + "_left.png"), left)
+        if gui is not None:
+            cv2.imwrite(os.path.join(dst, stem + "_left_mask.png"),
+                        (cv2.remap(gui, *maps[0][:2], cv2.INTER_LINEAR) > 0).astype(np.uint8) * 255)
         cv2.imwrite(os.path.join(dst, stem + "_depth16.png"),
                     np.clip(z * DEPTH_SCALE, 0, 65535).astype(np.uint16))
         r = depth_jpg(left, z, os.path.join(dst, stem + ".jpg"), stem[-12:])
         good = z > 0
-        print("  %-58s valid %5.1f%%  depth p2 %.0f  med %.0f  p98 %.0f mm"
-              % (stem[-58:], 100 * good.mean(),
+        print("  %-58s %s valid %5.1f%%  depth p2 %.0f  med %.0f  p98 %.0f mm"
+              % (stem[-58:], "gui-masked" if gui is not None else "NO GUI MASK", 100 * good.mean(),
                  *(np.percentile(z[good], [2, 50, 98]) if good.any() else (0, 0, 0))))
 
 
@@ -356,5 +390,22 @@ def main():
     print("done: %d frames, mean valid %.1f%%" % (total, 100 * f.mean()))
 
 
+def _self_test():
+    # identity rectification, GUI block at cols 50-59, uniform disparity 10
+    h, w = 40, 120
+    xs, ys = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    ident = (xs, ys, np.ones((h, w), bool))
+    gui = np.zeros((h, w), np.uint8)
+    gui[:, 50:60] = 255
+    bad = gui_rect_mask(gui, (ident, ident), np.full((h, w), 10.0, np.float32), grow=2)
+    assert bad[20, 55], "left pixel ON the GUI not masked"
+    assert bad[20, 66], "left pixel whose right-eye match (x-10) is GUI not masked"
+    assert not bad[20, 100] and not bad[20, 20], "tissue masked"
+    print("ok")
+
+
 if __name__ == "__main__":
-    main()
+    if "--self-test" in sys.argv:
+        _self_test()
+    else:
+        main()

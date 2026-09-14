@@ -71,10 +71,11 @@ def _crop(img, g, side, bottom, top=0.0):
 def _eval_pairs(model, frames, gt, image_shape, device, min_depth, max_depth,
                 num_vis=8, side_crop=0.0, bottom_crop=0.0, top_crop=0.0):
     """Core loop: per frame -> pred depth, median-scale to GT, compute_errors. Returns
-    (mean_errors[7], ratios[N], vis[list of [rgb|pred|gt] uint8 rows])."""
+    (mean_errors[7], ratios[N], vis[list of [rgb|pred|gt] uint8 rows], mean_errors_raw[7]);
+    the last is the same metrics with NO scaling (only meaningful when the GT is metric)."""
     mh, mw = round14(image_shape[0]), round14(image_shape[1])
     to_tensor = transforms.ToTensor()
-    errors, ratios, vis = [], [], []
+    errors, errors_raw, ratios, vis = [], [], [], []
     model.eval()
     for fp, g in zip(frames, gt):
         g = np.asarray(g, np.float32)
@@ -91,6 +92,7 @@ def _eval_pairs(model, frames, gt, image_shape, device, min_depth, max_depth,
         if mask.sum() == 0:
             continue
         p, gt_v = pred_full[mask], g[mask]
+        errors_raw.append(compute_errors(gt_v, np.clip(p, EVAL_MIN, None)))   # metric, unscaled
         ratio = np.median(gt_v) / np.median(p)                # per-frame median scaling
         ratios.append(ratio)
         p = np.clip(p * ratio, EVAL_MIN, EVAL_MAX)
@@ -103,7 +105,7 @@ def _eval_pairs(model, frames, gt, image_shape, device, min_depth, max_depth,
                                        colorize(1.0 / np.clip(g, EVAL_MIN, None), mask)], axis=1))
     if not errors:
         raise SystemExit("no valid GT pixels in any frame -- check --gt-npz units/pairing")
-    return np.array(errors).mean(0), np.array(ratios), vis
+    return np.array(errors).mean(0), np.array(ratios), vis, np.array(errors_raw).mean(0)
 
 
 def run_scared_eval(model, scared_dir, image_shape, device, min_depth=0.1, max_depth=150.0,
@@ -119,12 +121,37 @@ def run_scared_eval(model, scared_dir, image_shape, device, min_depth=0.1, max_d
     if len(frames) != len(gt):
         print(f"[scared] pairing mismatch {len(frames)} frames vs {len(gt)} GT -- skipping")
         return None
-    mean_errors, ratios, vis = _eval_pairs(model, frames, gt, image_shape, device, min_depth,
-                                           max_depth, num_vis, side_crop, bottom_crop, top_crop)
+    mean_errors, ratios, vis, _ = _eval_pairs(model, frames, gt, image_shape, device, min_depth,
+                                              max_depth, num_vis, side_crop, bottom_crop, top_crop)
     metrics = dict(zip(METRIC_NAMES, mean_errors.tolist()))
     metrics["scale_ratio_median"] = float(np.median(ratios))
     metrics["scale_ratio_std"] = float(np.std(ratios))
     return metrics, ratios, vis
+
+
+def run_proxy_gt_eval(model, proxy_dir, image_shape, device, min_depth=0.1, max_depth=150.0,
+                      num_vis=4, side_crop=0.0, bottom_crop=0.0, top_crop=0.0):
+    """Convergence of the mono depth to STEREO: make_stereo_proxy_gt.py's <stem>_left.png
+    (rectified left eye, GUI black) vs <stem>_depth16.png (mm*16, 0 = invalid, incl. the GUI).
+
+    Returns (metrics, vis) or None if `proxy_dir` holds no GT. `abs_rel` etc. are METRIC (no
+    scaling -- the depth is supposed to be mm); `ms_*` are per-frame median-scaled (shape only,
+    comparable to scared/*); `scale_ratio_median` = median(gt)/median(pred), 1.0 = metric.
+    """
+    from make_stereo_proxy_gt import DEPTH_SCALE      # lazy: pulls in cv2 + the stereo calib module
+    gts = sorted(Path(proxy_dir).glob("*_depth16.png")) if proxy_dir else []
+    if not gts:
+        return None
+    frames = [p.with_name(p.name[:-len("_depth16.png")] + "_left.png") for p in gts]
+    gt = (np.asarray(Image.open(p), np.float32) / DEPTH_SCALE for p in gts)   # lazy: 83x1340x1072
+    ms, ratios, vis, raw = _eval_pairs(model, frames, gt, image_shape, device, min_depth,
+                                       max_depth, num_vis, side_crop, bottom_crop, top_crop)
+    metrics = dict(zip(METRIC_NAMES, raw.tolist()))
+    metrics.update({"ms_" + k: v for k, v in zip(METRIC_NAMES, ms.tolist())})
+    metrics["scale_ratio_median"] = float(np.median(ratios))
+    metrics["scale_ratio_std"] = float(np.std(ratios))
+    metrics["n"] = len(ratios)
+    return metrics, vis
 
 
 def list_frames(args):
@@ -161,6 +188,22 @@ def main():
                          for g in gt]).mean(0)
         assert errs[0] < 1e-5 and errs[4] > 0.999, errs
         print(f"[smoke] ok: abs_rel={errs[0]:.2e} a1={errs[4]:.4f} (median scaling cancels the 0.5x)")
+
+        import tempfile                                       # proxy-GT: file layout + metric split
+        lo, hi = 20.0, 200.0
+        d = (1 / 50 - 1 / hi) / (1 / lo - 1 / hi)             # the disp that decodes to 50 mm
+
+        class Const(torch.nn.Module):
+            def forward(self, x):
+                return {("disp", 0): torch.full_like(x[:, :1], d)}
+
+        with tempfile.TemporaryDirectory() as td:
+            Image.fromarray(np.random.randint(0, 255, (56, 70, 3), np.uint8)).save(f"{td}/a_left.png")
+            Image.fromarray(np.full((56, 70), 100 * 16, np.uint16)).save(f"{td}/a_depth16.png")
+            pm, _ = run_proxy_gt_eval(Const(), td, (56, 70), "cpu", lo, hi)
+        assert abs(pm["abs_rel"] - 0.5) < 1e-3 and pm["ms_abs_rel"] < 1e-3, pm
+        assert abs(pm["scale_ratio_median"] - 2.0) < 1e-3, pm
+        print("[smoke] ok: proxy-GT pred 50 mm vs stereo 100 mm -> abs_rel 0.5 metric, 0 median-scaled")
         return
 
     assert args.gt_npz and (args.rgb_dir or args.list), "need --gt-npz and (--rgb-dir or --list)"
@@ -177,7 +220,7 @@ def main():
     model = build_depth_model(model_shape, device)
     _filter_load(model, args.ckpt, "depth")
 
-    mean_errors, ratios, vis = _eval_pairs(model, frames, gt, args.image_shape, device,
+    mean_errors, ratios, vis, _ = _eval_pairs(model, frames, gt, args.image_shape, device,
                                            args.min_depth, args.max_depth, args.num_vis,
                                            args.side_crop_frac, args.bottom_crop_frac,
                                            args.top_crop_frac)

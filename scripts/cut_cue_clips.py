@@ -193,11 +193,20 @@ def bars_between(p0, p1, bx, by):
     return 0
 
 
-def cue_span(mk, br, m_thr, b_thr, min_bars):
+def _on_span(p, span):
+    """True if point p lies on a (straight) marker-pair span, within CORRIDOR."""
+    (x0, y0), (x1, y1) = span
+    return (min(x0, x1) - CORRIDOR <= p[0] <= max(x0, x1) + CORRIDOR and
+            min(y0, y1) - CORRIDOR <= p[1] <= max(y0, y1) + CORRIDOR)
+
+
+def cue_span(mk, br, m_thr, b_thr, min_bars, taken=()):
     """The validated cue as a marker pair (p0, p1), or None if this is not a cue.
 
     Returns the WIDEST validated pair: the bar runs the full span, and picking a
-    shorter sub-pair would leave its tail unmasked.
+    shorter sub-pair would leave its tail unmasked. Pairs lying entirely on a span
+    in `taken` are skipped, so calling again finds the next link of a CHAINED cue
+    ("2 =yellow= 2 =grey= 1": two bars sharing the middle digit, each < PAIR_MAX_DIST).
     """
     if len(mk) == 0:
         return None
@@ -213,6 +222,8 @@ def cue_span(mk, br, m_thr, b_thr, min_bars):
             (x0, y0, _), (x1, y1, _) = m[i], m[j]
             span = abs(x0 - x1) + abs(y0 - y1)
             if span > PAIR_MAX_DIST or span <= best_len:
+                continue
+            if any(_on_span((x0, y0), s) and _on_span((x1, y1), s) for s in taken):
                 continue
             if bars_between((x0, y0), (x1, y1), bx, by) >= min_bars:
                 best, best_len = ((x0, y0), (x1, y1)), span
@@ -333,9 +344,11 @@ def cue_paths(mk, br, box, m_thr, b_thr, min_bars):
     inferred bar is drawn at its full nominal BAR_LEN: the length is fixed by the
     console, so stopping at the last matched stripe would leave the tail showing.
     """
-    span = cue_span(mk, br, m_thr, b_thr, min_bars)
-    if span is not None:
-        return [[_centre(*span[0]), _centre(*span[1])]]
+    spans = []
+    while (span := cue_span(mk, br, m_thr, b_thr, min_bars, spans)) is not None:
+        spans.append(span)       # terminates: a taken pair is always skipped after
+    if spans:
+        return [[_centre(*a), _centre(*b)] for a, b in spans]
     if len(mk) == 0 or len(br) == 0:
         return []
     b = br[br[:, 2] >= b_thr]
@@ -421,6 +434,14 @@ def black_gui(frame, panels, markers, bars, box, m_thr, b_thr, min_bars, dilate,
     its valid mask, so an undilated black/tissue edge interpolates to greys above
     0.04 and leaves a rim of GUI-contaminated pixels marked valid.
     """
+    frame[full_gui_mask(frame, panels, markers, bars, box, m_thr, b_thr, min_bars, dilate,
+                        bands)] = 0
+    return frame
+
+
+def full_gui_mask(frame, panels, markers, bars, box, m_thr, b_thr, min_bars, dilate,
+                  bands=False):
+    """The bool mask black_gui blacks out (True = GUI), for callers that need it kept."""
     mk, br = collect_frame(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), markers, bars, box)
     m = (gui_mask(frame, panels) |
          cue_mask(frame.shape, cue_paths(mk, br, box, m_thr, b_thr, min_bars), box))
@@ -429,8 +450,7 @@ def black_gui(frame, panels, markers, bars, box, m_thr, b_thr, min_bars, dilate,
     m = m.astype(np.uint8)
     if dilate > 0:
         m = cv2.dilate(m, np.ones((2 * dilate + 1,) * 2, np.uint8))
-    frame[m.astype(bool)] = 0
-    return frame
+    return m.astype(bool)
 
 
 # -------------------------------------------------------------- clip spans
@@ -729,6 +749,11 @@ def _self_test():
     assert cue_span(mk, np.empty((0, 3), np.float32), .55, .9, 5) is None
     # a validated PAIR still wins over inference: exact span, not an assumed 340 px
     assert cue_paths(mk, br, box, .55, .9, 5) == [[_centre(100, 990), _centre(400, 990)]]
+    # a CHAINED cue (2 =bar= 2 =bar= 1, whole chain > PAIR_MAX_DIST) masks both links
+    mk = np.array([[100, 990, .9], [400, 990, .9], [640, 990, .9]], np.float32)
+    br = np.array([[x, 990, .95] for x in range(110, 640, 22)], np.float32)
+    assert cue_paths(mk, br, box, .55, .9, 5) == [[_centre(100, 990), _centre(400, 990)],
+                                                   [_centre(400, 990), _centre(640, 990)]]
     print("self-test ok")
 
 

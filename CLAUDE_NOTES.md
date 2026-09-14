@@ -3,6 +3,149 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-14 - DEPTH: stereo proxy-GT convergence eval drives best.pth (+ frame/GUI convention)
+- CONVENTION agreed with Nick, written into CLAUDE.md: side bars CROPPED once (1340x1072 content
+  frame); GUI = black pixels + `<stem>_mask.png`, consumers read the mask, never infer from black.
+- `make_stereo_proxy_gt.run_images`: a `<stem>_mask.png` beside an SBS still invalidates depth
+  where the rectified left pixel OR its right-eye match (x - disp) is GUI, grown 4 px
+  (`gui_rect_mask`, self-test). Measured on 3 frames: 0 depth px left under the GUI; without the
+  mask 5-13k px survive there at median 46.6-54.3 mm = the screen plane. Also writes
+  `<stem>_left.png` + `<stem>_left_mask.png` (the mono model's input).
+- `eval_scared.run_proxy_gt_eval`: `abs_rel`.. are METRIC (unscaled, mm), `ms_*` median-scaled,
+  `scale_ratio_median` (1 = metric). `_eval_pairs` now also returns unscaled errors (4-tuple).
+- `finetune_depth --proxy-gt-dir` (default `../data/processed/proxy_gt_nogui_ffs`): logged every
+  epoch as `proxy_gt/*` and it SELECTS best.pth (outranks metric_val / SCARED). Overlays at 1/4 res.
+- Leakage checked: surgeries 18de9c5a / 5e27066c are not in depthclips_ruler_NoGUI -> clean test.
+- `finetune_depth --smoke` fails in `_selfcheck_scale_loss` (1.28 vs 1.32), untouched by this
+  change -- flagged as a separate task.
+
+## 2026-09-14 - DEPTH 3D: HUD/GUI stripped from the SBS proxy-GT stills (scripts/mask_sbs_gui.py)
+- Each SBS eye is un-squeezed into the MONO 1920x1080 frame (eye->mono affine + MONO_CROP), masked
+  there by the unchanged mono code (`cut_cue_clips.full_gui_mask`, split out of `black_gui`), mask
+  warped back; L|R masks OR-ed and applied to both eyes (overlays composited identically, +960 px).
+- Out: `../data/3D_ProxyGT/proxyGTimg_nogui/<stem>.png` (GUI black, lossless) + `<stem>_mask.png`
+  (255 = GUI). 83 frames: HUD+tab = 5.1% each; 8 carry a cue bar (5.5-6.0%), all checked against the
+  UNMASKED pixels, both eyes; no popups; no misses on contact sheets. Templates still score >=0.64 on
+  the 2.125x-upsampled eye, so the mono thresholds carry over.
+- BUG FIXED in `cue_paths` (mono too): a CHAINED cue `2 =yellow= 2 =grey= 1` is two bars whose whole
+  span > PAIR_MAX_DIST, and `cue_span` returned only the widest pair -> the grey link stayed visible.
+  Now repeats `cue_span` skipping pairs lying on an already-taken span. Self-test added.
+- The mask is the deliverable, not the black: black is identical in both eyes -> a flat ~47 mm
+  screen-plane that passes the LR check. make_stereo_proxy_gt.py does NOT read `_mask.png` yet.
+
+## 2026-09-11 - SUL: head-to-head of every method (scripts/eval_sul_methods.py) -- use the MASK's ends along the tube
+
+- 71 annotated frames, 4 methods x {Nick's masks, model masks} x {stereo, mono scaled per frame to the stereo,
+  mono raw}; fixed reference = Nick's ruler points back-projected with the STEREO depth (3D chord).
+  A mask ends (main-axis end pixels -> 3D chord), B first cylinder (git 50834de, run as is), C current
+  cylinder (knee3 end, outward-only start), D C's axis with both ends from the mask (1st/99th pct).
+- Median |SUL error|, Nick's masks: stereo A 2.8 / B 8.6 / C 2.9 / D 2.0 mm; mono-shape A 3.3 / B 8.0 / C 3.2 /
+  D 2.7. Per end along the tube (stereo): D within 1.6 mm at every end; C long end +2.8; B control end -3.6,
+  short 0/28 counted (hidden-start check rejects the prostate junction), long end +18.6.
+- B's good first number (control +1.4 with model masks) was the model mask's early start cancelling a 3.6 mm
+  early end. The 5e27 instability was the MODEL MASK, not the view angle (as guessed at the time).
+- Mono: C's depth-driven end degrades (control -5.1, long +5.0 mm); mask ends barely move. Raw mono scale is
+  off 1.06 / 1.59 / 1.74 x (control / short / long) -> a per-frame metric anchor is mandatory.
+- Model masks: every method fails on the long clip (start 12-15 mm too far); the prostate end of the mask is
+  the dominant error. RECOMMENDATION: D as the primary SUL, C's roof crossing only as a fallback / QC.
+- Caveat: rules (knee3, outward-only) were chosen on these same frames, one annotator, 3 clips -- no held-out
+  set; D involves no tuning. The chord reference carries surface depth (short: chord 22.5 vs along-tube 19.4).
+
+## 2026-09-11 - SUL: Nick's hand masks + ruler points -- the mask was the long clip's problem, the END definition the rest
+
+- Nick annotated the rectified frames (`OTHERS/annotate_urethra` -> `transfer_atlas_mod/workspace/<clip>/masks`)
+  and marked start/end with the Ruler tool (`scale_objects.json`, keyed by index into the sorted clip images;
+  mostly tracked, manual and tracked agree to <= 0.3 mm on the median). Converted to `<run>/hand_points.csv`;
+  hand-mask runs write `urethra_cyl_hand/`.
+- Method minus Nick, signed per-frame medians (start +: later/distal; end -: earlier):
+  control seg3 30-35 s: model start -1.5 end -3.5 SUL -2.0 | hand start -1.6 end -5.8 SUL -4.5 (Nick 22.4 mm)
+  short seg3 no-arm:    model start +3.4 end -2.1 SUL -4.8 | hand start +4.4 end -2.0 SUL -6.6 (Nick 22.5 mm)
+  long 5e27 no-arm:     model start -17.1 SUL +14.9       | hand start +3.9 end +2.9 SUL -1.5 (Nick 8.5 mm)
+- The long clip's instability was the MODEL MASK (27.2 -> 7.5 mm with Nick's masks, radius off the 8 mm cap),
+  NOT the viewing angle guessed earlier.
+- With hand masks each end is still 2-6 mm off, in both directions -- no single bias. On seg3 the end lands at the
+  zero crossing of the slow pre-knee drift, while Nick marks the knee (the steep rise).
+- CAVEAT on the metric: a ruler point takes the depth of whatever surface lies under it (prostate bulge, roof),
+  which can sit ~9 mm in front of the tube; projected on the tilted axis that moves it several mm (short clip:
+  start 15 px apart in the image, 4.4 mm apart along the axis). Compare in the image, along the top line, instead.
+- The long clip's reference itself spreads +-2 mm frame to frame (manual and tracked alike).
+- FOLLOW-UP: `--end-rule/--start-rule knee` (two-segment fit on the gap profile; falls back to the
+  zero rule if the break is past the detection or bends the wrong way) and hand points matched in the
+  IMAGE to the tube's top line (hand_measure). Runs with the zero rule go to *_end-zero_start-zero/.
+- RESULT (d21910e): the knee fixes the prostate START (short clip +1.4 -> +0.4 mm) but NOT the end
+  (control -7.3 -> -8.0, short -3.2 -> -3.6; long +3.0 either way). On seg3 the gap profile bends TWICE
+  (flat -> slow rise -> steep): a one-break fit takes the first bend, Nick marks the second, where the steep
+  rise starts (gap ~1.5-2.2 mm there). Long 5e27 has one sharp step and Nick is ~3 mm before it.
+  Image matching works: Nick's clicks sit 4-19 px from the tube line.
+- knee3 (f631b35; DEFAULT end rule since the next commit, start stays on the two-segment knee):
+  three-segment fit, end = start of the steepest later segment. End error vs Nick: control -7.3 -> +0.5,
+  short -3.2 -> +0.9 mm (p10-p90 within +-1.4); SUL vs Nick +1.8 / +0.5 / -0.5 mm. Long 5e27 unchanged
+  (+2.8, a few frames up to +14): one sharp step, and Nick marks ~3 mm before it.
+- OUTWARD ONLY start: the depth may move the start past the mask's edge, never into it. Long 5e27:
+  depth start 4.2 mm inside the mask in 19/28 frames (start error +3.6 vs Nick; mask edge -0.5); short and
+  control unaffected (depth start at or outside the edge). Cost: an overshooting mask cannot be pulled back.
+- RESULT (60e66e7). Nick's masks: start error -1.4 / +0.4 / -0.6 mm (long was +3.6), end +0.5 / +0.9 / +2.8,
+  SUL vs Nick +1.8 / +0.6 / +3.3 mm on control / short / long -- the long clip got WORSE overall because its
+  late start used to cancel its late end. Model masks: +2.9 / +0.7 / +13.7; overshooting model masks are now
+  pinned (10/10 control, 20/28 short starts are 'mask (step inside)'). Long end: the depth step sits ~3 mm past
+  the top of Nick's mask and his end -- tissue lying flush on the tube is invisible to the depth.
+
+## 2026-09-11 - SUL cylinder v2: the mask says WHERE, the depth finds the tube and the start border
+
+- Nick's three suggestions (df62aa9, bc9c0de). (1) Mask as a rough ROI: after the first fit, every
+  depth point within 40 px of the mask (instrument/catheter excluded) that lies on the surface is
+  re-selected and refit 3x; radius held to 2.5-8 mm (end-on views ran to 8.5-11 mm unconstrained).
+  (2) Start found like the end: a depth step at the mask's start -- prostate base in front, open cut
+  end behind, or the catheter -- searched ONLY from 3 mm inside to 5 mm past the mask's start; no step
+  but depth seen keeps the mask's start; unknown depth past it = hidden. (3) Prostate mask drawn
+  (magenta); a start landing on it is tagged "base (prostate)".
+- DEAD END, do not retry: walking the whole tube proximally from mid-tube stops at the first bump --
+  the bipolar jaw on seg3 (99/100 frames "base", SUL 23.9 -> 12.6) or where a curved urethra leaves the
+  straight cylinder (short no-arm clip: "open end", 14.0 vs 28.4 mm from the mask).
+- Crossings are interpolated to gap = 0 (the threshold walk-back put each one ~zero_tol/slope past,
+  and with both ends from the depth the offsets add). Self-test: cut end 17.9/18.0, prostate base 18.0/18.0.
+- RESULT seg3 30-35 s: 100/100 frames, start = catheter every frame, SUL 20.4 mm IQR 20.0-20.9. It was
+  23.9: the END moved -- on real tissue the zero crossing lands on the slow pre-knee drift, ~5 mm before
+  the steep rise where the tissue visibly covers the tube. OPEN: a hinge/knee fit is the better end.
+- Short no-arm seg3 clip (0.47 s, all 28 frames): the start lands on the prostate junction as a clean
+  depth step, but SUL still spans 12-25 mm within 0.45 s of fast camera motion -- the mask-start SUL moves
+  the same way, so that spread is the end/mask, not the start logic. 5e27 views stay unreliable (r pinned
+  at the 8 mm bound, IQR up to 17-33 mm).
+- The prostate class also paints the tissue around the cut stump after transection -- not a usable
+  start signal there.
+- `jobs/urethra_cylinder.sh`: SLOW=N slows only the encoded video.
+- `--masks DIR`: hand masks replace the model (tool ids mapped by name, palette index read with
+  PIL, DVP -> background, no keep-largest); frames without a mask are skipped; output in
+  `urethra_cyl_hand/`. Frames to annotate: `OTHERS/annotate_urethra/<clip>/images/`.
+- `--points CSV` (frame,ax,ay,bx,by, from the labelling tool's Ruler lines in scale_objects.json,
+  keyed by index into the sorted clip images): 3D chord = the annotator's SUL; both points projected
+  on the fitted axis give start/end errors (method - annotator, proximal point = start).
+
+## 2026-09-11 - SUL: urethra END point from a stereo cylinder + where the roof covers it
+
+- `scripts/urethra_cylinder.py` + `jobs/urethra_cylinder.sh`, run on a `temporal_stereo_clip.py
+  --save-depth` output. `ureth_fn` + keep-largest on the rectified left eye (the same 1340x1072
+  frame it was trained in), back-projected with P1, robust cylinder (soft_l1 on dist-to-axis - r,
+  mask eroded 7 px). END = walk the tube's camera-facing top line distally: gap = Z_top - Z_obs is
+  ~0 while the tube is visible and rises once the roof sits in front; first sustained gap > 1.5 mm,
+  walked back to <= 0.5 mm. SUL = end - start along the axis.
+- RESULT seg3 30-35 s (urethra side-on): 100/100 frames, **SUL 23.9 mm, IQR 23.6-24.2** under
+  camera motion; r 6.1 vs silhouette 5.2 mm. 5e27 33-38 s (looking down the lumen): cylinder
+  ill-posed (r 8.5 vs 5.2), 49/100 frames counted, SUL 17.2 mm IQR 16.4-19.2, and the frames whose
+  mask reaches the lumen read 19-21 mm -- UNRELIABLE. The method needs the urethra side-on.
+- **The unstable end was the START, not the roof.** On 5e27 SUL tracked mask size at rho 0.92: an
+  instrument over the proximal urethra truncates the mask. Fix is class-independent -- the roof test
+  run backwards (something in front 0.5-3 mm proximal of the start = hidden, frame not counted).
+  On 5e27 it also fires on some clean cut ends (end-on stump); a catheter exception was tried,
+  changed nothing on real data, and was removed.
+- Radius ratio fit/silhouette separates the two windows (1.18 vs 1.62) but does NOT track per-frame
+  error (rho 0.05), so it is reported, not used as a gate.
+- Ceilings: straight cylinder (a curved urethra biases the far end); ~+-1.5 mm in where the roof
+  "starts" (on seg3 the gap drifts -1..+0.5 mm before the knee); NO ruler GT for these surgeries
+  (`sul_reference` has none) -- this is precision, not accuracy.
+- `--self-test`: ray-cast tube under a roof + 0.15 mm noise -> r 3.95/4.0, axis 0.03 deg, SUL
+  18.7/18.0; no roof -> nothing found; instrument over the start -> flagged (would read 14.6).
+
 ## 2026-09-11 - DEPTH 3D: TEMPORAL stereo - a video closes 30% of one pair's holes, but does NOT sharpen it
 
 - `scripts/temporal_stereo_clip.py` + `jobs/temporal_stereo.sh`. Sample one window at 20 fps
@@ -890,3 +1033,19 @@ now returns elapsed time alongside the tier, and the status line shows both, e.g
 stage -- the line says model vs disk vs something else in the click/redraw path.
 
 BUILD -> 4.
+
+### 4-annotator arch comparison: Vivian marked a different structure (2026-09-11)
+
+`scripts/compare_arch_4way.py` adds Vivian to Nick/Veerle/Aron. Vivian did not track the
+comparison videos: her `JSONfileVivian/SUL_img3x/arches.json` is keyed by index into the sorted
+234-image SUL_img3x still set (same as `transfer_atlas_mod/workspace/SUL_img3x/arches.json`).
+Ten of those stills come from the comparison videos; `JSONfileVivian/SUL_img3x/frame_map.json`
+(new, hand-written) maps key -> (video, frame), found by pixel-matching each still against the
+mp4 (MAD ~3 vs ~5 runner-up). Her coords are full-frame; shifted into Nick's crop by
+source_crop (289, 4). Veerle/Aron keep the per-video mean offset vs Nick from compare_arch_multi.
+
+Result: Nick/Veerle/Aron agree to 35-65 px mean tip distance at these frames, Vivian is ~460 px
+(~100% of chord) from all three. Overlay confirms the mapping is right but her arch sits on the
+catheter tip / urethral opening (~150 px chord), not the Retzius arch (~900 px chord). Her numbers
+measure a different target, not annotator disagreement. Her PNGs/CSVs were briefly deleted, then
+restored on request from the identical workspace copies.
