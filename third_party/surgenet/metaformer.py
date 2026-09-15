@@ -712,6 +712,14 @@ def caformer_s18(num_classes=0, pretrained='ImageNet', pretrained_weights=None, 
 
     return model
 
+
+def variant_for(state_dict):
+    """caformer_s18 variant a (MetaFormerFPN or bare encoder) state dict was built as:
+    'ImageNet' has StarReLU scale/bias params, 'SurgeNet' is plain ReLU (none). RARP seg
+    checkpoints trained before 2026-09-15 are 'ImageNet'; the SurgeNet teacher and newer
+    ones are 'SurgeNet'. Build MetaFormerFPN(pretrained=variant_for(sd)) before loading sd."""
+    return "ImageNet" if any(k.endswith("mlp.act.scale") for k in state_dict) else "SurgeNet"
+
 """""" """""" """""" """"""
 """" FPN DEFINITIONS """
 """""" """""" """""" """"""

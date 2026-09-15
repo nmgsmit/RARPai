@@ -37,7 +37,7 @@ load_dotenv()
 
 # vendored from https://github.com/timjaspers0801/surgenet
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "surgenet"))
-from metaformer import MetaFormerFPN  # noqa: E402
+from metaformer import MetaFormerFPN, variant_for  # noqa: E402
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -104,8 +104,13 @@ def load_encoder(model: MetaFormerFPN, ckpt_path: str):
     sd = {k.replace("module.", "").replace("backbone.", ""): v
           for k, v in ck.items() if not k.startswith("head.")}
     msg = model.metaformer.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in msg.missing_keys if not k.startswith("head.")]
     print(f"[encoder] loaded {len(sd)} tensors | missing={len(msg.missing_keys)} "
-          f"unexpected={len(msg.unexpected_keys)}")
+          f"(encoder {len(enc_missing)}) unexpected={len(msg.unexpected_keys)}")
+    # the SurgeNet teacher is the ReLU variant: into pretrained="ImageNet" (StarReLU) 48 act
+    # scale/bias params silently stay at init. That variant is only allowed on purpose (A/B).
+    assert not enc_missing or variant_for(model.state_dict()) == "ImageNet", \
+        f"{len(enc_missing)} encoder keys not in {ckpt_path}: {enc_missing[:3]}"
 
 
 def dice_ce_loss(logits, target, num_classes):
@@ -199,7 +204,7 @@ def main():
     va = DataLoader(SegDataset(root / "Validation", args.img_size),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
 
-    model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None).to(device)
+    model = MetaFormerFPN(num_classes=nc, pretrained="SurgeNet", pretrained_weights=None).to(device)
     load_encoder(model, args.encoder_ckpt)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)

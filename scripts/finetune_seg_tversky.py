@@ -37,7 +37,7 @@ from torch.utils.data import DataLoader, Dataset
 load_dotenv()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "surgenet"))
-from metaformer import MetaFormerFPN  # noqa: E402
+from metaformer import MetaFormerFPN, variant_for  # noqa: E402
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD  = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -199,8 +199,14 @@ def load_encoder(model: MetaFormerFPN, ckpt_path: str):
     sd = {k.replace("module.", "").replace("backbone.", ""): v
           for k, v in ck.items() if not k.startswith("head.")}
     msg = model.metaformer.load_state_dict(sd, strict=False)
-    print(f"[encoder] loaded {len(sd)} tensors | missing={len(msg.missing_keys)} "
+    enc_missing = [k for k in msg.missing_keys if not k.startswith("head.")]
+    print(f"[encoder] {variant_for(model.state_dict())} | loaded {len(sd)} tensors | "
+          f"missing={len(msg.missing_keys)} (encoder {len(enc_missing)}) "
           f"unexpected={len(msg.unexpected_keys)}")
+    # the SurgeNet teacher is the ReLU variant: into pretrained="ImageNet" (StarReLU) 48 act
+    # scale/bias params silently stay at init. That variant is only allowed on purpose (--variant).
+    assert not enc_missing or variant_for(model.state_dict()) == "ImageNet", \
+        f"{len(enc_missing)} encoder keys not in {ckpt_path}: {enc_missing[:3]}"
 
 
 def tversky_ce_loss(logits, target, num_classes, alpha=0.4, beta=0.6, include_bg=False,
@@ -267,6 +273,10 @@ def main():
                          "with its labels mapped into the training scheme by name. Only classes "
                          "present in BOTH schemes are scorable.")
     ap.add_argument("--encoder-ckpt", default="../backbones/RARP_checkpoint_epoch0050_teacher.pth")
+    ap.add_argument("--variant",      default="SurgeNet", choices=["SurgeNet", "ImageNet"],
+                    help="caformer_s18 variant. SurgeNet (ReLU) = what the teacher was trained as. "
+                         "ImageNet (StarReLU) = how every seg run before 2026-09-15 was built "
+                         "(48 teacher keys left at init); only for the A/B.")
     ap.add_argument("--out",          default="outputs/rarp_tversky")
     ap.add_argument("--run-name",     default="tversky-ema")
     ap.add_argument("--keep-classes", default="1,3",
@@ -308,6 +318,8 @@ def main():
 
     if args.smoke:
         m   = MetaFormerFPN(num_classes=12, pretrained="ImageNet", pretrained_weights=None).to(device)
+        assert variant_for(m.state_dict()) == "ImageNet"
+        assert variant_for(MetaFormerFPN(num_classes=2, pretrained="SurgeNet").state_dict()) == "SurgeNet"
         x   = torch.randn(2, 3, args.img_size, args.img_size, device=device)
         y   = torch.randint(0, 12, (2, args.img_size, args.img_size), device=device)
         out = m(x)
@@ -398,7 +410,7 @@ def main():
             bg_in_loss=args.bg_in_loss,
             augment=not args.no_augment, loss="tversky+ce(bg-excluded)",
             aug="hflip+photometric", seed=args.seed,
-            encoder_ckpt=args.encoder_ckpt, data_root=str(root),
+            encoder_ckpt=args.encoder_ckpt, variant=args.variant, data_root=str(root),
         ),
     )
 
@@ -423,7 +435,7 @@ def main():
     assert not missing, (f"classes {missing} never appear in {len(ds)} training masks -- "
                          "wrong --keep-classes, --label-scheme, or mask palette mode?")
 
-    model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None).to(device)
+    model = MetaFormerFPN(num_classes=nc, pretrained=args.variant, pretrained_weights=None).to(device)
     load_encoder(model, args.encoder_ckpt)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
@@ -496,7 +508,10 @@ def main():
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     ckpt = Path(args.eval_only) if args.eval_only else outdir / "best.pth"
     print(f"[eval] checkpoint {ckpt}", flush=True)
-    model.load_state_dict(torch.load(ckpt, map_location=device))
+    sd = torch.load(ckpt, map_location=device)
+    if variant_for(sd) != args.variant:   # --eval-only on a checkpoint of the other variant
+        model = MetaFormerFPN(num_classes=nc, pretrained=variant_for(sd), pretrained_weights=None).to(device)
+    model.load_state_dict(sd)
     te_miou, te_dice, te_loss, te_per_dice = validate(model, te, nc, device, args.alpha, args.beta, args.bg_in_loss)
     track = [(c, names[c]) for c in range(1, nc)]
     te_per = "  ".join(f"{n}={te_per_dice[c]:.4f}" for c, n in track)

@@ -1277,3 +1277,20 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
 - Baseline, `endodac-ruler-range-sw05-3ep` (job 26688975, wandb r3p74r8y), proxy_gt ms_abs_rel
   ep0..3 = .1660 / .1640 / .1652 / .1656 -- flat. Run = `jobs/finetune_depth_sharpest.sh`
   (sw05 settings, scale-w 0, 3 ep).
+
+## 2026-09-15 — seg encoder variant: SurgeNet teacher is ReLU, seg runs built StarReLU
+- `caformer_s18(pretrained="ImageNet")` = StarReLU (learnable scale+bias per act);
+  `pretrained="SurgeNet"` = plain ReLU. The RARP teacher is the ReLU one. Loaded on Snellius:
+  ImageNet variant -> missing 54 = 48 encoder (`stages.*.token_mixer.act1.{scale,bias}`,
+  `stages.*.mlp.act.{scale,bias}`) + 6 `head.*`; SurgeNet variant -> missing 6 (`head.*` only,
+  unused by the FPN), unexpected 0 for both. Every seg log so far says `missing=54` -> ALL existing
+  seg models (rarp_tversky*, rarp_nick_*, ureth_*, bestseg, ...) started with StarReLU at default
+  init (s=1, b=0 -> s*relu(x)^2, not relu(x)) instead of the pretrained network. Encoder was trainable, so
+  they adapted, but the init was not the teacher.
+- Fix: `metaformer.variant_for(sd)` ("ImageNet" iff `*mlp.act.scale` in sd). The seg fine-tune
+  scripts build `pretrained="SurgeNet"`; `load_encoder` prints `(encoder N)` missing and asserts
+  N == 0 unless the model is deliberately StarReLU. `finetune_seg_tversky.py --variant ImageNet`
+  reproduces the old init (A/B only); its final/`--eval-only` eval rebuilds from the checkpoint's
+  variant. Every script that loads a seg best.pth (overlay_dir, overlay_masks, run_rarp_seg,
+  eval_urethra, slide_dice_examples, eval_sul_methods, urethra_cylinder, arch_tip_features tools)
+  builds `pretrained=variant_for(sd)`, so old StarReLU and new ReLU checkpoints both load strict.

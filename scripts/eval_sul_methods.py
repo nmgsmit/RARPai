@@ -123,13 +123,13 @@ def main():
 
     import torch
     from PIL import Image
-    from overlay_dir import MetaFormerFPN, _keep_largest, predict
+    from overlay_dir import MetaFormerFPN, _keep_largest, predict, variant_for
     from gui_depth_measure import (DEFAULT_CKPT, DEFAULT_MAX_DEPTH, DEFAULT_MIN_DEPTH,
                                    DEFAULT_SHAPE, DepthBackend)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     sd = torch.load(a.checkpoint, map_location="cpu", weights_only=True)
     segnet = MetaFormerFPN(num_classes=sd["FPN.segmentation_head.0.bias"].shape[0],
-                           pretrained="ImageNet", pretrained_weights=None)
+                           pretrained=variant_for(sd), pretrained_weights=None)
     segnet.load_state_dict(sd)
     segnet.to(dev).eval()
     mono = DepthBackend(DEFAULT_CKPT, DEFAULT_SHAPE, DEFAULT_MIN_DEPTH, DEFAULT_MAX_DEPTH).load()

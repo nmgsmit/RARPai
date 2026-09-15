@@ -45,7 +45,7 @@ _spec.loader.exec_module(ft)
 _spec2 = importlib.util.spec_from_file_location("eu", _HERE / "eval_urethra.py")
 eu = importlib.util.module_from_spec(_spec2)
 _spec2.loader.exec_module(eu)
-from metaformer import MetaFormerFPN                 # noqa: E402
+from metaformer import MetaFormerFPN, variant_for                 # noqa: E402
 
 PRED_RGB = (1.0, 0.85, 0.0)
 GT_RGB = "#00E5FF"
@@ -201,7 +201,7 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     sd = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None)
+    model = MetaFormerFPN(num_classes=nc, pretrained=variant_for(sd), pretrained_weights=None)
     model.load_state_dict(sd)
     model.eval().to(device)
     print(f"[model] {args.checkpoint} device={device} frames={len(pairs)}")

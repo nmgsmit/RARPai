@@ -29,7 +29,7 @@ sys.path.insert(0, str(_HERE.parent / "third_party" / "surgenet"))
 _spec = importlib.util.spec_from_file_location("ft", _HERE / "finetune_seg_tversky.py")
 ft = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ft)
-from metaformer import MetaFormerFPN  # noqa: E402
+from metaformer import MetaFormerFPN, variant_for  # noqa: E402
 
 
 def keep_largest(pred, u):
@@ -163,7 +163,7 @@ def main():
     sd = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     got = sd["FPN.segmentation_head.0.bias"].shape[0]
     assert got == nc, f"checkpoint has {got} classes, --keep-classes implies {nc}"
-    model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None)
+    model = MetaFormerFPN(num_classes=nc, pretrained=variant_for(sd), pretrained_weights=None)
     model.load_state_dict(sd)
     model.to(device)
 

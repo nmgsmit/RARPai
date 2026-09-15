@@ -21,7 +21,7 @@ from PIL import Image
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "surgenet"))
-from metaformer import MetaFormerFPN
+from metaformer import MetaFormerFPN, variant_for
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
@@ -45,7 +45,7 @@ def load_model(checkpoint_path, device):
     if num_classes is None:
         raise ValueError("could not infer num_classes from checkpoint")
 
-    model = MetaFormerFPN(num_classes=num_classes, pretrained="ImageNet", pretrained_weights=None).to(device)
+    model = MetaFormerFPN(num_classes=num_classes, pretrained=variant_for(state), pretrained_weights=None).to(device)
     model.load_state_dict(state)
     model.eval()
     print(f"[model] loaded {checkpoint_path} (num_classes={num_classes})")

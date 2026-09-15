@@ -87,8 +87,10 @@ def load_encoder(model: MetaFormerFPN, ckpt_path: str):
     sd = {k.replace("module.", "").replace("backbone.", ""): v
           for k, v in ck.items() if not k.startswith("head.")}
     msg = model.metaformer.load_state_dict(sd, strict=False)
+    enc_missing = [k for k in msg.missing_keys if not k.startswith("head.")]
     print(f"[encoder] loaded {len(sd)} tensors | missing={len(msg.missing_keys)} "
-          f"unexpected={len(msg.unexpected_keys)}")
+          f"(encoder {len(enc_missing)}) unexpected={len(msg.unexpected_keys)}")
+    assert not enc_missing, f"{len(enc_missing)} encoder keys not in {ckpt_path}: {enc_missing[:3]}"
 
 
 def dice_ce_loss(logits, target, num_classes):
@@ -182,7 +184,7 @@ def main():
     va = DataLoader(SegDataset(root / "Validation", args.img_size),
                     args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
 
-    model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None).to(device)
+    model = MetaFormerFPN(num_classes=nc, pretrained="SurgeNet", pretrained_weights=None).to(device)  # ReLU, as the teacher
     load_encoder(model, args.encoder_ckpt)
 
     opt   = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)

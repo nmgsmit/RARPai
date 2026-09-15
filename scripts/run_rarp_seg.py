@@ -20,7 +20,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "surgenet"))
 
-from metaformer import MetaFormerFPN  # noqa: E402
+from metaformer import MetaFormerFPN, variant_for  # noqa: E402
 from src.utils.viz import VideoWriter, overlay_mask_multiclass  # noqa: E402
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
@@ -48,7 +48,7 @@ def main():
     sd = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     nc = args.num_classes or sd["FPN.segmentation_head.0.bias"].shape[0]
     print(f"[checkpoint] num_classes={nc}")
-    model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None)
+    model = MetaFormerFPN(num_classes=nc, pretrained=variant_for(sd), pretrained_weights=None)
     model.load_state_dict(sd)
     model.to(device).eval()
     print(f"[loaded] {args.checkpoint} | device={device}")

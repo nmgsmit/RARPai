@@ -16,7 +16,7 @@ import torch
 from PIL import Image, ImageDraw
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "surgenet"))
-from metaformer import MetaFormerFPN  # noqa: E402
+from metaformer import MetaFormerFPN, variant_for  # noqa: E402
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406])
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225])
@@ -108,7 +108,7 @@ def main():
 
     sd = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     nc = sd["FPN.segmentation_head.0.bias"].shape[0]
-    model = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None)
+    model = MetaFormerFPN(num_classes=nc, pretrained=variant_for(sd), pretrained_weights=None)
     model.load_state_dict(sd)
     model.eval().to(device)
     print(f"[model] {args.checkpoint} num_classes={nc} feed={size_hw} device={device}")
