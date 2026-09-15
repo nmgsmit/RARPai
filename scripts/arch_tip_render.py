@@ -45,11 +45,13 @@ def _init(box, out):
 
 
 def _mask(job):
+    """Mask + encode in the worker; the parent writes. 128 processes creating files in one GPFS directory sat in
+    uninterruptible I/O wait (state D, 0% CPU) -> ~3 frames/s."""
     stem, f = job
     m = full_gui_mask(f, *_W["T"], _W["box"], CUE["m_thr"], CUE["b_thr"], CUE["min_bars"], CUE["dilate"])
     f[m] = 0                                                    # black pixels AND a mask file
-    cv2.imwrite(str(_W["out"] / f"{stem}.jpg"), _crop(f), [cv2.IMWRITE_JPEG_QUALITY, 95])
-    cv2.imwrite(str(_W["out"] / f"{stem}_mask.png"), _crop(m).astype(np.uint8) * 255)
+    return (stem, cv2.imencode(".jpg", _crop(f), [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes(),
+            cv2.imencode(".png", _crop(m).astype(np.uint8) * 255)[1].tobytes())
 
 
 def extract(video, out, workers):
@@ -68,7 +70,9 @@ def extract(video, out, workers):
                     batch.append((stem, f))
                 ok, f = cap.read()
                 i += 1
-            pool.map(_mask, batch)
+            for stem, jpg, png in pool.imap_unordered(_mask, batch):
+                (out / f"{stem}.jpg").write_bytes(jpg)
+                (out / f"{stem}_mask.png").write_bytes(png)            # mask last: it marks the frame done
             print(f"{i} frames", flush=True)
 
 
