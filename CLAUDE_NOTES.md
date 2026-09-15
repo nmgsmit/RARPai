@@ -1165,7 +1165,38 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
   `scripts/zeroshot_proxy_gt.py` / `jobs/zeroshot_proxy_gt.sh`. transformers 5.17 is installed with
   `pip --target ~/pylibs/bench --no-deps` (NOT in the venv, hub 1.19 pinned there for FoundationStereo);
   weights pre-downloaded to ~/.cache/huggingface on the login node (DAv2-L 1.25 GB, DAv2 metric
-  indoor L 1.25 GB, DepthPro 1.77 GB), job runs HF_HUB_OFFLINE=1. Crops:
+  indoor L 1.25 GB, DepthPro 1.77 GB), job runs HF_HUB_OFFLINE=1.
+- ZERO-SHOT RESULT (job 26731682, 2 min, outputs/zeroshot_proxy_gt/{results.json,per_frame.csv,grid.png};
+  self-check ms_abs_rel == run_proxy_gt_eval 0.1660). ms = median-scaled depth (training metric),
+  ssi = scale+shift in inverse depth; d = ssi vs warm-start, bootstrap CI over frames:
+    model                     ms_abs_rel ms_a1 | ssi_abs_rel ssi_a1 | d_ssi [95% CI]     | per patient ssi 18de9c5a / 5e27066c
+    EndoDAC warm-start          .1660   .724  |   .1527    .763   |                    | .156 / .147
+    ft manual ep5               .1649   .728  |   .1519    .765   | -.0008 [-.001,-.0005]| .155 / .147
+    ft sharpest1x ep5           .1653   .726  |   .1525    .763   | -.0002             | .155 / .147
+    ft ruler sw05               .1666   .722  |   .1536    .761   | +.0009             | .156 / .149
+    Depth Anything V2 L (rel)   .2998*  .548  |   .1059    .889   | -.0467 [-.057,-.037] | .119 / .082  (71/83 frames better)
+    DAv2 Metric Indoor L        .1306   .819  |   .1181    .854   | -.0345 [-.043,-.026] | .127 / .103  (68/83)
+    Depth Pro                   .1606   .757  |   .1459    .786   | -.0068 [-.021,+.007] | .160 / .121  (51/83)
+  * DAv2-rel outputs affine-invariant DISPARITY: median scaling can't remove its shift, use ssi.
+  => The proxy-GT is NOT at a floor: DAv2-L is 31% better on shape than EndoDAC, on BOTH patients.
+  All EndoDAC fine-tunes sit within 1% of the warm start. grid.png: EndoDAC maps are blurry with a
+  radial "bowl" (near at the rim, far in the centre) that follows the image, not the anatomy; DAv2
+  reproduces the stereo GT's structures (tissue ridges, catheter tip) with sharp edges. CIs treat
+  83 frames as independent but they come from 2 patients -> optimistic.
+- ZERO-SHOT ROUND 2 (Nick's list, image models only + EndoUFM): `zeroshot_proxy_gt.py --all` runs each
+  model in its own subprocess (`--model NAME`, per-model PYTHONPATH) then `--summarize`, because the
+  packages clash (DA3 numpy<2 vs MoGe/UniDepth numpy>=2; EndoUFM's top-level `networks`/`utils`).
+  Code, all `pip --target --no-deps` + only the modules the import actually missed (scratchpad
+  autodeps loop), NEVER in the venv: ~/pylibs/{bench (transformers 5.17), da3 (depth-anything-3
+  0.1.1 + moviepy==1.0.3, addict, plyfile, pycolmap, trimesh, evo), moge (MoGe git, utils3d-moge git),
+  unidepth (git), metric3d (mmengine, yapf, addict) + metric3d_mmcvstub (mmcv.utils.collect_env stub:
+  Metric3D imports it for env LOGGING only; real mmcv 1.7.2 does not build), endoufm_deps, EndoUFM (git
+  clone)}. Weights: HF cache (DA3-LARGE/GIANT/METRIC-LARGE, moge-2-vitl, moge-vitl,
+  unidepth-v2-vitl14), ~/.cache/torch/hub/checkpoints (Metric3D vit_large/giant2), repo code
+  ~/.cache/torch/hub/yvanyin_metric3d_main (loaded source='local'), ~/backbones/EndoUFM/depth_model.pth
+  (Google Drive id in its README). EndoOmni: NOT testable -- TianCuteQY/EndoOmni holds only a
+  2-line README, no code/weights, nothing on HF. EndoUFM rvlora: random_1/2 are built but unused in
+  RVLinear.forward, so loading is deterministic. Home quota ~170/200 GB after this. Crops:
   ~/zoomcrop/zoom_grid_{a,b}.png on Snellius. Pixel MAD vs a 1x crop does NOT work as a detector
   (the label is translucent over tissue); a template/OCR detector would need 2x/4x glyph crops.
   Ruler-run split had 4d8eca93 + 7d96d613 as VALIDATION videos (other segments; zoom there unchecked).
