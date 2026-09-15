@@ -1153,7 +1153,19 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
 - Both new sets share Validation/Test with depthclips_sharpest_1x (symlinks) so val numbers compare:
   `depthclips_manual` (manual, 1x) and `depthclips_all15_1x` (`prep_sharpest_clips.py --all --min-mb
   1.5 --zoom-csv`, every 1x staging clip, val/test patients excluded from Train). Runs: same as
-  26696249 (12 ep, anchor .3, scale-w 0, stride 1). Crops:
+  26696249 (12 ep, anchor .3, scale-w 0, stride 1).
+- RESULTS. manual (26729785, 29 clips / 791 fr): pose_trans .005 -> .010 over ep1-5 (no collapse),
+  ms_abs_rel best .1649 @ep5 (SCARED .0550 at best.pth vs warm .0539), then COLLAPSE at ep6
+  (pose .0104 -> .0034 -> .0015, val photo .056 -> .019) and ms back to .1660. all15_1x (26729787,
+  635 clips / 16622 fr / 59 patients): pose_trans EXPLODED .0137 -> .259 -> .615 (ep1-3) with
+  proxy_scale fixed, ms .1650 flat, SCARED .0538 -> .0560 by ep4 -> CANCELLED after ep4 at Nick's
+  request (best.pth = ep2 .1650). Neither little-good nor lots-of-data escapes the pose degeneracy:
+  the pose net is the unconstrained variable (collapse on short clips, blow-up on big data).
+- NEXT (Nick 2026-09-15): zero-shot benchmark on the proxy-GT before any more training --
+  `scripts/zeroshot_proxy_gt.py` / `jobs/zeroshot_proxy_gt.sh`. transformers 5.17 is installed with
+  `pip --target ~/pylibs/bench --no-deps` (NOT in the venv, hub 1.19 pinned there for FoundationStereo);
+  weights pre-downloaded to ~/.cache/huggingface on the login node (DAv2-L 1.25 GB, DAv2 metric
+  indoor L 1.25 GB, DepthPro 1.77 GB), job runs HF_HUB_OFFLINE=1. Crops:
   ~/zoomcrop/zoom_grid_{a,b}.png on Snellius. Pixel MAD vs a 1x crop does NOT work as a detector
   (the label is translucent over tissue); a template/OCR detector would need 2x/4x glyph crops.
   Ruler-run split had 4d8eca93 + 7d96d613 as VALIDATION videos (other segments; zoom there unchecked).
