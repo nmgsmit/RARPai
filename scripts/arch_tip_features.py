@@ -1,8 +1,8 @@
 """Per packed video in ../data/processed/arch_tip_all (arch_tip_data.py FrameStore): features, tool mask or depth.
 
     --what feats  <short>/feats_s3.npy (N,320,32,40) + feats_s4.npy (N,512,16,20) float16: CAFormer-S18 stages 3/4
-                  of the 512x640 GUI-blacked crop; encoder built and loaded as finetune_segmentation.py does
-                  (../backbones/RARP_checkpoint_epoch0050_teacher.pth)
+                  of the 512x640 GUI-blacked crop; frozen ../backbones/RARP_checkpoint_epoch0050_teacher.pth in the
+                  SurgeNet (ReLU) variant, so every encoder key loads
     --what tools  <short>/tools.npy (N,268,335) uint8: rarp_nick_fullres (kept classes 1,2,4,5, fed 1088x1344 as
                   trained) compact 3 catheter | 4 non-anatomical, >= 30% of a cell, at the 1/4 depth resolution
     --what depth  <short>/depth.npy (N,268,335) float16 mm: UniDepthV2 ViT-L through the frozen ruler calibration
@@ -58,7 +58,9 @@ def main():
 
     if args.what == "feats":
         from finetune_segmentation import load_encoder
-        m = MetaFormerFPN(num_classes=1, pretrained="ImageNet", pretrained_weights=None)
+        # "SurgeNet" = the ReLU CAFormer the teacher was trained as: all keys load. The "ImageNet" variant that
+        # finetune_segmentation builds leaves 48 StarReLU scale/bias params at init -- fine-tuning adapts, frozen does not.
+        m = MetaFormerFPN(num_classes=1, pretrained="SurgeNet", pretrained_weights=None)
         load_encoder(m, args.encoder)
         net, hw, bs = m.metaformer.cuda().eval(), (512, 640), 32
     elif args.what == "tools":
@@ -67,7 +69,7 @@ def main():
         assert nc == 5, f"{args.seg}: expected bg + 4 kept classes (1,2,4,5), got {nc}"
         net = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None)
         net.load_state_dict(sd)
-        net, hw, bs = net.cuda().eval(), (1088, 1344), 32
+        net, hw, bs = net.cuda().eval(), (1088, 1344), 4      # full-res FPN: batch 32 asked for 39 GB more than the H100 had
     else:
         from unidepth.models import UniDepthV2
         s_only = json.loads(Path(args.calib).read_text())["unidepth_v2_vitl"]["calibration"]["s_only"]

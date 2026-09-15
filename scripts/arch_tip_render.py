@@ -220,16 +220,130 @@ def render(video, d, out_path):
     print(f"wrote {out_path}")
 
 
+def render_head(video, d, head_dir, variant, out_path):
+    """Full video with arch_tip_head.py predictions: per frame the median over the models that had this patient in
+    TEST (none trained on it), the arch through that tip and ends, the tip smoothed over +-WIN frames, and every
+    model's own tip as a small dot (their spread = how much the held-out models disagree)."""
+    from arch_tip_cv import WIN, head_arch
+
+    short = patient(video)[:8]
+    files = sorted(Path(head_dir).glob(f"{variant}/s*/{short}.npz"))
+    assert files, f"no {variant} predictions for {short} under {head_dir}"
+    Z = [np.load(f) for f in files]
+    frames = Z[0]["frames"]
+    assert all(np.array_equal(z["frames"], frames) for z in Z), "splits disagree on frame order"
+    T = np.stack([z["tip"] for z in Z])                                  # (models, N, 2)
+    tip = np.median(T, 0)
+    L, R = np.median(np.stack([z["left"] for z in Z]), 0), np.median(np.stack([z["right"] for z in Z]), 0)
+    pos = {int(f): k for k, f in enumerate(frames)}
+    sm = {f: np.median(tip[[pos[g] for g in range(f - WIN, f + WIN + 1) if g in pos]], 0) for f in pos}
+    best_half = {r["frame"] for r in json.loads((BEST / "labels.json").read_text())["rows"] if r["video"] == video}
+
+    names = list(ANNOTATORS)
+    ann = {n: {int(k): v for k, v in load_frames(find_arches(ANNOTATORS[n], video))[0].items()} for n in names}
+    off = {n: (np.zeros(2) if n == REFERENCE else offset_for(video, n, {(m, video): ann[m] for m in names}))
+           for n in names}
+    cap = cv2.VideoCapture(str(DATA / video))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    stems = sorted(p.stem for p in (d / "images").glob("*.jpg"))
+    N = len(stems)
+
+    pts_all = np.concatenate([np.array([arch_points(e)[1] - off[n] for n in names for e in ann[n].values()]), tip])
+    PT = int(np.clip(-pts_all[:, 1].min() + 60, 0, 1000))
+    PL = int(np.clip(-pts_all[:, 0].min() + 60, 0, 1000))
+    PR = int(np.clip(pts_all[:, 0].max() - 1340 + 60, 0, 1000))
+    o = np.array([PL, PT])
+    pix = lambda q: tuple(int(v) for v in np.asarray(q) + o)            # noqa: E731
+    STRIP, ORANGE = 120, (0, 165, 255)
+    CW, CH = 2 * (1340 + PL + PR), 1072 + PT + 2 * STRIP
+    OW = 1920
+    OH = int(round(CH * OW / CW / 2)) * 2
+    tmp = out_path.with_suffix(".mp4v.mp4")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    vw = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*"mp4v"), fps, (OW, OH))
+    errs = {"raw all3": [], "smoothed all3": [], "raw best-half": [], "smoothed best-half": []}
+    for n_done, stem in enumerate(stems):
+        i = int(stem.rsplit("_", 1)[1])
+        k = pos[i]
+        img = cv2.imread(str(d / "images" / f"{stem}.jpg"))
+        H, W = img.shape[:2]
+        depth = np.load(d / "depth" / f"{stem}.npz")["depth"].astype(np.float32)
+        inv = 1 / np.clip(depth, 1, None)
+        lo, hi = np.percentile(inv, [2, 98])
+        col = cv2.resize(cv2.applyColorMap((np.clip((inv - lo) / (hi - lo + 1e-9), 0, 1) * 255).astype(np.uint8),
+                                           cv2.COLORMAP_TURBO), (W, H), interpolation=cv2.INTER_NEAREST)
+        col[cv2.imread(str(d / "images" / f"{stem}_mask.png"), cv2.IMREAD_GRAYSCALE) > 0] = 90
+        x, y, _, _ = (a[0] for a in curve(head_arch(tip[k], L[k], R[k])[None]))
+        spread = float(np.median(np.linalg.norm(T[:, k] - tip[k], axis=1)))
+
+        atips = {n: arch_points(ann[n][i])[1] - off[n] for n in names if i in ann[n]}
+        consensus = np.mean(list(atips.values()), 0) if len(atips) == 3 else None
+        line2 = f"head {variant}: median of {len(Z)} held-out models, spread {spread:.0f} px"
+        if consensus is not None:
+            e_raw, e_sm = float(np.linalg.norm(tip[k] - consensus)), float(np.linalg.norm(sm[i] - consensus))
+            errs["raw all3"].append(e_raw)
+            errs["smoothed all3"].append(e_sm)
+            if i in best_half:
+                errs["raw best-half"].append(e_raw)
+                errs["smoothed best-half"].append(e_sm)
+            line2 += f"   tip error vs consensus: raw {e_raw:.0f} px, smoothed {e_sm:.0f} px"
+
+        pad = dict(top=PT, bottom=0, left=PL, right=PR, borderType=cv2.BORDER_CONSTANT, value=(45, 45, 45))
+        panels = [cv2.copyMakeBorder(img, **pad), cv2.copyMakeBorder(col, **pad)]
+        for p in panels:
+            cv2.rectangle(p, (PL, PT), (PL + W - 1, PT + H - 1), (120, 120, 120), 2)
+            for n in names:
+                if i in ann[n]:
+                    apts, apex = arch_points(ann[n][i])
+                    poly(p, apts - off[n] + o, bgr(n), 3)
+                    cv2.circle(p, pix(apex - off[n]), 9, bgr(n), -1, cv2.LINE_AA)
+            if consensus is not None:
+                cv2.drawMarker(p, pix(consensus), (255, 255, 255), cv2.MARKER_STAR, 50, 3)
+            poly(p, np.stack([x, y], 1) + o, ORANGE, 4)
+            for s in range(len(Z)):
+                cv2.circle(p, pix(T[s, k]), 5, ORANGE, -1, cv2.LINE_AA)
+            cv2.drawMarker(p, pix(tip[k]), ORANGE, cv2.MARKER_TILTED_CROSS, 40, 4)
+            cv2.drawMarker(p, pix(sm[i]), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 54, 6)
+
+        frame = np.hstack(panels)
+        head, foot = (np.zeros((STRIP, frame.shape[1], 3), np.uint8) for _ in range(2))
+        line1 = (f"{short} (held-out)   frame {i}/{N - 1}   t {i / fps:6.2f}s   "
+                 f"annotated: {' '.join(atips) or 'none'}{'   [best-half test frame]' if i in best_half else ''}")
+        cv2.putText(head, line1, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(head, line2, (20, 102), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
+        cv2.putText(foot, "cyan Nick | magenta Veerle | green Aron (dot = their tip) | white star = consensus tip | "
+                    "grey margin = outside the camera frame", (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (255, 255, 255), 2,
+                    cv2.LINE_AA)
+        cv2.putText(foot, f"orange arch + x = model arch + tip (median over held-out models), orange dots = each model's "
+                    f"tip | red x = tip smoothed over +-{WIN} frames", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.1,
+                    (255, 255, 255), 2, cv2.LINE_AA)
+        vw.write(cv2.resize(np.vstack([head, frame, foot]), (OW, OH), interpolation=cv2.INTER_AREA))
+        if n_done % 200 == 0:
+            print(f"{n_done}/{N}", flush=True)
+    vw.release()
+    tmp.replace(out_path)
+    for key, e in errs.items():
+        if e:
+            print(f"tip error vs consensus, {key} (n={len(e)}): mean {np.mean(e):.1f} median {np.median(e):.1f} px")
+    print(f"wrote {out_path}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--video", required=True, help="prefix of the mp4 name, e.g. 46867a8e")
     ap.add_argument("--extract", action="store_true")
     ap.add_argument("--workers", type=int, default=10)
+    ap.add_argument("--head", help="arch_tip_head.py output dir -> render its held-out predictions instead of the fit")
+    ap.add_argument("--variant", default="rgbd")
     args = ap.parse_args()
     video = next(p.name for p in sorted(DATA.glob(f"{args.video}*.mp4")))
     d = ROOT.parent / "data" / "processed" / f"arch_tip_video_{args.video}"
     if args.extract:
         extract(video, d / "images", args.workers)
+    elif args.head:
+        render_head(video, d, args.head, args.variant,
+                    ROOT / "outputs" / "arch_tip_cv" / f"{args.video}_head_{args.variant}.mp4")
     else:
         render(video, d, ROOT / "outputs" / "arch_tip_depth" / f"{args.video}_fit.mp4")
 
