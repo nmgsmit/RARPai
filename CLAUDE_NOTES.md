@@ -1223,11 +1223,13 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
 - grid.png checks. Top 7 all reproduce the stereo ridge/fold/instrument/catheter tip; UniDepthV2
   cleanest, DA3-Metric-L patchy. Metric3D ViT-L shows a strong checkerboard -- NOT a load bug:
   checkpoint vs model = only `encoder.mask_token` missing (pretraining-only; giant2 also lacks the
-  final encoder norm and still scores well), so its low rank is genuine. DA3 IS handicapped by its
-  own post-processing: model/da3.py forward always calls _process_mono_sky_estimation, which sets
-  every pixel with sky prob >= 0.3 to the 99th-percentile depth; bright fatty/specular tissue trips it
-  (DA3-L frame 1: yellow fat at the top forced FAR). Added `da3_*_nosky` variants (same weights, that
-  step patched out) and `--only` so they run into the existing v2 dir. Crops:
+  final encoder norm and still scores well), so its low rank is genuine. DA3's mediocre score is ALSO
+  genuine: model/da3.py has _process_mono_sky_estimation (sky prob >= 0.3 -> 99th-percentile depth),
+  and DA3-L frame 1 puts the yellow fat at the top FAR, so I suspected it. Tested with the step
+  patched out (job 26734065, --only): identical to 4 decimals for L / Giant / Metric-L. Reason: none
+  of the three checkpoints has a sky head (configs build DepthAnything3Net with DualDPT / plain DPT,
+  no sky option), so the step returns at `if "sky" not in output`. The nosky variants were removed
+  again; `--only` stays for running a subset into an existing --out. Crops:
   ~/zoomcrop/zoom_grid_{a,b}.png on Snellius. Pixel MAD vs a 1x crop does NOT work as a detector
   (the label is translucent over tissue); a template/OCR detector would need 2x/4x glyph crops.
   Ruler-run split had 4d8eca93 + 7d96d613 as VALIDATION videos (other segments; zoom there unchecked).

@@ -36,9 +36,6 @@ MODELS = {  # name -> (kind, source, extra PYTHONPATH dirs)
     "da3_large": ("da3", "depth-anything/DA3-LARGE", [f"{PL}/da3"]),
     "da3_giant": ("da3", "depth-anything/DA3-GIANT", [f"{PL}/da3"]),
     "da3_metric_large": ("da3", "depth-anything/DA3METRIC-LARGE", [f"{PL}/da3"]),
-    "da3_large_nosky": ("da3_nosky", "depth-anything/DA3-LARGE", [f"{PL}/da3"]),
-    "da3_giant_nosky": ("da3_nosky", "depth-anything/DA3-GIANT", [f"{PL}/da3"]),
-    "da3_metric_large_nosky": ("da3_nosky", "depth-anything/DA3METRIC-LARGE", [f"{PL}/da3"]),
     "moge2_vitl": ("moge2", "Ruicheng/moge-2-vitl", [f"{PL}/moge"]),
     "moge1_vitl": ("moge1", "Ruicheng/moge-vitl", [f"{PL}/moge"]),
     "unidepth_v2_vitl": ("unidepth", "lpiccinelli/unidepth-v2-vitl14", [f"{PL}/unidepth"]),
@@ -115,13 +112,10 @@ def make_predictor(kind, src, device):
             return 1.0 / np.clip(a, 1e-6, None) if kind == "hf_disp" else a
         return f
 
-    if kind in ("da3", "da3_nosky"):
+    if kind == "da3":
+        # DA3's sky clamp (model/da3.py _process_mono_sky_estimation) is a no-op for these
+        # checkpoints: none has a sky head. Verified: patching it out changed nothing (4 decimals).
         from depth_anything_3.api import DepthAnything3
-        if kind == "da3_nosky":
-            # DA3's forward ALWAYS sets pixels with sky prob >= 0.3 to the 99th-percentile depth
-            # (model/da3.py _process_mono_sky_estimation); surgery has no sky, bright tissue trips it.
-            from depth_anything_3.model.da3 import DepthAnything3Net
-            DepthAnything3Net._process_mono_sky_estimation = lambda self, output: output
         m = DepthAnything3.from_pretrained(src).to(device).eval()
 
         def f(img, hw):
