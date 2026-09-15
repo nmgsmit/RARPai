@@ -46,8 +46,9 @@ def curve(c):
     return x, y, -Ty / n, Tx / n                        # (0, 1) = down at the apex of an upright arch
 
 
-def score(c, gx, gy, valid):
-    """Mean inward log-depth gradient along each candidate; -inf when < half the curve is usable."""
+def score(c, gx, gy, valid, min_valid=K // 2):
+    """Mean inward gradient along each candidate; -inf when fewer than min_valid samples are usable
+    (lower it for arches whose apex may lie outside the frame)."""
     x, y, nx, ny = curve(c)
     H, W = gx.shape
     ix, iy = np.rint(x / DS).astype(int), np.rint(y / DS).astype(int)
@@ -56,11 +57,13 @@ def score(c, gx, gy, valid):
     ok &= valid[iy, ix]
     g = (gx[iy, ix] * nx + gy[iy, ix] * ny) * ok
     n = ok.sum(1)
-    return np.where(n >= K // 2, g.sum(1) / np.maximum(n, 1), -np.inf)
+    return np.where(n >= min_valid, g.sum(1) / np.maximum(n, 1), -np.inf)
 
 
-def grads(depth, gui, sigma):
-    L = cv2.GaussianBlur(np.log(np.clip(depth.astype(np.float32), 1, None)), (0, 0), sigma)
+def grads(depth, gui, sigma, log=True):
+    """Normalised gradients of log-depth (log=False: of the field as is, e.g. image lightness)."""
+    f = np.log(np.clip(depth.astype(np.float32), 1, None)) if log else depth.astype(np.float32)
+    L = cv2.GaussianBlur(f, (0, 0), sigma)
     gx, gy = cv2.Sobel(L, cv2.CV_32F, 1, 0) / 8, cv2.Sobel(L, cv2.CV_32F, 0, 1) / 8
     r = int(3 * sigma) + 1
     valid = cv2.dilate(gui.astype(np.uint8), np.ones((2 * r + 1,) * 2, np.uint8)) == 0

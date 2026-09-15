@@ -60,7 +60,7 @@ def extract(video, out, workers):
     with Pool(workers, _init, (box, out)) as pool:
         while ok:
             batch = []
-            while ok and len(batch) < 64:
+            while ok and len(batch) < max(64, 2 * workers):
                 stem = f"{short}_{i:05d}"
                 if not (out / f"{stem}_mask.png").exists():
                     batch.append((stem, f))
