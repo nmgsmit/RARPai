@@ -1097,6 +1097,66 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
   .1660 / .1672 / .1660 / .1659 vs ruler .1660 / .1640 / .1652 / .1656. Neither converges; train
   photo fell .073 -> .032 (val .031, ~3x below ruler) while shape stayed put. Suspect anchor-w 0.3
   (L1 to the frozen warm-start) pins the shape; next A/B = same data, --anchor-w 0 / 0.1.
+- A/B done (3 ep each, same data). proxy_gt ms_abs_rel ep0..3 / SCARED abs_rel at ep3:
+  anchor 0.3 (26690383)  .1660 .1672 .1660 .1659 / .0542
+  anchor 0.1 (26691199)  .1660 .1670 .1661 .1660 / .0542
+  anchor 0   (26691198)  .1660 .2477 .2477 .2477 / .1270  -- COLLAPSED: ep1-3 identical to 4
+  decimals, proxy_scale 1.03 -> 2.11, so the depth froze (saturated/constant) while train photo
+  still fell .071 -> .031. best.pth = warm start.
+  => the anchor is NOT what holds the shape: at 0.1 it is as flat as 0.3; at 0 it breaks. Photometric
+  self-supervision on these clips does not move mono shape toward stereo in 3 epochs at all.
+- Mask side-thread: coverage stayed min .676 after OR-ing black-in-every-frame, because the missed
+  panels are TRANSIENT (15/28, 19/21, 13/15 frames, fixed position, box 77-86% black). bands=True
+  fixes 2 of 3 but triples the mask (5.4% -> 16.7%), so not adopted. Masks are unused by training.
+- FRAME STRIDE (anchor 0.3, 3 ep): proxy_gt ms_abs_rel ep1..3 / pose_trans ep3 / train,val photo ep3:
+  stride 1 (26690383)  .1672 .1660 .1659 / .0011 / .032 .031
+  stride 4 (26692024)  .1668 .1661 .1660 / .0054 / .153 .144
+  stride 8 (26692025)  .1667 .1660 .1661 / .0039 / .205 .223
+  More parallax is real (pose_trans 5x) but shape still does not move; photo loss stays 5-7x higher,
+  i.e. the wider pairs are not explained by a rigid warp. Every sharpest-set run's best.pth = warm start.
+- OPEN, raised by Nick: da Vinci DIGITAL ZOOM 2x/4x in some clips = focal x2/x4 while K is fixed
+  (--no-learn-intrinsics). Breaks the rotation warp (shape error), makes mixed-zoom batches
+  contradictory, and for the ruler/SUL work biases z_true = fx*mm/px by the zoom factor. Not yet
+  measured how many clips are zoomed; options: detect + scale K, 1x-only subset, or learned K.
+- ZOOM READ (by eye) for the 77 selected clips: the label sits right of the scope-angle readout in
+  the bottom HUD, full 1920x1080 frame ~x1212-1262 y1034-1066 (`1x 0°`), only visible in the with-GUI
+  originals `/home/nsmit2/data/UMCdissectionvid/<video>.mp4`. First/middle/last frame agree in every
+  clip. 68 x 1x, 1 x 2x (4d8eca93), 8 x 4x (RARP_069, RARP_077, RARP_083, RARP_086, RARP_089,
+  349725a5, 7d96d613, d7419222). 8 zoomed clips are in TRAIN, RARP_083 (4x) is in TEST; val is
+  all 1x. 1x-only set = `../data/processed/depthclips_sharpest_1x` (symlinks, 59 train / 5 val /
+  4 test clips), run job 26692937 -> outputs/depth_sharpest_1x, otherwise identical to 26690383.
+  RESULT ep1..3: ms_abs_rel .1655 .1660 .1660 (best .1655, ep1) vs all-zoom .1672 .1660 .1659 --
+  shape still flat. But the dynamics changed: pose_trans stays .0034-.0037 (all-zoom run collapsed
+  to .0011) and photo loss no longer drops to ~.03 (train .079 -> .062, val .069 -> .051 on the SAME
+  1x val clips). Reading: with zoomed clips in the batch the model escaped to ~zero camera motion,
+  where depth does not affect the warp; without them it keeps moving the camera but 3 epochs don't
+  move the shape. Candidate next: same 1x set, more epochs.
+  12 EPOCHS (job 26696249, wandb umz8y8lp, 20 min): pose_trans .0034 -> .0009 by ep3 -> .0006-.0008
+  after; val photo .070 -> .016 (ep3) -> .008 plateau from ep8. ms_abs_rel stays in .1653-.1663
+  (warm .1660; best .1653 ep5, back to .1660 at ep12); SCARED .0539 -> .0554 at best.pth (worse).
+  => the zero-motion escape is NOT a zoom artifact: 1x clips reach it too, 3 epochs later (the
+  3-ep run's short cosine schedule stopped it early). Once pose ~0 the photometric loss has no
+  depth gradient, so shape only random-walks within +-0.3% of the warm start. Photometric
+  self-supervision on these short 17 ms-stride clips cannot move this model's shape.
+
+### DEPTH: little-but-good vs lots-of-data (2026-09-15)
+- Nick hand-picked camera-motion clips: local `data/depthclips_manual` -> Snellius
+  `~/data/depthclips_manual_raw` (31 mp4, 840 frames, 11-38 frames each, 9 patients, none in
+  staging / sharpest_1x val-test / proxy GT). Names = `<source video>-<t0>-<t1>[-segN].mp4`; sources
+  are NOT on Snellius, but the GUI is still on screen, so `scripts/prep_manual_clips.py` runs
+  full_gui_mask on each clip's own frames (black + `<i>_mask.png`).
+- ZOOM DETECTOR `scripts/zoomdet.py` (templates `data/templates/zoom/*.npy`): label crop x1212-1262
+  y1034-1066, high-pass, averaged over the clip (label fixed, tissue moves), NCC vs 1x/2x/4x class
+  means from the 77 hand labels. Leave-one-out on those 77: 1x vs zoomed 100% (1x margin >= +.187,
+  zoomed <= -.045); 2x/4x confusion only (one 2x example). Staging >1.5 MB: 796 1x / 22 2x / 64 4x,
+  NO clip within +-0.15 of the boundary. Manual: 29 1x, 2 x 4x (06c50176) -> dropped.
+- Both new sets share Validation/Test with depthclips_sharpest_1x (symlinks) so val numbers compare:
+  `depthclips_manual` (manual, 1x) and `depthclips_all15_1x` (`prep_sharpest_clips.py --all --min-mb
+  1.5 --zoom-csv`, every 1x staging clip, val/test patients excluded from Train). Runs: same as
+  26696249 (12 ep, anchor .3, scale-w 0, stride 1). Crops:
+  ~/zoomcrop/zoom_grid_{a,b}.png on Snellius. Pixel MAD vs a 1x crop does NOT work as a detector
+  (the label is translucent over tissue); a template/OCR detector would need 2x/4x glyph crops.
+  Ruler-run split had 4d8eca93 + 7d96d613 as VALIDATION videos (other segments; zoom there unchecked).
 - `finetune_depth.py`: `--scale-w 0` now selects best.pth on proxy_gt `ms_abs_rel`; epoch line
   prints `proxy_ms_abs_rel`. Overlap check: proxy-GT = 2 patients, in neither staging nor ruler.
 - Baseline, `endodac-ruler-range-sw05-3ep` (job 26688975, wandb r3p74r8y), proxy_gt ms_abs_rel

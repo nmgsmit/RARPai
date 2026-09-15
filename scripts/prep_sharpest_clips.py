@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Sharpest cue clip per patient -> a finetune_depth dataset (relative depth, no scale anchors).
+"""Cue clips from depth_clips_staging -> a finetune_depth dataset (relative depth, no scale anchors).
 
     <src>/<video>/<video>_clipNNN_fSSSSSS-EEEEEE.mp4   (cut_cue_clips output, GUI already black)
  -> <dst>/sharpness_rank.csv                   every clip > --min-mb, ranked by var(Laplacian)
- -> <dst>/{Train,Validation,Test}/rarp/<video>/clip_000/{images/<i>.jpg + <i>_mask.png, source_crop.json}
+ -> <dst>/{Train,Validation,Test}/rarp/<video>/clip_NNN/{images/<i>.jpg + <i>_mask.png, source_crop.json}
 
-One clip per PATIENT (uuid or RARP_NNN prefix; a patient can have several <video> dirs), the one
-with the highest `sharp` from rank_sharpness.py. Frames are cropped once to the 5:4 content
-(x289 y4 1340x1072, same as the ruler dumps).
+Default: one clip per PATIENT (uuid or RARP_NNN prefix), the one with the highest `sharp` from
+rank_sharpness.py, split by patient. `--all` keeps EVERY clip > --min-mb instead. `--zoom-csv`
+(zoomdet output: clip,zoom) keeps only 1x clips. `--val-test-from` links an existing dataset's
+Validation/Test (so runs share them) and keeps those patients out of Train. Frames are cropped once
+to the 5:4 content (x289 y4 1340x1072, same as the ruler dumps).
 
 GUI masks come from cut_cue_clips.full_gui_mask on the SOURCE video (--gui-src, frames S..E from
 the clip name): the staging clips have the GUI blacked, so the templates have nothing to match
@@ -16,6 +18,8 @@ geometry anyway; cue bars and popups are still visible in them.
 
     python scripts/prep_sharpest_clips.py --src /home/nsmit2/data/depth_clips_staging \
         --dst ../data/processed/depthclips_sharpest
+    python scripts/prep_sharpest_clips.py --all --min-mb 1.5 --zoom-csv ~/zoomcrop/zoom_staging15.csv \
+        --val-test-from ../data/processed/depthclips_sharpest_1x --dst ../data/processed/depthclips_all15_1x
     python scripts/prep_sharpest_clips.py --dst ../data/processed/depthclips_sharpest --masks-only
     python scripts/prep_sharpest_clips.py --selftest
 """
@@ -37,11 +41,15 @@ CUE = dict(m_thr=0.55, b_thr=0.90, min_bars=4, dilate=3)   # cut_cue_clips defau
 _T = {}
 
 
+def patient(video):
+    return PATIENT.match(video).group(1)
+
+
 def best_per_patient(rows):
     """rows: dicts with video(dir name), clip, sharp -> {patient: best row}."""
     best = {}
     for r in rows:
-        p = PATIENT.match(r["video"]).group(1)
+        p = patient(r["video"])
         if p not in best or r["sharp"] > best[p]["sharp"]:
             best[p] = r
     return best
@@ -53,6 +61,12 @@ def _score(path):
 
 def _crop(a):
     return a[CROP["y"]:CROP["y"] + CROP["h"], CROP["x"]:CROP["x"] + CROP["w"]]
+
+
+def write_crop_json(out):
+    (out / "source_crop.json").write_text(json.dumps(
+        {"version": 1, "source_size": [1920, 1080], "crop": CROP,
+         "output_size": [CROP["w"], CROP["h"]]}, indent=2))
 
 
 def load_gui_templates():
@@ -100,6 +114,11 @@ def _start(clip_name):
     return int(re.search(r"_f(\d+)-\d+\.mp4$", clip_name).group(1))
 
 
+def _clip_index(clip_name):
+    m = re.search(r"_clip(\d+)_", clip_name)
+    return int(m.group(1)) if m else 0
+
+
 def _masks_job(job):
     imgdir, video, start = job
     jpgs = sorted(imgdir.glob("[0-9]*[0-9].jpg"))
@@ -111,7 +130,8 @@ def _masks_job(job):
     return imgdir, write_masks(imgdir, [m | cut for m in gui_masks(video, start, len(jpgs))])
 
 
-def extract(clip, out):
+def extract(job):
+    clip, out = job
     cap = cv2.VideoCapture(str(clip))
     (out / "images").mkdir(parents=True, exist_ok=True)
     n = 0
@@ -123,25 +143,42 @@ def extract(clip, out):
         cv2.imwrite(str(out / "images" / f"{n:07d}.jpg"), _crop(f), [cv2.IMWRITE_JPEG_QUALITY, 95])
         n += 1
     cap.release()
-    (out / "source_crop.json").write_text(json.dumps(
-        {"version": 1, "source_size": [1920, 1080], "crop": CROP,
-         "output_size": [CROP["w"], CROP["h"]]}, indent=2))
+    write_crop_json(out)
     return n
 
 
 def run_masks(dst, gui_src, workers):
-    """(Re)write every selected clip's masks from its source video, in place."""
+    """(Re)write the masks of every clip this script wrote (rows with a `dir`), in place."""
     _T["t"] = load_gui_templates()
-    rows = [r for r in csv.DictReader(open(dst / "sharpness_rank.csv")) if r["selected"]]
-    jobs = [(dst / r["selected"] / "rarp" / r["video"] / "clip_000" / "images",
-             Path(gui_src) / f"{r['video']}.mp4", _start(r["clip"])) for r in rows]
+    rows = list(csv.DictReader(open(dst / "sharpness_rank.csv")))
+    if rows and "dir" not in rows[0]:              # datasets built before --all: one clip_000 each
+        for r in rows:
+            r["dir"] = f"{r['selected']}/rarp/{r['video']}/clip_000" if r["selected"] else ""
+    jobs = [(dst / r["dir"] / "images", Path(gui_src) / f"{r['video']}.mp4", _start(r["clip"]))
+            for r in rows if r["dir"]]
     cv2.setNumThreads(1)
     with ThreadPool(workers) as pool:                # cv2 frees the GIL; _T is shared
         res = pool.map(_masks_job, jobs)
     for imgdir, (fr, cov) in res:
-        print(f"[mask] {imgdir.parent.parent.name[:8]}  gui={fr:.3f}  covers_black={cov:.3f}", flush=True)
+        print(f"[mask] {imgdir.parent.parent.name[:8]}/{imgdir.parent.name}  gui={fr:.3f}  "
+              f"covers_black={cov:.3f}", flush=True)
     cov = np.array([c for _, (_, c) in res])
     print(f"[mask] {len(res)} clips, covers_black median {np.median(cov):.3f} min {cov.min():.3f}")
+
+
+def link_val_test(src_root, dst):
+    """Symlink src_root/{Validation,Test}/rarp/<video> into dst; return their patients."""
+    held = set()
+    for sp in ("Validation", "Test"):
+        (dst / sp / "rarp").mkdir(parents=True, exist_ok=True)
+        for v in sorted((Path(src_root) / sp / "rarp").iterdir()):
+            os.symlink(v.resolve(), dst / sp / "rarp" / v.name)
+            held.add(patient(v.name))
+    return held
+
+
+def read_zoom(path):
+    return {r["clip"]: r["zoom"] for r in csv.DictReader(open(os.path.expanduser(path)))}
 
 
 def selftest():
@@ -152,6 +189,7 @@ def selftest():
     assert set(b) == {"RARP_083", "31e2c520-bf13-4370-8807-50c3f8af3fd0"}, b
     assert b["RARP_083"]["clip"] == "b", b
     assert _start("x-01.25.01.339_clip010_f007014-007031.mp4") == 7014
+    assert _clip_index("x-01.25.01.339_clip010_f007014-007031.mp4") == 10
     print("selftest ok")
 
 
@@ -162,6 +200,11 @@ def main():
     ap.add_argument("--gui-src", default="/home/nsmit2/data/UMCdissectionvidNOgui",
                     help="source videos (<video>.mp4) the clips were cut from, for GUI masks")
     ap.add_argument("--masks-only", action="store_true", help="rewrite masks of an existing --dst")
+    ap.add_argument("--all", action="store_true",
+                    help="keep EVERY clip > --min-mb, not only the sharpest per patient")
+    ap.add_argument("--zoom-csv", help="zoomdet csv (clip,zoom): keep only 1x clips")
+    ap.add_argument("--val-test-from",
+                    help="existing dataset: symlink its Validation/Test, keep their patients out of Train")
     ap.add_argument("--min-mb", type=float, default=1.0, help="skip clips at or below this size")
     ap.add_argument("--n-val", type=int, default=5, help="patients held out as Validation")
     ap.add_argument("--n-test", type=int, default=5, help="patients held out as Test")
@@ -184,28 +227,41 @@ def main():
     rows = [{"video": c.parent.name, "clip": c.name, "size_mb": round(c.stat().st_size / 2**20, 2),
              **{k: float(v) for k, v in s.items()}} for c, s in scored if s]
     rows.sort(key=lambda r: r["sharp"], reverse=True)
-    best = best_per_patient(rows)
 
-    patients = sorted(best)
-    random.Random(a.seed).shuffle(patients)
-    split = {p: "Validation" if i < a.n_val else "Test" if i < a.n_val + a.n_test else "Train"
-             for i, p in enumerate(patients)}
+    zoom = read_zoom(a.zoom_csv) if a.zoom_csv else {}
+    cand = [r for r in rows if not zoom or zoom.get(r["clip"]) == "1x"]
     dst.mkdir(parents=True)
-    with open(dst / "sharpness_rank.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, ["video", "clip", "size_mb", "sharp", "nsharp", "blur_frac",
-                               "patient", "selected"])
-        w.writeheader()
-        for r in rows:
-            p = PATIENT.match(r["video"]).group(1)
-            w.writerow({**r, "patient": p, "selected": split[p] if best[p] is r else ""})
+    held = link_val_test(a.val_test_from, dst) if a.val_test_from else set()
+    cand = [r for r in cand if patient(r["video"]) not in held]
+    keep = cand if a.all else list(best_per_patient(cand).values())
 
-    for p in sorted(best):
-        r = best[p]
-        n = extract(src / r["video"] / r["clip"], dst / split[p] / "rarp" / r["video"] / "clip_000")
-        print(f"{split[p]:10s} {p[:8]}  sharp={r['sharp']:7.1f}  {n:3d} frames  {r['clip']}",
-              flush=True)
-    print(f"{len(best)} patients -> {sum(v == 'Train' for v in split.values())} Train / "
-          f"{a.n_val} Validation / {a.n_test} Test; ranking in {dst / 'sharpness_rank.csv'}")
+    pats = sorted({patient(r["video"]) for r in keep})
+    if a.val_test_from:
+        psplit = dict.fromkeys(pats, "Train")
+    else:
+        random.Random(a.seed).shuffle(pats)
+        psplit = {p: "Validation" if i < a.n_val else "Test" if i < a.n_val + a.n_test else "Train"
+                  for i, p in enumerate(pats)}
+    kept = {id(r) for r in keep}
+    for r in rows:
+        r["zoom"] = zoom.get(r["clip"], "")
+        r["selected"] = psplit[patient(r["video"])] if id(r) in kept else ""
+        r["dir"] = f"{r['selected']}/rarp/{r['video']}/clip_{_clip_index(r['clip']):03d}" if id(r) in kept else ""
+    with open(dst / "sharpness_rank.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, ["video", "clip", "size_mb", "sharp", "nsharp", "blur_frac", "zoom",
+                               "selected", "dir"], extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
+
+    with ThreadPool(a.workers) as pool:
+        nframes = pool.map(extract, [(src / r["video"] / r["clip"], dst / r["dir"]) for r in keep])
+    for sp in ("Train", "Validation", "Test"):
+        idx = [i for i, r in enumerate(keep) if r["selected"] == sp]
+        print(f"{sp:10s} {len({patient(keep[i]['video']) for i in idx}):3d} patients "
+              f"{len(idx):4d} clips {sum(nframes[i] for i in idx):6d} frames written", flush=True)
+    print(f"{len(rows)} ranked, {len(rows) - len(cand)} dropped by zoom/held-out patients, "
+          f"{len(keep)} kept ({'all' if a.all else 'sharpest per patient'}); "
+          f"val/test {'linked from ' + a.val_test_from if held else 'split here'}", flush=True)
     run_masks(dst, a.gui_src, a.workers)
 
 
