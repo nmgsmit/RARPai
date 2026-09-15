@@ -28,7 +28,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from arch_tip_data import A, cv_splits  # noqa: E402
+from arch_tip_data import A, FrameStore, cv_splits  # noqa: E402
 from arch_tip_fit import K, curve, grads, score  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -85,13 +85,12 @@ def head_arch(tip, left, right):
 
 
 def frame_maps(short, frame):
-    stem, d = f"{short}_{frame:05d}", A / short
-    depth = np.load(d / "depth" / f"{stem}.npz")["depth"].astype(np.float32)
+    fs, k = G["fs"][short], G["idx"][short][frame]
+    depth = np.asarray(G["depth"][short][k], np.float32)
     H, W = depth.shape
-    gui = cv2.resize(cv2.imread(str(d / "images" / f"{stem}_mask.png"), cv2.IMREAD_GRAYSCALE), (W, H),
-                     interpolation=cv2.INTER_AREA) > 0
-    bad = gui | (np.asarray(G["tools"][short][G["idx"][short][frame]]) > 0)
-    img = cv2.resize(cv2.imread(str(d / "images" / f"{stem}.jpg")), (W, H), interpolation=cv2.INTER_AREA)
+    gui = cv2.resize(fs.mask(k).astype(np.uint8), (W, H), interpolation=cv2.INTER_AREA) > 0
+    bad = gui | (np.asarray(G["tools"][short][k]) > 0)
+    img = cv2.resize(fs.jpg(k), (W, H), interpolation=cv2.INTER_AREA)
     gd = grads(depth, bad, SIGMA)
     gr = grads(cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[..., 0], bad, SIGMA, log=False)
     return gd, gr, score(COARSE, *gd, min_valid=MINV), score(COARSE, *gr, min_valid=MINV)
@@ -101,8 +100,9 @@ def frame_maps(short, frame):
 def _init(state):
     G.update(state)
     G["tools"] = {s: np.load(A / s / "tools.npy", mmap_mode="r") for s in G["shorts"]}
-    G["idx"] = {s: {int(t.rsplit("_", 1)[1]): k for k, t in enumerate(json.loads((A / s / "stems.json").read_text()))}
-                for s in G["shorts"]}
+    G["depth"] = {s: np.load(A / s / "depth.npy", mmap_mode="r") for s in G["shorts"]}
+    G["fs"] = {s: FrameStore(s) for s in G["shorts"]}
+    G["idx"] = {s: fs.pos for s, fs in G["fs"].items()}
     G["M"] = [mahal(COARSE[:, :2], *p) for p in G["prior"]]
     G["head"] = {}
     for (v, s, short), f in G.get("head_files", {}).items():

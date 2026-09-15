@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from arch_tip_data import A, cv_splits  # noqa: E402
+from arch_tip_data import A, FrameStore, cv_splits  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 GH, GW = 32, 40
@@ -66,13 +66,12 @@ class Store:
 
     def __init__(self, short, depth):
         d = A / short
-        self.stems = json.loads((d / "stems.json").read_text())
-        self.frames = np.array([int(s.rsplit("_", 1)[1]) for s in self.stems])
-        self.idx = {f: k for k, f in enumerate(self.frames)}
+        self.frames = FrameStore(short).frames
+        self.idx = {int(f): k for k, f in enumerate(self.frames)}
         self.s3 = np.load(d / "feats_s3.npy", mmap_mode="r")
         self.s4 = np.load(d / "feats_s4.npy", mmap_mode="r")
         self.t32 = cached(d / "tools32.npy", lambda: tools32(d))
-        self.d32 = cached(d / "depth32.npy", lambda: depth32(d, self.stems)) if depth else None
+        self.d32 = cached(d / "depth32.npy", lambda: depth32(d)) if depth else None
 
 
 def cached(path, make):
@@ -87,16 +86,18 @@ def tools32(d):
                      for m in t])[:, None].astype(np.float16)
 
 
-def depth32(d, stems):
-    def one(s):
-        z = np.load(d / "depth" / f"{s}.npz")["depth"].astype(np.float32)
+def depth32(d):
+    zs = np.load(d / "depth.npy", mmap_mode="r")
+
+    def one(k):
+        z = np.asarray(zs[k], np.float32)
         L = cv2.GaussianBlur(np.log(np.clip(z, 1, None)), (0, 0), 2)
         gx, gy = cv2.Sobel(L, cv2.CV_32F, 1, 0) / 8, cv2.Sobel(L, cv2.CV_32F, 0, 1) / 8
         m = np.median(np.hypot(gx, gy)) + 1e-6
         return np.stack([cv2.resize(c, (GW, GH), interpolation=cv2.INTER_AREA)
                          for c in (L - np.median(L), gx / m, gy / m)]).astype(np.float16)
     with ThreadPoolExecutor(16) as ex:
-        return np.stack(list(ex.map(one, stems)))
+        return np.stack(list(ex.map(one, range(len(zs)))))
 
 
 def extra_of(st, ks, variant):
@@ -153,8 +154,8 @@ def train(s3, s4, ex, Y, Wt, a, dev, seed=0):
 @torch.no_grad()
 def predict(model, norm, st, variant, dev, bs=256):
     out = []
-    for k0 in range(0, len(st.stems), bs):
-        ks = np.arange(k0, min(k0 + bs, len(st.stems)))
+    for k0 in range(0, len(st.frames), bs):
+        ks = np.arange(k0, min(k0 + bs, len(st.frames)))
         s3, s4, ex = (torch.from_numpy(np.asarray(x)).to(dev).float()
                       for x in (st.s3[ks], st.s4[ks], extra_of(st, ks, variant)))
         out.append(model((s3 - norm[0]) / norm[1], (s4 - norm[2]) / norm[3], ex).cpu().numpy())
