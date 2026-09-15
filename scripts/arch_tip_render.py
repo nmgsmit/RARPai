@@ -40,6 +40,7 @@ _W = {}
 
 # ------------------------------------------------------------------------------ extract
 def _init(box, out):
+    cv2.setNumThreads(1)                # the pool is the parallelism; 128 workers x 128 cv2 threads thrash
     _W.update(T=load_gui_templates(), box=box, out=out)
 
 
