@@ -1229,7 +1229,46 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
   patched out (job 26734065, --only): identical to 4 decimals for L / Giant / Metric-L. Reason: none
   of the three checkpoints has a sky head (configs build DepthAnything3Net with DualDPT / plain DPT,
   no sky option), so the step returns at `if "sky" not in output`. The nosky variants were removed
-  again; `--only` stays for running a subset into an existing --out. Crops:
+  again; `--only` stays for running a subset into an existing --out.
+
+### DEPTH: absolute mm after ONE ruler calibration, tested on the proxy-GT (2026-09-15)
+- Nick: 6 models (EndoDAC warm start, UniDepthV2-L, DAv2-L, MoGe-2-L, Metric3D-g2, DAv2 Metric
+  Indoor-L), calibrate scale+shift on the ruler set, test ABSOLUTE depth on the proxy-GT (not on
+  a ruler hold-out). `scripts/metric_calib_proxy.py` / `jobs/metric_calib_proxy.sh`, job 26735955,
+  out `outputs/metric_calib_proxy/`. Per object: z_true = mm / in-plane ray length (fixed K 0.82/1.02
+  on 1340x1072), z_pred = mean predicted depth over its 5 points; robust (soft-l1, log) fit of
+  1/z = s/z_pred + b, plus scale-only z_pred/s'. Frozen, applied to every proxy frame, no per-frame
+  scaling. Also per-class fit residual and distance-tracking slope on the ruler objects.
+- ZOOM, both sets. Ruler source videos (`~/data/UMCrulervid/<video>.mp4`, same names as the dump
+  dirs; clips carry no source-frame index, but zoom was constant over 5 windows x 8 frames of each
+  whole video): 15 x 1x, 349725a5 4x, 7d96d613 4x, 4d8eca93 2x -> passed as --exclude-videos
+  (2002 of 2317 objects, 1249 frames remain). Proxy-GT: the `*.jpg` next to depth16 are viz panels
+  (no GUI); raw SBS sources = `~/data/3D_ProxyGT/*.mp4` + `ruler/*.mp4` (5 clips). In SBS each eye is
+  squeezed 2x, HUD label at full-frame y~995-1045, x~575-690 (left eye); read by eye on 6 frames
+  per clip (30 crops): all `1x 0°`. zoomdet templates would need horizontal stretching for SBS.
+- scale_objects.json facts: focal_px is null (so the fixed K is used), classes 1 Ruler (typed mm),
+  2 Catheter tip 5.333, 3 Robot arm 8; sources manual 251 / tracked 1649 / measured 416 (arm) /
+  hold 1; frame keys index the sorted images of the clip.
+- RESULT (job 26735955, 16 min, all 6 ran; results.json in outputs/metric_calib_proxy/):
+    PROXY-GT ABSOLUTE after one ruler calibration   abs_rel  rmse   a1   | scale-only abs_rel | d vs EndoDAC [95% CI]
+    Metric3D v2 ViT-giant2                           .189  10.1mm .679 |  .191  | -.263 [-.302,-.223]
+    UniDepthV2 ViT-L                                 .218  11.2mm .633 |  .222  | -.234 [-.277,-.192]
+    DAv2 Metric Indoor L                             .278  12.8mm .549 |  .265  | -.174 [-.217,-.131]
+    DAv2 L (relative)                                .300  15.5mm .452 |  .405  | -.152 [-.173,-.130]
+    EndoDAC warm start                               .452  22.2mm .309 |  .403  |
+    MoGe-2 ViT-L                                     .528  20.7mm .301 |  .580  | +.076 [+.039,+.114]
+  RULER fit residual (median |ratio-1|) all/ruler/cath/arm + tracking slope (affine | scale-only):
+    Metric3D-g2 .136/.124/.148/.182 .61|.50   UniDepthV2 .184/.187/.194/.155 .28|.41
+    DAv2-MI .178/.177/.158/.218 .51|.65   DAv2-L .167/.160/.174/.187 .54|1.14
+    EndoDAC .189/.191/.233/.145 .36|.17   MoGe-2 .193/.179/.277/.175 .29|.44
+  => THE RANKING CHANGES with absolute scale: Metric3D-g2 (5th on per-frame shape) is best absolute;
+  UniDepthV2 (1st on shape) 2nd; MoGe-2 (3rd on shape) falls BELOW EndoDAC -- its depth level jumps
+  between scenes, so a frozen calibration misplaces the proxy frames. Metric models barely need the
+  shift (scale-only within .004, DAv2-MI even better without); relative DAv2-L needs it (.405 -> .300).
+  EndoDAC's negative shift hurt it (scale-only .403 < affine .452). Absolute error is ~2x the
+  per-frame-scaled error for every model: that gap = scale inconsistency + ruler-vs-proxy scene
+  difference. Tracking slopes are noisy (in-plane z_true is cos-biased, both axes noisy) -- read
+  them as coarse, not as a ranking. Crops:
   ~/zoomcrop/zoom_grid_{a,b}.png on Snellius. Pixel MAD vs a 1x crop does NOT work as a detector
   (the label is translucent over tissue); a template/OCR detector would need 2x/4x glyph crops.
   Ruler-run split had 4d8eca93 + 7d96d613 as VALIDATION videos (other segments; zoom there unchecked).
