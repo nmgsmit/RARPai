@@ -1294,3 +1294,17 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
   variant. Every script that loads a seg best.pth (overlay_dir, overlay_masks, run_rarp_seg,
   eval_urethra, slide_dice_examples, eval_sul_methods, urethra_cylinder, arch_tip_features tools)
   builds `pretrained=variant_for(sd)`, so old StarReLU and new ReLU checkpoints both load strict.
+- A/B = `jobs/finetune_tversky_dice.sh` settings (keep 1,2,3,4, lr 1e-4, 50 ep, a=b=0.5, bg-in-loss)
+  + `--data-root ../data/RARPSurgenet` (the job's `fold1` path no longer exists: flattened on Aug 3,
+  378/97/60 frames) x `--variant {SurgeNet,ImageNet}` x seed {42,1,2}. Same fixed Test split.
+  Outputs `outputs/ab_variant_{relu,starrelu}_s{seed}`, wandb `ab-dice-*`, jobs 26760474-80.
+    test         seed42  seed1   seed2   mean     (val dice mean)
+    ReLU dice    .8237   .8253   .8240   .8243    (.7893)
+    StarReLU     .8129   .8080   .8104   .8104    (.7776)
+    d dice      +.0108  +.0173  +.0136  +.0139
+  mean mIoU .7125 vs .6931 (+.019); catheter .8544 vs .8348; urethra .8325 vs .8163; prostate
+  .8047 vs .7896; apicalvesicle .6657 vs .6503 -- ReLU better on every seed AND every class.
+  StarReLU s42 = .8129 reproduces the old rarp_tversky_dice (.8135) -> same data, bug is the only change.
+  ReLU runs are also ~1 min faster (5:10 vs 6:30). Caveat: 60 test frames, 3 seeds, same frames
+  per seed -> no CI, but the sign is consistent. => every existing seg model (incl. ureth_*,
+  rarp_nick_*, bestseg) is worth a retrain with the fixed init; expect ~+1-2 dice points.
