@@ -20,7 +20,7 @@ import json
 import shutil
 import subprocess
 import sys
-from multiprocessing import Pool
+from multiprocessing import get_context
 from pathlib import Path
 
 import cv2
@@ -58,7 +58,8 @@ def extract(video, out, workers):
     cap, short = cv2.VideoCapture(str(DATA / video)), patient(video)[:8]
     ok, f = cap.read()
     box, i = content_box(cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)), 0
-    with Pool(workers, _init, (box, out)) as pool:
+    # spawn, not fork: the parent's cv2 thread pool is already running, and setNumThreads in a forked child hangs
+    with get_context("spawn").Pool(workers, _init, (box, out)) as pool:
         while ok:
             batch = []
             while ok and len(batch) < max(64, 2 * workers):
