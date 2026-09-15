@@ -5,8 +5,13 @@ Per image: `<stem>_unidepth.npz` (depth mm float32 over the auto-cropped content
 as gui_depth_measure, so `gui_depth_measure.py --ckpt unidepth` measures on exactly these maps.
 
     python scripts/unidepth_overlays.py --dir ../data/others_ruler
+    python scripts/unidepth_overlays.py --dir ../data/others_ruler --calib outputs/metric_calib_proxy/results.json
+
+--calib: apply the frozen ruler-set calibration of metric_calib_proxy (1/z_mm = s/z_m + b, or
+z_mm = z_m/s_only with --calib-mode scale). That fit ran UniDepth WITHOUT K, so K is dropped here too.
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -47,8 +52,13 @@ def main():
     ap.add_argument("--dir", required=True)
     ap.add_argument("--model", default="lpiccinelli/unidepth-v2-vitl14")
     ap.add_argument("--intrinsics", type=float, nargs=4, default=list(DEFAULT_K_NORM))
+    ap.add_argument("--calib", help="metric_calib_proxy results.json -> ruler-calibrated mm")
+    ap.add_argument("--calib-mode", choices=["affine", "scale"], default="affine")
     args = ap.parse_args()
 
+    cal = json.loads(Path(args.calib).read_text())["unidepth_v2_vitl"]["calibration"] if args.calib else None
+    if cal:
+        print(f"ruler calibration ({args.calib_mode}): {cal}")
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = UniDepthV2.from_pretrained(args.model).to(dev).eval()
 
@@ -60,11 +70,16 @@ def main():
         fx, fy, cx, cy = args.intrinsics
         K = torch.tensor([[fx * w, 0, cx * w], [0, fy * h, cy * h], [0, 0, 1]], dtype=torch.float32)
         rgb = torch.from_numpy(crop).permute(2, 0, 1)
-        depth = model.infer(rgb.to(dev), K.to(dev))["depth"][0, 0].float().cpu().numpy() * 1000.0
+        if cal:                                   # same inference as the calibration fit: no K, metres
+            z = model.infer(rgb.to(dev))["depth"][0, 0].float().cpu().numpy()
+            depth = (z / cal["s_only"] if args.calib_mode == "scale"
+                     else 1.0 / np.clip(cal["s"] / np.clip(z, 1e-6, None) + cal["b"], 1e-6, None))
+        else:
+            depth = model.infer(rgb.to(dev), K.to(dev))["depth"][0, 0].float().cpu().numpy() * 1000.0
         np.savez(p.with_name(p.stem + "_unidepth.npz"), depth=depth.astype(np.float32),
-                 fracs=np.array(fracs))
+                 fracs=np.array(fracs), calib=args.calib_mode if cal else "none")
         cv2.imwrite(str(p.with_name(p.stem + "_unidepth_overlay.png")),
-                    overlay_panel(crop, depth, "UniDepthV2"))
+                    overlay_panel(crop, depth, f"UniDepthV2 ruler-cal {args.calib_mode}" if cal else "UniDepthV2"))
         print(f"{p.name}: median {np.median(depth):.0f} mm")
 
 
