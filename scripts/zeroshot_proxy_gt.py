@@ -36,6 +36,9 @@ MODELS = {  # name -> (kind, source, extra PYTHONPATH dirs)
     "da3_large": ("da3", "depth-anything/DA3-LARGE", [f"{PL}/da3"]),
     "da3_giant": ("da3", "depth-anything/DA3-GIANT", [f"{PL}/da3"]),
     "da3_metric_large": ("da3", "depth-anything/DA3METRIC-LARGE", [f"{PL}/da3"]),
+    "da3_large_nosky": ("da3_nosky", "depth-anything/DA3-LARGE", [f"{PL}/da3"]),
+    "da3_giant_nosky": ("da3_nosky", "depth-anything/DA3-GIANT", [f"{PL}/da3"]),
+    "da3_metric_large_nosky": ("da3_nosky", "depth-anything/DA3METRIC-LARGE", [f"{PL}/da3"]),
     "moge2_vitl": ("moge2", "Ruicheng/moge-2-vitl", [f"{PL}/moge"]),
     "moge1_vitl": ("moge1", "Ruicheng/moge-vitl", [f"{PL}/moge"]),
     "unidepth_v2_vitl": ("unidepth", "lpiccinelli/unidepth-v2-vitl14", [f"{PL}/unidepth"]),
@@ -112,8 +115,13 @@ def make_predictor(kind, src, device):
             return 1.0 / np.clip(a, 1e-6, None) if kind == "hf_disp" else a
         return f
 
-    if kind == "da3":
+    if kind in ("da3", "da3_nosky"):
         from depth_anything_3.api import DepthAnything3
+        if kind == "da3_nosky":
+            # DA3's forward ALWAYS sets pixels with sky prob >= 0.3 to the 99th-percentile depth
+            # (model/da3.py _process_mono_sky_estimation); surgery has no sky, bright tissue trips it.
+            from depth_anything_3.model.da3 import DepthAnything3Net
+            DepthAnything3Net._process_mono_sky_estimation = lambda self, output: output
         m = DepthAnything3.from_pretrained(src).to(device).eval()
 
         def f(img, hw):
@@ -282,6 +290,8 @@ def main():
     ap.add_argument("--grid-frames", type=int, default=4)
     ap.add_argument("--model", choices=list(MODELS))
     ap.add_argument("--all", action="store_true", help="every model in its own subprocess, then summarize")
+    ap.add_argument("--only", help="comma-separated model names to run with --all (summary still uses "
+                                   "every per_model/*.npz already in --out)")
     ap.add_argument("--summarize", action="store_true")
     a = ap.parse_args()
     out = Path(a.out)
@@ -290,7 +300,10 @@ def main():
         return run_model(a.model, a.proxy_gt_dir, out, a.grid_frames)
     if a.all:
         failed = []
-        for n, (_, _, extra) in MODELS.items():
+        names = a.only.split(",") if a.only else list(MODELS)
+        assert set(names) <= set(MODELS), f"unknown models: {set(names) - set(MODELS)}"
+        for n in names:
+            extra = MODELS[n][2]
             env = {**os.environ, "PYTHONPATH": os.pathsep.join(extra + [os.environ.get("PYTHONPATH", "")])}
             r = subprocess.run([sys.executable, __file__, "--model", n, "--proxy-gt-dir", a.proxy_gt_dir,
                                 "--out", a.out, "--grid-frames", str(a.grid_frames)], env=env)

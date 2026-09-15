@@ -1196,7 +1196,38 @@ depth, so only `proxy_gt/ms_abs_rel` (per-frame median-scaled) is comparable, ne
   ~/.cache/torch/hub/yvanyin_metric3d_main (loaded source='local'), ~/backbones/EndoUFM/depth_model.pth
   (Google Drive id in its README). EndoOmni: NOT testable -- TianCuteQY/EndoOmni holds only a
   2-line README, no code/weights, nothing on HF. EndoUFM rvlora: random_1/2 are built but unused in
-  RVLinear.forward, so loading is deterministic. Home quota ~170/200 GB after this. Crops:
+  RVLinear.forward, so loading is deterministic. Home quota ~170/200 GB after this.
+- ROUND 2 RESULT (job 26733667, 7 min, all 16 ran, outputs/zeroshot_proxy_gt_v2/; round-1 models
+  reproduce exactly). Sorted by ssi_abs_rel; d = ssi vs EndoDAC warm start [bootstrap 95% CI]:
+    model                        ms_abs_rel  ssi_abs_rel ssi_a1  d_ssi [95% CI]        per patient   better
+    UniDepthV2 ViT-L               .1187      .0991     .906   -.054 [-.063,-.044]   .106 / .087   74/83
+    Depth Anything V2 L (rel)      .2998*     .1059     .889   -.047 [-.057,-.037]   .119 / .082   71/83
+    MoGe-2 ViT-L                   .1638      .1120     .881   -.041 [-.050,-.032]   .122 / .095   68/83
+    MoGe ViT-L                     .1413      .1148     .880   -.038 [-.049,-.027]   .122 / .103   64/83
+    Metric3D v2 ViT-giant2         .1275      .1174     .878   -.035 [-.045,-.025]   .123 / .107   67/83
+    DAv2 Metric Indoor L           .1306      .1181     .854   -.035 [-.043,-.026]   .127 / .103   68/83
+    DA3 Metric-Large               .1673      .1335     .825   -.019 [-.029,-.009]   .137 / .127   55/83
+    EndoUFM                        .1516      .1403     .789   -.012 [-.017,-.008]   .146 / .130   50/83
+    Depth Pro                      .1606      .1459     .786   -.007 [-.021,+.008]   .160 / .121   51/83
+    DA3 Giant                      .1937      .1500     .769   -.003 [-.014,+.009]   .170 / .115   39/83
+    EndoDAC ft manual ep5          .1649      .1519     .765   -.001                 .155 / .147   70/83
+    EndoDAC warm start             .1660      .1527     .762    0                    .156 / .147
+    Metric3D v2 ViT-L              .1705      .1548     .763   +.002 [-.010,+.015]   .168 / .131   37/83
+    DA3 Large                      .1861      .1585     .742   +.006 [-.006,+.018]   .176 / .128   34/83
+  => UniDepthV2 is best on BOTH metrics (ms .119 = 28% below EndoDAC, ssi .099 = 35% below) and on
+  both patients. Six general models beat EndoDAC by 23-35% with CIs far from 0. DA3 (all sizes) is
+  mediocre here although its processor keeps the full frame (upper_bound_resize = longest side 504,
+  each side resized to a multiple of 14, no crop/pad) -> not an alignment bug. Metric3D needs the
+  giant2 backbone (ViT-L = EndoDAC level). EndoUFM is the best SCARED-trained model (+8%) but far
+  behind the general ones. CIs treat 83 frames from 2 patients as independent -> optimistic.
+- grid.png checks. Top 7 all reproduce the stereo ridge/fold/instrument/catheter tip; UniDepthV2
+  cleanest, DA3-Metric-L patchy. Metric3D ViT-L shows a strong checkerboard -- NOT a load bug:
+  checkpoint vs model = only `encoder.mask_token` missing (pretraining-only; giant2 also lacks the
+  final encoder norm and still scores well), so its low rank is genuine. DA3 IS handicapped by its
+  own post-processing: model/da3.py forward always calls _process_mono_sky_estimation, which sets
+  every pixel with sky prob >= 0.3 to the 99th-percentile depth; bright fatty/specular tissue trips it
+  (DA3-L frame 1: yellow fat at the top forced FAR). Added `da3_*_nosky` variants (same weights, that
+  step patched out) and `--only` so they run into the existing v2 dir. Crops:
   ~/zoomcrop/zoom_grid_{a,b}.png on Snellius. Pixel MAD vs a 1x crop does NOT work as a detector
   (the label is translucent over tissue); a template/OCR detector would need 2x/4x glyph crops.
   Ruler-run split had 4d8eca93 + 7d96d613 as VALIDATION videos (other segments; zoom there unchecked).
