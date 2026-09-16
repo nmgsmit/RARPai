@@ -3,6 +3,23 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-16 - Urethra cylinder from the MASK is the default now (urethra_cylinder.mask_tube, analyse(axis="mask"))
+- Why: on monocular calibrated UniDepth the free fit failed: the urethra's depth is only ~1-2 mm deeper at its edges
+  than its middle -> radius hit the 8 mm bound (unbounded 8-20); the refit pulled in tissue beside the urethra
+  (RARP_062 22% inliers outside the mask); 9192f353 put the axis IN FRONT of the surface.
+- Method: radius = half the 3D width (3-97 pct) of the prostate-side half of the mask. Direction = per mask row
+  (5% trimmed each end) midpoint of left/right edge, instrument notches (NONANAT in the urethra hull) filled; RANSAC
+  line (15 px) through the midpoints in the image + separate line of row median depth (middle third) -> 3D top line;
+  axis one radius behind it. NONANAT grown 15 px outside the urethra first (blurred depth at a tool edge read as roof).
+  Start/end march unchanged.
+- Each piece fixed a visible failure on SUL_img3x hand masks + ureth_fn class 4: bottom-half-only rows followed the
+  ragged prostate end (RARP_064 leaned 84 px); least squares on midpoints followed RARP_087's skewed top -> RANSAC;
+  a depth-step instrument test flagged sloping tissue (RARP_091) -> dropped.
+- `axis="fit"` = old free fit. Self-test runs both; only changed expectation: "mask past the start" -> mask mode
+  finds the base 0.6 mm outside t_mask (SUL 17.96, true 18); fit mode keeps "mask (step inside)" (SUL nan).
+- CALLERS CHANGE: arch_cylinder_compare, sul_depth_models, eval_sul_methods now get the mask tube, stereo included;
+  their earlier numbers are free-fit -> pass axis="fit" to reproduce. Not re-run yet.
+
 ## 2026-09-16 - UniDepth K: the ruler calibration let UniDepth GUESS its focal per frame
 - Every calibrated UniDepth path (metric_calib_proxy, arch_tip_unidepth, unidepth_overlays --calib, GUI npz)
   calls `infer(rgb)` without K, while z_true on the ruler set uses the da Vinci K_NORM. New

@@ -115,6 +115,69 @@ def fit_cylinder(P, init=None, r_range=(2.5, 8.0)):
     return p, d, float(s.x[4]), float(np.median(np.abs(res(s.x)))), r_sil
 
 
+def mask_tube(zmap, seg, K, ransac_px=15.0, trim=0.05, seed=0):
+    """The tube from the MASK, depth only for tilt and position (the default, axis="mask" in analyse).
+
+    Free fitting fails on monocular depth: it is too flat across the urethra to give a radius (fits ran to
+    8-20 mm) and doesn't separate the urethra from its neighbours (the refit pulled in tissue beside it).
+      radius    = half the width of the prostate-side half of the mask, in 3D (3-97 pct across its axis)
+      direction = per mask row (5% trimmed each end) the midpoint between the left and right edge, with
+                  instrument notches (NONANAT inside the urethra's hull) filled in; a RANSAC line through
+                  the midpoints in the image (skewed rows of a blob drop out), and separately a line of
+                  the row's middle-third median depth against the row -> the tube's top line in 3D
+      axis      = that top line moved one radius away from the camera
+    Returns (p, d, r, residual, r) like fit_cylinder, or None for too few rows.
+    """
+    fx, fy, cx, cy = K
+    ure = (seg == URETHRA) & (zmap > 0)
+    vm, um = np.nonzero(ure)
+    if len(vm) < 50:
+        return None
+    P = np.stack([(um - cx) * zmap[vm, um] / fx, (vm - cy) * zmap[vm, um] / fy, zmap[vm, um]], 1)
+    ax = np.linalg.svd(P - P.mean(0), full_matrices=False)[2][0]
+    t = (P - P.mean(0)) @ ax
+    low = t > np.median(t) if np.corrcoef(t, vm)[0, 1] > 0 else t < np.median(t)   # prostate side = lower
+    Pb = P[low]
+    across = unit(np.cross(ax, unit(Pb.mean(0))))
+    r = float(np.subtract(*np.percentile((Pb - Pb.mean(0)) @ across, [97, 3])) / 2)
+
+    hull = np.zeros(seg.shape, np.uint8)
+    cv2.fillConvexPoly(hull, cv2.convexHull(np.argwhere(seg == URETHRA)[:, ::-1].astype(np.int32)), 1)
+    fill = (seg == URETHRA) | ((seg == NONANAT) & hull.astype(bool))
+    rows = np.unique(vm)
+    rows = rows[int(len(rows) * trim):max(3, int(len(rows) * (1 - trim)))]
+    V, U, Z = [], [], []
+    for v in rows:
+        us = np.flatnonzero(ure[v])
+        if len(us) < 10:
+            continue
+        span = np.flatnonzero(fill[v])
+        a, b = span.min(), span.max()
+        mid = us[(us > a + (b - a) / 3) & (us < b - (b - a) / 3)]
+        V.append(v); U.append((a + b) / 2); Z.append(float(np.median(zmap[v, mid if len(mid) else us])))
+    if len(V) < 3:
+        return None
+    V, U, Z = map(np.array, (V, U, Z))
+    rng = np.random.default_rng(seed)
+    best = np.ones(len(V), bool)
+    for _ in range(300):
+        i0, i1 = rng.choice(len(V), 2, replace=False)
+        if V[i0] == V[i1]:
+            continue
+        k = (U[i1] - U[i0]) / (V[i1] - V[i0])
+        inl = np.abs(U - (U[i0] + k * (V - V[i0]))) < ransac_px
+        if inl.sum() > best.sum() or best.all():
+            best = inl
+    fu, fz = np.polyfit(V[best], U[best], 1), np.polyfit(V, Z, 1)
+    ends = np.array([[(np.polyval(fu, v) - cx) * np.polyval(fz, v) / fx, (v - cy) * np.polyval(fz, v) / fy,
+                      np.polyval(fz, v)] for v in (V.min(), V.max())])
+    d = unit(ends[1] - ends[0])
+    top = ends.mean(0)
+    p = top - r * toward_camera(top[None], d)[0]
+    res = float(np.median(np.abs(np.linalg.norm(np.cross(Pb - p, d), axis=1) - r)))
+    return p, d, r, res, r
+
+
 def orient(p, d, P, uv, seg):
     """Point the axis DISTALLY. Proximal = the end nearer the prostate/catheter; with neither
     in view, the lower end in the image (the pubic arch is at the top in this console view)."""
@@ -276,15 +339,21 @@ def march(p, d, r, t0, zmap, seg, K, ext, margin, sign=1, rule="knee", step=0.2,
 
 
 def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40, inlier_mm=1.0,
-            end_rule="knee3", start_rule="knee"):
+            end_rule="knee3", start_rule="knee", axis="mask", tool_grow=15):
     """One frame -> cylinder, start, end, SUL (or None when there is too little urethra).
 
-    The mask is only a rough WHERE. A first fit runs on its eroded core; then every depth point near
-    the mask (instrument and catheter excluded) that lies on that surface is re-selected and the fit
-    repeated, so the DEPTH decides what the tube is. Both ends come from the depth as well: walk the
-    tube's top line each way until the surface stops being the tube.
+    axis="mask" (default): the tube comes from the mask, see mask_tube -- works on monocular depth.
+    axis="fit": the older free fit. The mask is only a rough WHERE: a first fit on its eroded core, then
+    every depth point near the mask (instrument and catheter excluded) on that surface is re-selected and
+    the fit repeated, so the DEPTH decides what the tube is. Needs stereo-quality depth.
+    Either way both ends come from the depth: walk the tube's top line each way until the surface stops
+    being the tube. Instruments (NONANAT) are grown by tool_grow px outside the urethra first: the depth
+    around a tool is blurred past its mask and would read as the tissue roof.
     """
     fx, fy, cx, cy = K
+    if tool_grow and (seg == NONANAT).any():
+        grown = cv2.dilate((seg == NONANAT).astype(np.uint8), np.ones((2 * tool_grow + 1,) * 2, np.uint8))
+        seg = np.where(grown.astype(bool) & (seg != URETHRA), NONANAT, seg).astype(seg.dtype)
     ok = (seg == URETHRA) & (zmap > 0)
     # fit on the eroded core: silhouette pixels mix tube and background depth
     core = cv2.erode(ok.astype(np.uint8), np.ones((2 * erode + 1,) * 2, np.uint8)).astype(bool)
@@ -300,17 +369,23 @@ def analyse(zmap, seg, K, erode=7, ext=30.0, margin=1.5, min_px=1500, roi_px=40,
         return np.stack([(u - cx) * z / fx, (v - cy) * z / fy, z], 1), np.stack([u, v], 1) * 1.0
 
     P, puv = pts(core, 20000)
-    p, d, r, res, r_sil = fit_cylinder(P)
-    roi = (cv2.dilate(ok.astype(np.uint8), np.ones((2 * roi_px + 1,) * 2, np.uint8)).astype(bool)
-           & (zmap > 0) & ~np.isin(seg, (NONANAT, CATHETER)))
-    Q, quv = pts(roi, 40000)
     S, suv = P, puv
-    for _ in range(3):
-        on = np.abs(np.linalg.norm(np.cross(Q - p, d), axis=1) - r) < inlier_mm
-        if on.sum() < min_px // 2:
-            break
-        S, suv = Q[on], quv[on]
-        p, d, r, res, _ = fit_cylinder(S, init=(p, d, r))
+    if axis == "mask":
+        tube = mask_tube(zmap, seg, K)
+        if tube is None:
+            return None
+        p, d, r, res, r_sil = tube
+    else:
+        p, d, r, res, r_sil = fit_cylinder(P)
+        roi = (cv2.dilate(ok.astype(np.uint8), np.ones((2 * roi_px + 1,) * 2, np.uint8)).astype(bool)
+               & (zmap > 0) & ~np.isin(seg, (NONANAT, CATHETER)))
+        Q, quv = pts(roi, 40000)
+        for _ in range(3):
+            on = np.abs(np.linalg.norm(np.cross(Q - p, d), axis=1) - r) < inlier_mm
+            if on.sum() < min_px // 2:
+                break
+            S, suv = Q[on], quv[on]
+            p, d, r, res, _ = fit_cylinder(S, init=(p, d, r))
     d, rule = orient(p, d, S, suv, seg)
     t0 = float(np.median((S - p) @ d))
     end = march(p, d, r, t0, zmap, seg, K, ext, margin, sign=+1, rule=end_rule)
@@ -590,7 +665,7 @@ def render(K, W, H, p, d, r, t_roof, beta=1.0, bg=75.0, t_len=60.0, base=False):
     return z.astype(np.float32), seg
 
 
-def self_test():
+def self_test(axis="mask"):
     import tempfile
     from PIL import Image
     im = Image.new("P", (6, 1))
@@ -600,13 +675,13 @@ def self_test():
         f = os.path.join(tmp, "0000000.png")
         im.save(f)
         got = load_mask(f, (1, 6))[0].tolist()
-    print("self-test masks : tool ids 0-5 ->", got)
+    print("self-test [axis=%s] masks : tool ids 0-5 ->" % axis, got)
     assert got == [0, URETHRA, PROSTATE, 0, CATHETER, NONANAT], "hand-mask id mapping"
     K, W, H = (285.8, 285.8, 150.9, 133.5), 335, 268        # the rectified K at quarter size
     d_true, p_true, r_true, t_roof = unit(np.array([0.15, -1.0, 0.3])), np.array([2.0, 12, 55]), 4.0, 18.0
     rng = np.random.default_rng(0)
     noisy = lambda z: z + rng.normal(0, 0.15, z.shape).astype(np.float32)   # ~stereo noise
-    run = lambda z, seg: analyse(z, seg, K, erode=2, min_px=200, roi_px=10)
+    run = lambda z, seg: analyse(z, seg, K, erode=2, min_px=200, roi_px=10, axis=axis)
     z, seg = render(K, W, H, p_true, d_true, r_true, t_roof)
     z = noisy(z)
     fr = run(z, seg)
@@ -631,7 +706,7 @@ def self_test():
     m = (seg == URETHRA) & (ta > t_roof - 6) & (ta < t_roof)
     zd[m] -= 0.8 * (ta[m] - (t_roof - 6)) / 6
     frk = run(zd, seg)
-    frz = analyse(zd, seg, K, erode=2, min_px=200, roi_px=10, end_rule="zero")
+    frz = analyse(zd, seg, K, erode=2, min_px=200, roi_px=10, end_rule="zero", axis=axis)
     print("self-test drift  : SUL knee %.2f  zero %.2f  (true %.1f)" % (frk["sul"], frz["sul"], t_roof))
     assert abs(frk["sul"] - t_roof) < 1.0, "knee end on a drifting surface"
     tsyn = np.arange(0, 30, 0.2)                # flat, a 2 mm rise over 8 mm, steep from 18 mm
@@ -656,8 +731,11 @@ def self_test():
     frb2 = run(noisy(zb), segb2)
     print("self-test mask past the start: start=%s  t_start-t_mask %.2f  SUL %.2f"
           % (frb2["start_kind"], frb2["t_start"] - frb2["t_mask_start"], frb2["sul"]))
-    assert frb2["start_kind"] == "mask (step inside)" and frb2["t_start"] == frb2["t_mask_start"], \
-        "outward-only: a depth step inside the mask must give way to the mask's edge"
+    if axis == "fit":
+        assert frb2["start_kind"] == "mask (step inside)" and frb2["t_start"] == frb2["t_mask_start"], \
+            "outward-only: a depth step inside the mask must give way to the mask's edge"
+    else:   # mask tube: the base step lands 0.6 mm outside t_mask, so it counts as the base -- SUL still right
+        assert abs(frb2["sul"] - t_roof) < 1.5, "SUL, mask past the start"
     z3, seg3 = z.copy(), seg.copy()
     z3[172:], seg3[172:] = 40.0, NONANAT     # an instrument across the proximal ~5 mm
     fr3 = run(z3, seg3)
@@ -691,7 +769,7 @@ def main():
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     if a.self_test:
-        return self_test()
+        return self_test("mask") or self_test("fit")
     if not a.run:
         raise SystemExit("need --run (or --self-test)")
 
