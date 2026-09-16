@@ -7,8 +7,7 @@ measured on each model's depth map three ways:
             (= a line drawn in gui_depth_measure)
   polyline  summed 3D distance over the 5 points, bilinear depth (= finetune_depth.scale_loss, what sw05 trained on)
   inplane   a..b with every point at the object's mean depth (= distance only; what metric_calib_proxy scores)
-and three depth scalings:
-  raw       the model's own metric output (m -> mm); only for models that claim metric depth
+and two depth scalings (a depth model is never used unscaled):
   scale     z / s_only      fitted LEAVE-ONE-SURGERY-OUT on all classes' distances (as metric_calib_proxy)
   affine    1/z = s/z + b   same LOO fit
 Deviation = measured - true mm per ruler -> mean, mean |dev|, median |dev|, IQR, min, max.
@@ -30,8 +29,6 @@ OUT = Path("outputs/ruler_length_models")
 MODELS = ["unidepth_v2_vitl", "metric3d_v2_vit_giant2", "moge2_vitl", "depth_anything_v2_large",
           "depth_anything_v2_metric_indoor_large", "endodac_warmstart", "ft_ruler_sw05",
           "vda_metric_large", "vda_large", "da3_large_mv"]
-RAW_UNIT = {"ft_ruler_sw05": 1.0, "endodac_warmstart": 1.0, "unidepth_v2_vitl": 1000.0, "moge2_vitl": 1000.0,
-            "depth_anything_v2_metric_indoor_large": 1000.0, "vda_metric_large": 1000.0}   # native -> mm
 SW05_TEST = ("9192f353", "84f43102", "494b85c9", "68ab379c", "4c4ae254")   # sw05's held-out surgeries
 P, R = 5, 2                                                                # points per object, patch radius
 
@@ -115,8 +112,6 @@ def evaluate(name, out):
     ok = np.isfinite(zb).all(1) & np.isfinite(ze).all(1) & (zb > 0).all(1)
     zp, zt = zb.mean(1), mm / unit_ray(pts)
     depths = {}
-    if name in RAW_UNIT:
-        depths["raw"] = (zb * RAW_UNIT[name], ze * RAW_UNIT[name])
     sc_b, sc_e, af_b, af_e = (np.full_like(a, np.nan) for a in (zb, ze, zb, ze))
     for s_ in np.unique(surg):                          # calibration never sees the surgery it measures
         te, tr = surg == s_, (surg != s_) & ok
