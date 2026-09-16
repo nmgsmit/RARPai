@@ -15,6 +15,7 @@ K = da Vinci K_NORM on the 1340x1072 content frame, as the annotations and the c
 
     sbatch jobs/ruler_length_models.sh --model unidepth_v2_vitl     # CPU (genoa), one job per model
     python scripts/ruler_length_models.py --summarize               # CPU seconds, runs anywhere
+    python scripts/ruler_length_models.py --overlays --only unidepth_v2_vitl,depth_anything_v2_metric_indoor_large
     python scripts/ruler_length_models.py --selftest
 """
 import argparse, csv, os, subprocess, sys
@@ -105,9 +106,10 @@ def stats(dev, mm):
                 p25=p25, p75=p75, min=dev.min(), max=dev.max(), mean_abs_pct=100 * np.mean(np.abs(dev) / mm))
 
 
-def evaluate(name, out):
+def calibrate(name, out):
+    """-> (npz, ok, surgery, {"scale": (zb, ze), "affine": (zb, ze)}) with LEAVE-ONE-SURGERY-OUT fits."""
     r = np.load(out / f"{name}.npz")
-    pts, zb, ze, mm, cls = r["pts"], r["zb"], r["ze"], r["mm"], r["cls"]
+    pts, zb, ze, mm = r["pts"], r["zb"], r["ze"], r["mm"]
     surg = np.array([v[:8] for v in r["video"]])
     ok = np.isfinite(zb).all(1) & np.isfinite(ze).all(1) & (zb > 0).all(1)
     zp, zt = zb.mean(1), mm / unit_ray(pts)
@@ -119,6 +121,12 @@ def evaluate(name, out):
         sc_b[te], sc_e[te] = zb[te] / s_only, ze[te] / s_only
         af_b[te], af_e[te] = apply_affine(zb[te], s, b), apply_affine(ze[te], s, b)
     depths["scale"], depths["affine"] = (sc_b, sc_e), (af_b, af_e)
+    return r, ok, surg, depths
+
+
+def evaluate(name, out):
+    r, ok, surg, depths = calibrate(name, out)
+    pts, mm, cls = r["pts"], r["mm"], r["cls"]
     rows = []
     for subset, sel in (("all", np.ones_like(ok)), ("sw05_test", np.isin(surg, SW05_TEST))):
         m = ok & sel & (cls == 1)
@@ -129,6 +137,60 @@ def evaluate(name, out):
                 rows.append(dict(model=name, subset=subset, calib=cal, method=meth,
                                  **stats(l[good] - mm[m][good], mm[m][good])))
     return rows
+
+
+LABEL = {"unidepth_v2_vitl": "UniDepth", "depth_anything_v2_metric_indoor_large": "DAv2-mi",
+         "depth_anything_v2_large": "DAv2-L", "ft_ruler_sw05": "EndoDAC-sw05"}
+COLOR = {"unidepth_v2_vitl": (80, 220, 255), "depth_anything_v2_metric_indoor_large": (255, 200, 60),
+         "depth_anything_v2_large": (255, 110, 200), "ft_ruler_sw05": (170, 170, 170)}
+
+
+def overlays(out, names, calib="scale", worst=6):
+    """Test-surgery rulers drawn on their frame with each model's GUI-line (chord) length, calibrated LOO.
+    One frame per test clip + the `worst` frames by largest |chord - true| over the models."""
+    from PIL import Image, ImageDraw, ImageFont
+    L, base = {}, None
+    for n in names:
+        r, ok, surg, depths = calibrate(n, out)
+        if base is None:
+            base = r
+            keep, bsurg = ok & (r["cls"] == 1) & np.isin(surg, SW05_TEST), surg
+        assert np.array_equal(r["image"], base["image"]) and np.allclose(r["pts"], base["pts"]), f"{n}: object order differs"
+        keep &= ok
+        L[n] = lengths(r["pts"], *depths[calib])["chord"]
+    img, pts, mm = base["image"], base["pts"], base["mm"]
+    idx = np.flatnonzero(keep & np.all([np.isfinite(L[n]) for n in names], 0))
+    clip = np.array([str(Path(i).parents[1]) for i in img])
+    pick = {img[i] for i in {clip[i]: i for i in idx[::-1]}.values()}          # first ruler frame per clip
+    err = np.max([np.abs(L[n][idx] - mm[idx]) for n in names], 0)
+    pick |= {img[i] for i in idx[np.argsort(-err)][:worst * 3]}
+    pick = sorted(pick)[:200]
+    d = out / f"overlays_{calib}"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 22)
+    except OSError:
+        font = ImageFont.load_default(size=22)
+    for f in pick:
+        im = Image.open(f).convert("RGB")
+        dr = ImageDraw.Draw(im)
+        for i in idx[img[idx] == f]:
+            a, b = pts[i, 0], pts[i, -1]
+            dr.line([tuple(a), tuple(b)], fill=(40, 255, 120), width=4)
+            for q in (a, b):
+                dr.ellipse([q[0] - 7, q[1] - 7, q[0] + 7, q[1] + 7], outline=(40, 255, 120), width=3)
+            lines = [(f"true {mm[i]:.1f} mm", (40, 255, 120))] +                     [(f"{LABEL.get(n, n)} {L[n][i]:.1f} ({L[n][i] - mm[i]:+.1f})", COLOR.get(n, (255, 255, 255))) for n in names]
+            x, y = max(b[0], a[0]) + 16, min(a[1], b[1])
+            x = min(x, im.width - 330)
+            box = [x - 6, y - 6, x + 324, y + 28 * len(lines) + 2]
+            dr.rectangle(box, fill=(0, 0, 0))
+            for k, (t, c) in enumerate(lines):
+                dr.text((x, y + 28 * k), t, fill=c, font=font)
+        dr.rectangle([0, 0, 900, 34], fill=(0, 0, 0))
+        dr.text((8, 5), f"{Path(f).parents[2].name[:8]} {Path(f).parents[1].name} {Path(f).stem} | chord (GUI line), "
+                        f"{calib} calib LOO | label: mm (measured - true)", fill=(255, 255, 255), font=ImageFont.load_default(size=18))
+        im.save(d / f"{Path(f).parents[2].name[:8]}_{Path(f).parents[1].name.replace('.mp4', '')}_{Path(f).stem}.jpg", quality=90)
+    print(f"wrote {len(pick)} overlays ({len(idx)} test rulers) -> {d}")
 
 
 def summarize(out, names):
@@ -169,6 +231,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", choices=MODELS)
     ap.add_argument("--summarize", action="store_true")
+    ap.add_argument("--overlays", action="store_true", help="draw test rulers with each --only model's length")
     ap.add_argument("--only", default=",".join(MODELS))
     ap.add_argument("--out", default=str(OUT))
     ap.add_argument("--selftest", action="store_true")
@@ -177,6 +240,8 @@ def main():
         return selftest()
     if a.summarize:
         return summarize(Path(a.out), a.only.split(","))
+    if a.overlays:
+        return overlays(Path(a.out), a.only.split(","))
     if a.model and not os.environ.get("RULER_LEN_CHILD"):   # each model needs its own code dirs on PYTHONPATH
         import video_depth_proxy_gt as vd
         from zeroshot_proxy_gt import MODELS as ZS
