@@ -181,8 +181,8 @@ def overlays(out, names, calib="scale", worst=6):
                 dr.ellipse([q[0] - 7, q[1] - 7, q[0] + 7, q[1] + 7], outline=(40, 255, 120), width=3)
             lines = [(f"true {mm[i]:.1f} mm", (40, 255, 120))] +                     [(f"{LABEL.get(n, n)} {L[n][i]:.1f} ({L[n][i] - mm[i]:+.1f})", COLOR.get(n, (255, 255, 255))) for n in names]
             x, y = max(b[0], a[0]) + 16, min(a[1], b[1])
-            x = min(x, im.width - 330)
-            box = [x - 6, y - 6, x + 324, y + 28 * len(lines) + 2]
+            x = min(x, im.width - 380)
+            box = [x - 6, y - 6, x + 374, y + 28 * len(lines) + 2]
             dr.rectangle(box, fill=(0, 0, 0))
             for k, (t, c) in enumerate(lines):
                 dr.text((x, y + 28 * k), t, fill=c, font=font)
