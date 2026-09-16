@@ -3,6 +3,13 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-16 - UniDepth K: the ruler calibration let UniDepth GUESS its focal per frame
+- Every calibrated UniDepth path (metric_calib_proxy, arch_tip_unidepth, unidepth_overlays --calib, GUI npz)
+  calls `infer(rgb)` without K, while z_true on the ruler set uses the da Vinci K_NORM. New
+  `metric_calib_proxy --k`: UniDepth gets K_NORM on the ruler set, stereo P1 on the proxy eyes; every run
+  now logs UniDepth's own focal (npz `focal`, p5/50/95 printed). Run it into a SEPARATE --out; switch
+  the downstream no-K paths only if it wins (proxy abs_rel, LOO, tracking slope).
+
 ## 2026-09-14 - DEPTH: stereo proxy-GT convergence eval drives best.pth (+ frame/GUI convention)
 - CONVENTION agreed with Nick, written into CLAUDE.md: side bars CROPPED once (1340x1072 content
   frame); GUI = black pixels + `<stem>_mask.png`, consumers read the mask, never infer from black.

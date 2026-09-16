@@ -139,9 +139,18 @@ def make_predictor(kind, src, device):
         from unidepth.models import UniDepthV2
         m = UniDepthV2.from_pretrained(src).to(device).eval()
 
-        def f(img, hw):
+        def f(img, hw, k=None):                     # k = normalised (fx, fy, cx, cy); None = UniDepth guesses
             rgb = torch.from_numpy(np.asarray(img)).permute(2, 0, 1)   # uint8, infer() normalises
-            return up(m.infer(rgb)["depth"][0, 0], hw)
+            K = None
+            if k is not None:
+                w, h = img.size
+                K = torch.tensor([[k[0] * w, 0, k[2] * w], [0, k[1] * h, k[3] * h], [0, 0, 1]],
+                                 dtype=torch.float32, device=device)
+            o = m.infer(rgb, K)
+            if "intrinsics" in o:                   # what focal it used, normalised like k
+                Ki = o["intrinsics"][0].float().cpu().numpy()
+                f.last_k = (Ki[0, 0] / img.size[0], Ki[1, 1] / img.size[1])
+            return up(o["depth"][0, 0], hw)
         return f
 
     if kind == "metric3d":

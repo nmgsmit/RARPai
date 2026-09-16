@@ -22,6 +22,7 @@ Each model runs in its own subprocess with its own PYTHONPATH (zeroshot_proxy_gt
     python scripts/metric_calib_proxy.py --model unidepth_v2_vitl
     python scripts/metric_calib_proxy.py --summarize
     python scripts/metric_calib_proxy.py --selftest
+    python scripts/metric_calib_proxy.py --loo unidepth_v2_vitl   # held-out-surgery check, no GPU
 """
 import argparse, json, os, subprocess, sys
 from pathlib import Path
@@ -99,7 +100,9 @@ def sample(depth, pts):
 
 
 # ------------------------------------------------------------------------------ one model
-def run_model(name, ruler_root, proxy_dir, exclude, out):
+def run_model(name, ruler_root, proxy_dir, exclude, out, use_k=False):
+    """use_k: feed models that take a camera (UniDepth) the KNOWN K -- da Vinci K_NORM on the ruler
+    set, stereo P1 on the proxy left eyes -- instead of letting them guess one per frame."""
     import torch
     from PIL import Image
     from eval_scared import EVAL_MAX, EVAL_MIN, compute_errors
@@ -113,10 +116,19 @@ def run_model(name, ruler_root, proxy_dir, exclude, out):
     print(f"[{name}] {len(objs)} ruler objects on {len(by_img)} frames", flush=True)
 
     rec = np.full((len(objs), 2), np.nan)              # (z_pred, z_true)
+    kw_ruler, kw_proxy = {}, {}
+    if use_k:
+        assert kind == "unidepth", f"--k only wired for UniDepth, not {kind}"
+        P1 = np.array(json.loads(Path("calib/stereo_calib.json").read_text())["P1"])
+        kw_ruler = {"k": K_NORM}
+        kw_proxy = {"k": (P1[0, 0] / HW[1], P1[1, 1] / HW[0], P1[0, 2] / HW[1], P1[1, 2] / HW[0])}
+    focal = []                                         # model's own (fx, fy) normalised, per ruler frame
     with torch.no_grad():
         f = make_predictor(kind, src, device)
         for n, (img, idx) in enumerate(by_img.items()):
-            depth = f(Image.open(img).convert("RGB"), HW)
+            depth = f(Image.open(img).convert("RGB"), HW, **kw_ruler)
+            if hasattr(f, "last_k"):
+                focal.append(f.last_k)
             for i in idx:
                 _, pts, mm, _, _, _ = objs[i]
                 z = sample(depth, pts)
@@ -133,7 +145,7 @@ def run_model(name, ruler_root, proxy_dir, exclude, out):
         frames, gt = load_frames(proxy_dir)
         err = {"affine": [], "scale": []}
         for fp, g in zip(frames, gt):
-            pred = f(Image.open(fp).convert("RGB"), g.shape)
+            pred = f(Image.open(fp).convert("RGB"), g.shape, **kw_proxy)
             mask = (g > EVAL_MIN) & (g < EVAL_MAX)
             t = g[mask]
             for key, cal in (("affine", apply_affine(pred, s, b)), ("scale", pred / s_only)):
@@ -143,7 +155,11 @@ def run_model(name, ruler_root, proxy_dir, exclude, out):
     np.savez(out / "per_model" / f"{name}.npz", rec=rec, ok=ok, cls=cls, src=srcs,
              video=np.array([o[5] for o in objs]), s=s, b=b, s_only=s_only,
              affine=np.array(err["affine"]), scale=np.array(err["scale"]),
-             frames=np.array([p.name for p in frames]))
+             frames=np.array([p.name for p in frames]), focal=np.array(focal), use_k=use_k)
+    if focal:
+        q = np.percentile(np.array(focal), [5, 50, 95], axis=0)
+        print(f"[{name}] model focal (norm) fx p5/50/95 {q[0,0]:.3f}/{q[1,0]:.3f}/{q[2,0]:.3f} "
+              f"fy {q[0,1]:.3f}/{q[1,1]:.3f}/{q[2,1]:.3f} | da Vinci K {K_NORM[0]}/{K_NORM[1]}", flush=True)
     a = np.array(err["affine"])
     print(f"[{name}] proxy ABSOLUTE (scale+shift cal): abs_rel={a[:, 0].mean():.4f} "
           f"rmse={a[:, 2].mean():.2f}mm a1={a[:, 4].mean():.4f}", flush=True)
@@ -192,6 +208,40 @@ def summarize(out, names):
     print(f"\nwrote {out / 'results.json'}")
 
 
+def loo(out, name, videos=()):
+    """Leave-one-VIDEO-out on the saved ruler records: fit on the other surgeries, score this one.
+    Also `raw` (no calibration at all) and a constant-distance baseline (median z_true of the other
+    videos) -- a calibration that cannot beat it is not measuring distance. `videos` (prefixes)
+    restricts everything to those surgeries, e.g. a fine-tuned model's held-out test split."""
+    r = np.load(out / "per_model" / f"{name}.npz")
+    ok = r["ok"] & (np.array([any(v.startswith(p) for p in videos) for v in r["video"]]) if videos else True)
+    zp, zt, cls, vid = r["rec"][ok, 0], r["rec"][ok, 1], r["cls"][ok], r["video"][ok]
+    unit = 1000.0 if np.median(zp) < 10 else 1.0    # ponytail: metres (UniDepth) vs mm by magnitude
+    ratio = {k: np.empty_like(zt) for k in ("raw", "affine", "scale", "constant")}
+    print(f"\n{name}: leave-one-video-out, {len(zt)} objects / {len(set(vid))} videos")
+    print(f"{'held-out video':12s} {'n':>4s} {'true mm p5-p95':>15s} | median ratio cal/true (1 = right) "
+          f"raw / affine / scale / constant")
+    for v in sorted(set(vid)):
+        te = vid == v
+        s, b, s_only = fit_calibration(zp[~te], zt[~te])
+        ratio["raw"][te] = zp[te] * unit / zt[te]
+        ratio["affine"][te] = apply_affine(zp[te], s, b) / zt[te]
+        ratio["scale"][te] = zp[te] / s_only / zt[te]
+        ratio["constant"][te] = np.median(zt[~te]) / zt[te]
+        p5, p95 = np.percentile(zt[te], [5, 95])
+        print(f"{v[:12]:12s} {te.sum():4d} {p5:7.0f}-{p95:<7.0f} | "
+              + " / ".join(f"{np.median(ratio[k][te]):.2f}" for k in ratio))
+    print(f"\nHELD-OUT median |ratio-1| (brackets: the saved fit on ALL ruler videos) and distance-tracking slope")
+    print(f"{'':9s} {'all':>12s} " + " ".join(f"{CLASSES[c]:>12s}" for c in CLASSES) + f" {'slope':>6s}")
+    ins = {"affine": apply_affine(zp, float(r["s"]), float(r["b"])) / zt, "scale": zp / float(r["s_only"]) / zt}
+    for k, q in ratio.items():
+        cell = lambda m: f"{np.median(np.abs(q[m] - 1)):.3f}" + (f" ({np.median(np.abs(ins[k][m] - 1)):.3f})" if k in ins else "")
+        print(f"{k:9s} {cell(np.ones_like(zt, bool)):>12s} " + " ".join(f"{cell(cls == c):>12s}" for c in CLASSES)
+              + f" {tracking_slope(q * zt, zt):6.3f}")
+    print(f"within 10% / 20% of the true distance: "
+          + "  ".join(f"{k} {np.mean(np.abs(q - 1) < .1):.0%}/{np.mean(np.abs(q - 1) < .2):.0%}" for k, q in ratio.items()))
+
+
 def selftest():
     rng = np.random.default_rng(0)
     zt = rng.uniform(30, 120, 400)
@@ -217,14 +267,20 @@ def main():
     ap.add_argument("--only", default=",".join(SIX))
     ap.add_argument("--summarize", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--loo", metavar="MODEL", help="leave-one-video-out check of a saved per_model/MODEL.npz")
+    ap.add_argument("--loo-videos", default="", help="comma-separated video prefixes to restrict --loo to")
+    ap.add_argument("--k", action="store_true", help="give UniDepth the known K instead of its own guess "
+                    "(use a separate --out: unidepth_overlays --calib reads the no-K results.json)")
     a = ap.parse_args()
     if a.selftest:
         return selftest()
+    if a.loo:
+        return loo(Path(a.out), a.loo, [v for v in a.loo_videos.split(",") if v])
     out = Path(a.out)
     (out / "per_model").mkdir(parents=True, exist_ok=True)
     exclude = [e for e in a.exclude_videos.split(",") if e]
     if a.model:
-        return run_model(a.model, a.ruler_root, a.proxy_gt_dir, exclude, out)
+        return run_model(a.model, a.ruler_root, a.proxy_gt_dir, exclude, out, a.k)
     names = a.only.split(",")
     assert set(names) <= set(MODELS), set(names) - set(MODELS)
     if a.all:
@@ -233,7 +289,7 @@ def main():
             env = {**os.environ, "PYTHONPATH": os.pathsep.join(MODELS[n][2] + [os.environ.get("PYTHONPATH", "")])}
             r = subprocess.run([sys.executable, __file__, "--model", n, "--ruler-root", a.ruler_root,
                                 "--proxy-gt-dir", a.proxy_gt_dir, "--out", a.out,
-                                "--exclude-videos", a.exclude_videos], env=env)
+                                "--exclude-videos", a.exclude_videos] + (["--k"] if a.k else []), env=env)
             if r.returncode:
                 failed.append(n)
                 print(f"[FAILED] {n} (exit {r.returncode})", flush=True)
