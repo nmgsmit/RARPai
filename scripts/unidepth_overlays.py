@@ -37,9 +37,10 @@ def overlay_panel(crop_rgb, depth, name):
     return panel
 
 
-def frames(d):
-    """Source frames only: skip the npz/overlay/compare files these scripts write next to them."""
-    return [p for p in sorted(Path(d).iterdir())
+def frames(d, pattern="*"):
+    """Source frames only: skip the npz/overlay/compare files these scripts write next to them.
+    `pattern` narrows a folder holding by-products too (proxy-GT: --glob "*_left.png")."""
+    return [p for p in sorted(Path(d).glob(pattern))
             if p.suffix.lower() in IMG_EXTS and "_unidepth" not in p.stem and "_endodac" not in p.stem]
 
 
@@ -54,6 +55,10 @@ def main():
     ap.add_argument("--intrinsics", type=float, nargs=4, default=list(DEFAULT_K_NORM))
     ap.add_argument("--calib", help="metric_calib_proxy results.json -> ruler-calibrated mm")
     ap.add_argument("--calib-mode", choices=["affine", "scale"], default="affine")
+    ap.add_argument("--glob", default="*", help='only these files, e.g. "*_left.png" in a proxy-GT dir')
+    ap.add_argument("--no-crop", action="store_true",
+                    help="frames are already the content frame (rectified stereo left): no auto-crop, "
+                         "so the map covers the same pixels as the stereo depth16")
     args = ap.parse_args()
 
     cal = json.loads(Path(args.calib).read_text())["unidepth_v2_vitl"]["calibration"] if args.calib else None
@@ -62,9 +67,9 @@ def main():
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     model = UniDepthV2.from_pretrained(args.model).to(dev).eval()
 
-    for p in frames(args.dir):
+    for p in frames(args.dir, args.glob):
         full = Image.open(p).convert("RGB")
-        fracs = auto_bars(np.asarray(full))
+        fracs = (0.0, 0.0, 0.0) if args.no_crop else auto_bars(np.asarray(full))
         crop = np.asarray(full.crop(crop_box(full.size, *fracs)))
         h, w = crop.shape[:2]
         fx, fy, cx, cy = args.intrinsics
