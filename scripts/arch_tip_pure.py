@@ -12,6 +12,9 @@ DINOv3 ViT-L/16 last layer = 1024 ch; all on the 32x40 grid of a 512x640 feed):
   tip       vote head (softmax over cells of centre + offset -> tip and both arch ends; may leave the frame)
   tip+seg   same head, plus an anatomy head trained on the masks (7-way soft CE on the grid) as extra supervision
   seg->tip  anatomy head only; tip = top of the largest predicted urethra region + the median train offset
+  tip+mid   tip + the centre of the arch chord (weights 1, 0.5)
+  arc5/arc7 5 / 7 points along the drawn arch (tip, then outwards to both ends); loss weight 1 at the tip,
+            falling linearly to 0.25 at the ends. Only the tip (point 0) is ever scored.
   prior     train-mean tip        human: each annotator vs the mean of the other two
 
     python scripts/arch_tip_pure.py pack --src "E:/Geknipte Videos batch 2/20archesfortesting/Pure Arch" --out <dir>
@@ -166,7 +169,7 @@ def feats(args):
 
 
 # ------------------------------------------------------------------------------------------------ model (GPU)
-def make_head(cin, width=256):
+def make_head(cin, npts=3, width=256):
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -180,7 +183,7 @@ def make_head(cin, width=256):
                 return nn.Sequential(nn.Conv2d(i, o, 3, padding=d, dilation=d), nn.GroupNorm(8, o), nn.ReLU(inplace=True))
             self.body = nn.Sequential(block(width + 2, width, 1), block(width, width, 2), block(width, width, 4),
                                       block(width, width, 1))
-            self.vote, self.seg = nn.Conv2d(width, 9, 1), nn.Conv2d(width, NCLS, 1)
+            self.vote, self.seg = nn.Conv2d(width, 3 * npts, 1), nn.Conv2d(width, NCLS, 1)
             ys, xs = torch.meshgrid(torch.arange(GH), torch.arange(GW), indexing="ij")
             self.register_buffer("cx", ((xs + 0.5) * CELL).float().flatten())
             self.register_buffer("cy", ((ys + 0.5) * CELL).float().flatten())
@@ -190,8 +193,9 @@ def make_head(cin, width=256):
             f = F.dropout2d(self.red(x), 0.1, self.training)
             h = self.body(torch.cat([f, self.coords.expand(len(x), -1, -1, -1)], 1))
             o = self.vote(h).flatten(2)
-            w = o[:, :3].softmax(-1)
-            pts = torch.stack([(w * (self.cx + o[:, 3:6] * CELL)).sum(-1), (w * (self.cy + o[:, 6:9] * CELL)).sum(-1)], -1)
+            w = o[:, :npts].softmax(-1)                  # per point: heat, dx, dy (point 0 = tip)
+            pts = torch.stack([(w * (self.cx + o[:, npts:2 * npts] * CELL)).sum(-1),
+                               (w * (self.cy + o[:, 2 * npts:] * CELL)).sum(-1)], -1)
             return pts, self.seg(h)
     return Head()
 
@@ -225,6 +229,33 @@ def urethra_tip(seg_logits):
     return np.array([xs[band].mean() * 4 + 2, ys.min() * 4 + 2], np.float32)
 
 
+# Training targets. Point 0 is always the tip (the only thing scored); weights fall with distance from the tip.
+POINTS = {"tip": None, "tip+mid": None, "arc5": [0, -0.5, 0.5, -1, 1], "arc7": [0, -1 / 3, 1 / 3, -2 / 3, 2 / 3, -1, 1]}
+
+
+def arc_points(tip, left, right, us, power=2.0):
+    """Points on the annotation tool's arch (apex = tip, ends = left/right) at chord positions us in [-1, 1]."""
+    mid, ch = (left + right) / 2, right - left
+    d = np.linalg.norm(ch, axis=-1, keepdims=True) / 2
+    t = ch / (2 * d + 1e-9)
+    nrm = np.stack([t[..., 1], -t[..., 0]], -1)
+    h = ((tip - mid) * nrm).sum(-1, keepdims=True)
+    return np.stack([mid + u * d * t + (1 - abs(u) ** power) * h * nrm for u in us], -2)
+
+
+def targets(yt, method):
+    """(N,3,2) tip/left/right tensor -> (N,P,2) target points and P weights for this method."""
+    import torch
+    if method in ("tip", "tip+seg", "seg->tip"):
+        return yt, [1.0, 0.25, 0.25]
+    if method == "tip+mid":
+        return torch.stack([yt[:, 0], (yt[:, 1] + yt[:, 2]) / 2], 1), [1.0, 0.5]
+    us = POINTS[method]
+    Y = yt.cpu().numpy()
+    pts = arc_points(Y[:, 0], Y[:, 1], Y[:, 2], us)
+    return torch.from_numpy(pts.astype(np.float32)).to(yt.device), [1 - 0.75 * abs(u) for u in us]
+
+
 def train_data():
     """Training videos, (N,3,2) tip/left/right targets and (N,7,32,40) soft anatomy targets, video by video."""
     shorts = sorted(p.name for p in PURE.iterdir() if (p / "frames.npy").exists())
@@ -247,20 +278,22 @@ def norm_stats(X):
 
 
 def fit(X, yt, st, mu, sd, method, seed, steps, bs, dev):
-    """tip: vote loss only; tip+seg: vote + anatomy loss; seg->tip: anatomy loss only."""
+    """yt = (N,3,2) tip/left/right; targets() turns it into the method's points + weights. tip+seg adds the anatomy
+    loss, seg->tip uses only the anatomy loss."""
     import torch
     import torch.nn.functional as F
     torch.manual_seed(seed)
-    head = make_head(X.shape[1]).to(dev)
+    pts_t, wts = targets(yt, method)
+    head = make_head(X.shape[1], pts_t.shape[1]).to(dev)
     opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=1e-2)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, 1e-3, total_steps=steps)
     wv, ws = (1.0, 0.0) if method == "tip" else (1.0, 1.0) if method == "tip+seg" else (0.0, 1.0)
-    pw = torch.tensor([1.0, 0.25, 0.25], device=dev)
+    pw = torch.tensor(wts, device=dev, dtype=torch.float32)
     head.train()
     for _ in range(steps):
         b = torch.randint(0, len(X), (bs,), device=dev)
         pts, seg = head((X[b].float() - mu) / sd)
-        lv = (F.smooth_l1_loss(pts / 100, yt[b] / 100, beta=0.2, reduction="none").sum(-1) * pw).sum(-1).mean()
+        lv = (F.smooth_l1_loss(pts / 100, pts_t[b] / 100, beta=0.2, reduction="none").sum(-1) * pw).sum(-1).mean()
         ls = -(st[b].float() * F.log_softmax(seg, 1)).sum(1).mean()
         loss = wv * lv + ws * ls
         opt.zero_grad()
@@ -313,7 +346,8 @@ def predict(args):
         P, _ = infer_with(head, mu, sd, XA, dev)
         out = ROOT / "outputs" / "arch_tip_pure" / "pred" / f"{args.method}_{bb}" / f"s{seed}"
         out.mkdir(parents=True, exist_ok=True)
-        np.savez(out / f"{short}.npz", frames=fs.frames, tip=P[:, 0], left=P[:, 1], right=P[:, 2], test_frames=np.array(tf))
+        ends = P[:, -2:] if P.shape[1] > 2 else np.stack([P[:, 0], P[:, 0]], 1)   # outermost points = arch ends
+        np.savez(out / f"{short}.npz", frames=fs.frames, tip=P[:, 0], left=ends[:, 0], right=ends[:, 1], test_frames=np.array(tf))
         print(f"{args.method} {bb} seed {seed}: {len(fs)} frames, test error {np.linalg.norm(P[tk, 0] - tips, axis=1).mean():.1f} px",
               flush=True)
 
@@ -347,7 +381,7 @@ def run(args):
         XT = {s: np.load(PURE / "feats" / bb / "test" / f"{s}.npy", mmap_mode="r") for s in TEST}
         mu, sd = norm_stats(X)
         yt, st = torch.from_numpy(YT).to(dev), torch.from_numpy(ST).to(dev)
-        for method, seed in itertools.product(("tip", "tip+seg", "seg->tip"), range(args.seeds)):
+        for method, seed in itertools.product(args.methods, range(args.seeds)):
             head = fit(X, yt, st, mu, sd, method, seed, args.steps, args.bs, dev)
 
             def infer(arr):
@@ -391,7 +425,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cmd", choices=["pack", "feats", "run", "predict"])
     ap.add_argument("--video", default="cada5bef", help="predict: test video short id")
-    ap.add_argument("--method", default="tip", choices=["tip", "tip+seg"], help="predict: method")
+    ap.add_argument("--method", default="tip", choices=list(POINTS) + ["tip+seg"], help="predict: method")
+    ap.add_argument("--methods", nargs="+", default=["tip", "tip+mid", "arc5", "arc7"],
+                    choices=list(POINTS) + ["tip+seg", "seg->tip"], help="run: methods to compare")
     ap.add_argument("--src", default="E:/Geknipte Videos batch 2/20archesfortesting/Pure Arch")
     ap.add_argument("--out", default=str(PURE))
     ap.add_argument("--k", type=int, default=500)
@@ -413,4 +449,8 @@ def main():
 if __name__ == "__main__":
     ids, u = colour_ids(np.array([[[0, 255, 255], [255, 0, 255], [128, 128, 128], [0, 0, 255], [7, 7, 7]]], np.uint8))
     assert ids.tolist() == [[1, 2, 5, 6, 0]] and abs(u - 0.2) < 1e-9, (ids, u)       # BGR in: yellow magenta grey red other
+    _y = np.array([[670.0, 250.0]]), np.array([[270.0, 550.0]]), np.array([[1070.0, 550.0]])
+    _p = arc_points(*_y, POINTS["arc7"])[0]
+    assert np.allclose(_p[0], _y[0][0]) and np.allclose(_p[-2], _y[1][0]) and np.allclose(_p[-1], _y[2][0]), _p
+    assert np.allclose(arc_points(*_y, [0.5])[0, 0], [870, 250 + 0.25 * 300]), arc_points(*_y, [0.5])
     main()
