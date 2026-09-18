@@ -23,7 +23,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "third_party" / "surgenet"))
 from arch_tip_data import A, FrameStore  # noqa: E402
-from metaformer import MetaFormerFPN, variant_for  # noqa: E402
+from metaformer import MetaFormerFPN  # noqa: E402
 
 MEAN, STD = np.array([0.485, 0.456, 0.406], np.float32), np.array([0.229, 0.224, 0.225], np.float32)
 TOOL_IDS = (3, 4)
@@ -54,11 +54,13 @@ def main():
     ap.add_argument("--seg", default="outputs/rarp_nick_fullres/best.pth")
     ap.add_argument("--calib", default="outputs/metric_calib_proxy/results.json")
     ap.add_argument("--unidepth", default="lpiccinelli/unidepth-v2-vitl14")
+    ap.add_argument("--root", default=str(A), help="dir of packed videos (default arch_tip_all; e.g. arch_tip_pure)")
     args = ap.parse_args()
 
     if args.what == "feats":
         from finetune_segmentation import load_encoder
-        # "SurgeNet" = the ReLU CAFormer the teacher was trained as: all keys load (load_encoder asserts it).
+        # "SurgeNet" = the ReLU CAFormer the teacher was trained as: all keys load. The "ImageNet" variant that
+        # finetune_segmentation builds leaves 48 StarReLU scale/bias params at init -- fine-tuning adapts, frozen does not.
         m = MetaFormerFPN(num_classes=1, pretrained="SurgeNet", pretrained_weights=None)
         load_encoder(m, args.encoder)
         net, hw, bs = m.metaformer.cuda().eval(), (512, 640), 32
@@ -66,7 +68,7 @@ def main():
         sd = torch.load(args.seg, map_location="cpu", weights_only=False)
         nc = sd["FPN.segmentation_head.0.bias"].shape[0]
         assert nc == 5, f"{args.seg}: expected bg + 4 kept classes (1,2,4,5), got {nc}"
-        net = MetaFormerFPN(num_classes=nc, pretrained=variant_for(sd), pretrained_weights=None)
+        net = MetaFormerFPN(num_classes=nc, pretrained="ImageNet", pretrained_weights=None)
         net.load_state_dict(sd)
         net, hw, bs = net.cuda().eval(), (1088, 1344), 4      # full-res FPN: batch 32 asked for 39 GB more than the H100 had
     else:
@@ -74,8 +76,9 @@ def main():
         s_only = json.loads(Path(args.calib).read_text())["unidepth_v2_vitl"]["calibration"]["s_only"]
         net, hw, bs = UniDepthV2.from_pretrained(args.unidepth).cuda().eval(), None, 1
 
-    for d in sorted(p for p in A.iterdir() if (p / "frames.npy").exists()):
-        store = FrameStore(d.name)
+    root = Path(args.root)
+    for d in sorted(p for p in root.iterdir() if (p / "frames.npy").exists()):
+        store = FrameStore(d.name, root=root)
         N = len(store)
         dl = torch.utils.data.DataLoader(Frames(store, hw), batch_size=bs, num_workers=16)
         if args.what == "feats":
