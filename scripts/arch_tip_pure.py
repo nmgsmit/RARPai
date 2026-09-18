@@ -292,7 +292,7 @@ def run(args):
                 P, S = [], []
                 with torch.no_grad():
                     for i in range(0, len(arr), 256):
-                        x = torch.from_numpy(np.asarray(arr[i:i + 256])).to(dev).float()
+                        x = (arr[i:i + 256] if torch.is_tensor(arr) else torch.from_numpy(np.asarray(arr[i:i + 256]))).to(dev).float()
                         p, s = head((x - mu) / sd)
                         P.append(p[:, 0].cpu().numpy())
                         S.append(s)
