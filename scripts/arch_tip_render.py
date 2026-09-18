@@ -237,7 +237,10 @@ def render_head(video, d, head_dir, variant, out_path):
     L, R = np.median(np.stack([z["left"] for z in Z]), 0), np.median(np.stack([z["right"] for z in Z]), 0)
     pos = {int(f): k for k, f in enumerate(frames)}
     sm = {f: np.median(tip[[pos[g] for g in range(f - WIN, f + WIN + 1) if g in pos]], 0) for f in pos}
-    best_half = {r["frame"] for r in json.loads((BEST / "labels.json").read_text())["rows"] if r["video"] == video}
+    if "test_frames" in Z[0]:                       # the run's own test set (arch_tip_pure: per-video better half)
+        best_half = set(Z[0]["test_frames"].tolist())
+    else:
+        best_half = {r["frame"] for r in json.loads((BEST / "labels.json").read_text())["rows"] if r["video"] == video}
 
     names = list(ANNOTATORS)
     ann = {n: {int(k): v for k, v in load_frames(find_arches(ANNOTATORS[n], video))[0].items()} for n in names}
@@ -246,8 +249,23 @@ def render_head(video, d, head_dir, variant, out_path):
     cap = cv2.VideoCapture(str(DATA / video))
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
-    stems = sorted(p.stem for p in (d / "images").glob("*.jpg"))
-    N = len(stems)
+    if (d / "images").is_dir():                     # local per-frame files (arch_tip_render --extract + unidepth)
+        todo = sorted(int(p.stem.rsplit("_", 1)[1]) for p in (d / "images").glob("*.jpg"))
+
+        def load(i):
+            s = f"{short}_{i:05d}"
+            return (cv2.imread(str(d / "images" / f"{s}.jpg")),
+                    cv2.imread(str(d / "images" / f"{s}_mask.png"), cv2.IMREAD_GRAYSCALE) > 0,
+                    np.load(d / "depth" / f"{s}.npz")["depth"].astype(np.float32))
+    else:                                           # Snellius: packed frames + depth.npy of arch_tip_all
+        from arch_tip_data import A, FrameStore
+        fs, zs = FrameStore(short), np.load(A / short / "depth.npy", mmap_mode="r")
+        todo = [int(f) for f in fs.frames]
+
+        def load(i):
+            k = fs.pos[i]
+            return fs.jpg(k), fs.mask(k), np.asarray(zs[k], np.float32)
+    N = len(todo)
 
     pts_all = np.concatenate([np.array([arch_points(e)[1] - off[n] for n in names for e in ann[n].values()]), tip])
     PT = int(np.clip(-pts_all[:, 1].min() + 60, 0, 1000))
@@ -263,17 +281,15 @@ def render_head(video, d, head_dir, variant, out_path):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     vw = cv2.VideoWriter(str(tmp), cv2.VideoWriter_fourcc(*"mp4v"), fps, (OW, OH))
     errs = {"raw all3": [], "smoothed all3": [], "raw best-half": [], "smoothed best-half": []}
-    for n_done, stem in enumerate(stems):
-        i = int(stem.rsplit("_", 1)[1])
+    for n_done, i in enumerate(todo):
         k = pos[i]
-        img = cv2.imread(str(d / "images" / f"{stem}.jpg"))
+        img, gui, depth = load(i)
         H, W = img.shape[:2]
-        depth = np.load(d / "depth" / f"{stem}.npz")["depth"].astype(np.float32)
         inv = 1 / np.clip(depth, 1, None)
         lo, hi = np.percentile(inv, [2, 98])
         col = cv2.resize(cv2.applyColorMap((np.clip((inv - lo) / (hi - lo + 1e-9), 0, 1) * 255).astype(np.uint8),
                                            cv2.COLORMAP_TURBO), (W, H), interpolation=cv2.INTER_NEAREST)
-        col[cv2.imread(str(d / "images" / f"{stem}_mask.png"), cv2.IMREAD_GRAYSCALE) > 0] = 90
+        col[gui] = 90
         x, y, _, _ = (a[0] for a in curve(head_arch(tip[k], L[k], R[k])[None]))
         spread = float(np.median(np.linalg.norm(T[:, k] - tip[k], axis=1)))
 
@@ -309,7 +325,7 @@ def render_head(video, d, head_dir, variant, out_path):
         frame = np.hstack(panels)
         head, foot = (np.zeros((STRIP, frame.shape[1], 3), np.uint8) for _ in range(2))
         line1 = (f"{short} (held-out)   frame {i}/{N - 1}   t {i / fps:6.2f}s   "
-                 f"annotated: {' '.join(atips) or 'none'}{'   [best-half test frame]' if i in best_half else ''}")
+                 f"annotated: {' '.join(atips) or 'none'}{'   [test frame]' if i in best_half else ''}")
         cv2.putText(head, line1, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
         cv2.putText(head, line2, (20, 102), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA)
         cv2.putText(foot, "cyan Nick | magenta Veerle | green Aron (dot = their tip) | white star = consensus tip | "
@@ -343,7 +359,7 @@ def main():
         extract(video, d / "images", args.workers)
     elif args.head:
         render_head(video, d, args.head, args.variant,
-                    ROOT / "outputs" / "arch_tip_cv" / f"{args.video}_head_{args.variant}.mp4")
+                    Path(args.head).parent / f"{args.video}_head_{args.variant}.mp4")
     else:
         render(video, d, ROOT / "outputs" / "arch_tip_depth" / f"{args.video}_fit.mp4")
 

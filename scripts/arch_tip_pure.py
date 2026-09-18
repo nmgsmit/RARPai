@@ -143,9 +143,7 @@ def feats(args):
             return len(self.ks)
 
         def __getitem__(self, i):
-            img = cv2.cvtColor(self.fs.jpg(self.ks[i]), cv2.COLOR_BGR2RGB)
-            img = cv2.resize(img, (640, 512), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
-            return torch.from_numpy(((img - MEAN) / STD).transpose(2, 0, 1).copy())
+            return torch.from_numpy(prep(self.fs.jpg(self.ks[i])))
 
     jobs = [("train", s, FrameStore(s, root=PURE), None) for s in sorted(p.name for p in PURE.iterdir() if (p / "frames.npy").exists())]
     for short, (fr, _, _) in test_frames().items():
@@ -227,19 +225,105 @@ def urethra_tip(seg_logits):
     return np.array([xs[band].mean() * 4 + 2, ys.min() * 4 + 2], np.float32)
 
 
-def run(args):
+def train_data():
+    """Training videos, (N,3,2) tip/left/right targets and (N,7,32,40) soft anatomy targets, video by video."""
+    shorts = sorted(p.name for p in PURE.iterdir() if (p / "frames.npy").exists())
+    Y = {s: json.loads((PURE / s / "labels.json").read_text())["labels"] for s in shorts}
+    fr = {s: FrameStore(s, root=PURE).frames for s in shorts}
+    YT = np.concatenate([np.array([[Y[s][str(f)][k] for k in ("tip", "left", "right")] for f in fr[s]], np.float32)
+                         for s in shorts])
+    return shorts, YT, np.concatenate([seg_targets(s, len(fr[s])) for s in shorts])
+
+
+def norm_stats(X):
+    """Per-channel mean / std of an (N, C, H, W) float16 GPU tensor, in chunks."""
+    m = sq = 0
+    for c in X.split(256):
+        c = c.float()
+        m, sq = m + c.sum((0, 2, 3)), sq + (c * c).sum((0, 2, 3))
+    n = X.shape[0] * GH * GW
+    mu = (m / n).view(1, -1, 1, 1)
+    return mu, (sq / n - mu.flatten() ** 2).clamp_min(1e-6).sqrt().view(1, -1, 1, 1)
+
+
+def fit(X, yt, st, mu, sd, method, seed, steps, bs, dev):
+    """tip: vote loss only; tip+seg: vote + anatomy loss; seg->tip: anatomy loss only."""
     import torch
     import torch.nn.functional as F
+    torch.manual_seed(seed)
+    head = make_head(X.shape[1]).to(dev)
+    opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=1e-2)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, 1e-3, total_steps=steps)
+    wv, ws = (1.0, 0.0) if method == "tip" else (1.0, 1.0) if method == "tip+seg" else (0.0, 1.0)
+    pw = torch.tensor([1.0, 0.25, 0.25], device=dev)
+    head.train()
+    for _ in range(steps):
+        b = torch.randint(0, len(X), (bs,), device=dev)
+        pts, seg = head((X[b].float() - mu) / sd)
+        lv = (F.smooth_l1_loss(pts / 100, yt[b] / 100, beta=0.2, reduction="none").sum(-1) * pw).sum(-1).mean()
+        ls = -(st[b].float() * F.log_softmax(seg, 1)).sum(1).mean()
+        loss = wv * lv + ws * ls
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        sched.step()
+    return head.eval()
+
+
+def infer_with(head, mu, sd, arr, dev, bs=256):
+    """(N,3,2) tip/left/right px and (N,7,32,40) anatomy logits; arr = numpy/memmap or GPU tensor of features."""
+    import torch
+    P, S = [], []
+    with torch.no_grad():
+        for i in range(0, len(arr), bs):
+            x = (arr[i:i + bs] if torch.is_tensor(arr) else torch.from_numpy(np.asarray(arr[i:i + bs]))).to(dev).float()
+            p, s = head((x - mu) / sd)
+            P.append(p.cpu().numpy())
+            S.append(s)
+    return np.concatenate(P), torch.cat(S)
+
+
+def prep(bgr):
+    """GUI-blacked 1340x1072 BGR crop -> normalised 3x512x640 float32 (every backbone's feed)."""
+    img = cv2.resize(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), (640, 512), interpolation=cv2.INTER_AREA).astype(np.float32) / 255
+    return ((img - MEAN) / STD).transpose(2, 0, 1).copy()
+
+
+def predict(args):
+    """Every frame of one test video: train the method on the Pure Arch videos with each seed, predict, save per seed
+    <out>/pred/<method>_<backbone>/s<seed>/<short>.npz (frames, tip, left, right, test_frames) for arch_tip_render."""
+    import torch
+    dev, bb, short = "cuda", args.backbones[0], args.video
+    shorts, YT, ST = train_data()
+    X = torch.from_numpy(np.concatenate([np.load(PURE / "feats" / bb / "train" / f"{s}.npy") for s in shorts])).to(dev)
+    mu, sd = norm_stats(X)
+    yt, st = torch.from_numpy(YT).to(dev), torch.from_numpy(ST).to(dev)
+    f, _ = backbone(bb, dev)
+    fs = FrameStore(short)
+    XA = []
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        for i in range(0, len(fs), 32):
+            x = torch.from_numpy(np.stack([prep(fs.jpg(k)) for k in range(i, min(i + 32, len(fs)))])).to(dev)
+            XA.append(f(x).half())
+    XA = torch.cat(XA)
+    tf, tips, _ = test_frames()[short]
+    tk = [fs.pos[t] for t in tf]
+    for seed in range(args.seeds):
+        head = fit(X, yt, st, mu, sd, args.method, seed, args.steps, args.bs, dev)
+        P, _ = infer_with(head, mu, sd, XA, dev)
+        out = ROOT / "outputs" / "arch_tip_pure" / "pred" / f"{args.method}_{bb}" / f"s{seed}"
+        out.mkdir(parents=True, exist_ok=True)
+        np.savez(out / f"{short}.npz", frames=fs.frames, tip=P[:, 0], left=P[:, 1], right=P[:, 2], test_frames=np.array(tf))
+        print(f"{args.method} {bb} seed {seed}: {len(fs)} frames, test error {np.linalg.norm(P[tk, 0] - tips, axis=1).mean():.1f} px",
+              flush=True)
+
+
+def run(args):
+    import torch
     dev = "cuda"
-    train_shorts = sorted(p.name for p in PURE.iterdir() if (p / "frames.npy").exists())
-    Y = {s: json.loads((PURE / s / "labels.json").read_text())["labels"] for s in train_shorts}
-    fr = {s: FrameStore(s, root=PURE).frames for s in train_shorts}
-    YT = np.concatenate([np.array([[Y[s][str(f)][k] for k in ("tip", "left", "right")] for f in fr[s]], np.float32)
-                         for s in train_shorts])
-    ST = np.concatenate([seg_targets(s, len(fr[s])) for s in train_shorts])
+    train_shorts, YT, ST = train_data()
     tests = test_frames()
     prior = YT[:, 0].mean(0)
-    pw = torch.tensor([1.0, 0.25, 0.25], device=dev)
     rows = []
 
     def score(name, bb, seed, preds):
@@ -261,42 +345,14 @@ def run(args):
     for bb in args.backbones:
         X = torch.from_numpy(np.concatenate([np.load(PURE / "feats" / bb / "train" / f"{s}.npy") for s in train_shorts])).to(dev)
         XT = {s: np.load(PURE / "feats" / bb / "test" / f"{s}.npy", mmap_mode="r") for s in TEST}
-        m = sq = 0
-        for c in X.split(256):
-            c = c.float()
-            m, sq = m + c.sum((0, 2, 3)), sq + (c * c).sum((0, 2, 3))
-        n = X.shape[0] * GH * GW
-        mu = (m / n).view(1, -1, 1, 1)
-        sd = (sq / n - mu.flatten() ** 2).clamp_min(1e-6).sqrt().view(1, -1, 1, 1)
+        mu, sd = norm_stats(X)
         yt, st = torch.from_numpy(YT).to(dev), torch.from_numpy(ST).to(dev)
         for method, seed in itertools.product(("tip", "tip+seg", "seg->tip"), range(args.seeds)):
-            torch.manual_seed(seed)
-            head = make_head(X.shape[1]).to(dev)
-            opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=1e-2)
-            sched = torch.optim.lr_scheduler.OneCycleLR(opt, 1e-3, total_steps=args.steps)
-            wv, ws = (1.0, 0.0) if method == "tip" else (1.0, 1.0) if method == "tip+seg" else (0.0, 1.0)
-            head.train()
-            for _ in range(args.steps):
-                b = torch.randint(0, len(X), (args.bs,), device=dev)
-                pts, seg = head((X[b].float() - mu) / sd)
-                lv = (F.smooth_l1_loss(pts / 100, yt[b] / 100, beta=0.2, reduction="none").sum(-1) * pw).sum(-1).mean()
-                ls = -(st[b].float() * F.log_softmax(seg, 1)).sum(1).mean()
-                loss = wv * lv + ws * ls
-                opt.zero_grad()
-                loss.backward()
-                opt.step()
-                sched.step()
-            head.eval()
+            head = fit(X, yt, st, mu, sd, method, seed, args.steps, args.bs, dev)
 
             def infer(arr):
-                P, S = [], []
-                with torch.no_grad():
-                    for i in range(0, len(arr), 256):
-                        x = (arr[i:i + 256] if torch.is_tensor(arr) else torch.from_numpy(np.asarray(arr[i:i + 256]))).to(dev).float()
-                        p, s = head((x - mu) / sd)
-                        P.append(p[:, 0].cpu().numpy())
-                        S.append(s)
-                return np.concatenate(P), torch.cat(S)
+                P, S = infer_with(head, mu, sd, arr, dev)
+                return P[:, 0], S
 
             if method == "seg->tip":
                 _, S = infer(X)                                   # train predictions -> median offset to the arch tip
@@ -333,7 +389,9 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["pack", "feats", "run"])
+    ap.add_argument("cmd", choices=["pack", "feats", "run", "predict"])
+    ap.add_argument("--video", default="cada5bef", help="predict: test video short id")
+    ap.add_argument("--method", default="tip", choices=["tip", "tip+seg"], help="predict: method")
     ap.add_argument("--src", default="E:/Geknipte Videos batch 2/20archesfortesting/Pure Arch")
     ap.add_argument("--out", default=str(PURE))
     ap.add_argument("--k", type=int, default=500)
@@ -346,6 +404,8 @@ def main():
         pack(args.src, Path(args.out), args.k)
     elif args.cmd == "feats":
         feats(args)
+    elif args.cmd == "predict":
+        predict(args)
     else:
         run(args)
 
