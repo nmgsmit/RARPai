@@ -287,7 +287,8 @@ def fit(X, yt, st, mu, sd, method, seed, steps, bs, dev):
     head = make_head(X.shape[1], pts_t.shape[1]).to(dev)
     opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=1e-2)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, 1e-3, total_steps=steps)
-    wv, ws = (1.0, 0.0) if method == "tip" else (1.0, 1.0) if method == "tip+seg" else (0.0, 1.0)
+    wv = 0.0 if method == "seg->tip" else 1.0                  # point loss for every point method
+    ws = 1.0 if method in ("tip+seg", "seg->tip") else 0.0     # anatomy loss only where asked
     pw = torch.tensor(wts, device=dev, dtype=torch.float32)
     head.train()
     for _ in range(steps):
