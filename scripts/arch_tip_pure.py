@@ -352,6 +352,83 @@ def predict(args):
               flush=True)
 
 
+# ------------------------------------------------------------------------------------------------ ablation (GPU)
+def depth3(z):
+    """(268,335) mm -> (3,32,40): log-depth minus its median + normalised log-depth x/y gradients (as round 2)."""
+    L = cv2.GaussianBlur(np.log(np.clip(np.asarray(z, np.float32), 1, None)), (0, 0), 2)
+    gx, gy = cv2.Sobel(L, cv2.CV_32F, 1, 0) / 8, cv2.Sobel(L, cv2.CV_32F, 0, 1) / 8
+    m = np.median(np.hypot(gx, gy)) + 1e-6
+    ch = [L - np.median(L), np.clip(gx / m, -20, 20), np.clip(gy / m, -20, 20)]   # clip: near-flat frames blow up 1/m
+    return np.stack([cv2.resize(c, (GW, GH), interpolation=cv2.INTER_AREA) for c in ch])
+
+
+def ablate(args):
+    """Extra INPUT channels on top of the frozen backbone features, same targets / seeds / test set as `run`:
+       feats | +depth (UniDepth, 3 ch) | +anatomy (7-class probabilities, predicted) | +depth+anatomy.
+    Test videos have no masks, so anatomy maps are always PREDICTED: training frames get maps from a model trained on
+    the other half of the training videos (2-fold by video), test frames from a model trained on all 14."""
+    import torch
+    dev, bb = "cuda", args.backbones[0]
+    shorts, YT, ST = train_data()
+    n_per = [len(FrameStore(s, root=PURE)) for s in shorts]
+    vid = np.repeat(np.arange(len(shorts)), n_per)
+    tests = test_frames()
+    X = torch.from_numpy(np.concatenate([np.load(PURE / "feats" / bb / "train" / f"{s}.npy") for s in shorts])).to(dev)
+    XT = {s: np.asarray(np.load(PURE / "feats" / bb / "test" / f"{s}.npy", mmap_mode="r")) for s in TEST}
+    mu, sd = norm_stats(X)
+    yt, st = torch.from_numpy(YT).to(dev), torch.from_numpy(ST).to(dev)
+
+    dep = np.concatenate([np.stack([depth3(z) for z in np.load(PURE / s / "depth.npy", mmap_mode="r")]) for s in shorts])
+    depT = {}
+    for s in TEST:
+        fs, zs = FrameStore(s), np.load(A / s / "depth.npy", mmap_mode="r")
+        depT[s] = np.stack([depth3(zs[fs.pos[f]]) for f in tests[s][0]])
+    print("depth channels ready", dep.shape, flush=True)
+
+    ana = np.zeros((len(X), NCLS, GH, GW), np.float16)
+    for fold in (0, 1):
+        held = np.isin(vid, np.arange(fold, len(shorts), 2))
+        tr, te = torch.from_numpy(np.nonzero(~held)[0]).to(dev), np.nonzero(held)[0]
+        head = fit(X[tr], yt[tr], st[tr], mu, sd, "seg->tip", 0, args.steps, args.bs, dev)
+        ana[te] = infer_with(head, mu, sd, X[torch.from_numpy(te).to(dev)], dev)[1].softmax(1).half().cpu().numpy()
+        del head
+    head = fit(X, yt, st, mu, sd, "seg->tip", 0, args.steps, args.bs, dev)
+    anaT = {s: infer_with(head, mu, sd, XT[s], dev)[1].softmax(1).half().cpu().numpy() for s in TEST}
+    agree = float((ana.argmax(1) == ST.argmax(1)).mean())
+    print(f"anatomy maps ready: cross-fitted train maps match the mask argmax in {agree:.1%} of grid cells", flush=True)
+
+    configs = {"feats": (), "+depth": ("depth",), "+anatomy": ("anatomy",), "+depth+anatomy": ("depth", "anatomy")}
+    rows = []
+    for name, parts in configs.items():
+        ext = [{"depth": dep, "anatomy": ana}[p].astype(np.float16) for p in parts]
+        Xc = torch.cat([X] + [torch.from_numpy(e).to(dev) for e in ext], 1) if ext else X
+        XTc = {s: np.concatenate([XT[s]] + [{"depth": depT, "anatomy": anaT}[p][s].astype(np.float16) for p in parts], 1)
+               for s in TEST}
+        muc, sdc = norm_stats(Xc)
+        for seed in range(args.seeds):
+            head = fit(Xc, yt, st, muc, sdc, args.method, seed, args.steps, args.bs, dev)
+            per = {s: float(np.linalg.norm(infer_with(head, muc, sdc, XTc[s], dev)[0][:, 0] - tests[s][1], axis=1).mean())
+                   for s in TEST}
+            pooled = np.concatenate([np.linalg.norm(infer_with(head, muc, sdc, XTc[s], dev)[0][:, 0] - tests[s][1], axis=1)
+                                     for s in TEST])
+            rows.append(dict(config=name, seed=seed, macro=float(np.mean(list(per.values()))), median=float(np.median(pooled)),
+                             within50=float((pooled <= 50).mean()), per_video=per))
+            print(f"{name:<16} seed {seed}: macro {rows[-1]['macro']:6.1f}  " + " ".join(f"{s} {v:.0f}" for s, v in per.items()),
+                  flush=True)
+        if ext:
+            del Xc
+    out = ROOT / "outputs" / "arch_tip_pure"
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"ablation_{args.method}_{bb}.json").write_text(json.dumps(dict(method=args.method, backbone=bb, rows=rows), indent=1))
+    print(f"\n=== input ablation: {bb}, target {args.method}, {args.seeds} seeds; tip error vs consensus, 7 test videos ===")
+    print(f"{'inputs':<17}{'macro':>14}{'median':>8}{'<=50':>6}  " + " ".join(f"{s:>8}" for s in TEST))
+    for name in configs:
+        rs = [r for r in rows if r["config"] == name]
+        mac = [r["macro"] for r in rs]
+        print(f"{name:<17}{np.mean(mac):7.1f} +-{np.std(mac):4.1f}{np.mean([r['median'] for r in rs]):8.1f}"
+              f"{np.mean([r['within50'] for r in rs]):6.0%}  " + " ".join(f"{np.mean([r['per_video'][s] for r in rs]):8.1f}" for s in TEST))
+
+
 def run(args):
     import torch
     dev = "cuda"
@@ -423,7 +500,7 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["pack", "feats", "run", "predict"])
+    ap.add_argument("cmd", choices=["pack", "feats", "run", "predict", "ablate"])
     ap.add_argument("--video", default="cada5bef", help="predict: test video short id")
     ap.add_argument("--method", default="tip", choices=list(POINTS) + ["tip+seg"], help="predict: method")
     ap.add_argument("--methods", nargs="+", default=["tip", "tip+mid", "arc5", "arc7"],
@@ -442,6 +519,8 @@ def main():
         feats(args)
     elif args.cmd == "predict":
         predict(args)
+    elif args.cmd == "ablate":
+        ablate(args)
     else:
         run(args)
 
