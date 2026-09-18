@@ -54,8 +54,12 @@ class FrameStore:
 
     def mask(self, k):
         """bool, True = GUI."""
+        return self.labels(k) > 0
+
+    def labels(self, k):
+        """The stored PNG as uint8 ids (GUI mask: 0/255; arch_tip_pure: anatomy class ids)."""
         _, _, _, o, n = self.index[k]
-        return cv2.imdecode(np.asarray(self.bin[o:o + n]), cv2.IMREAD_GRAYSCALE) > 0
+        return cv2.imdecode(np.asarray(self.bin[o:o + n]), cv2.IMREAD_GRAYSCALE)
 
 
 def append(fh, index, frame, jpg, png):
