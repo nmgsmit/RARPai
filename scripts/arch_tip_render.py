@@ -249,7 +249,9 @@ def render_head(video, d, head_dir, variant, out_path):
     cap = cv2.VideoCapture(str(DATA / video))
     fps = cap.get(cv2.CAP_PROP_FPS)
     cap.release()
-    if (d / "images").is_dir():                     # local per-frame files (arch_tip_render --extract + unidepth)
+    # local per-frame files (arch_tip_render --extract + unidepth); a folder with JPGs but no masks (e.g. the upload to
+    # Snellius for the UniDepth job) is not enough -> packed frames instead
+    if (d / "images").is_dir() and next((d / "images").glob("*_mask.png"), None) is not None:
         todo = sorted(int(p.stem.rsplit("_", 1)[1]) for p in (d / "images").glob("*.jpg"))
 
         def load(i):
