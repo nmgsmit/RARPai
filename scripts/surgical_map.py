@@ -8,6 +8,11 @@ that 3D point projects (red; an arrow at the edge when it is off-frame). Green =
 in that frame; grey dots in 3D = those consensus tips lifted onto their frame's depth (if the map is
 consistent, they cluster). "Download" saves the picked point + its projection into every keyframe.
 
+Foreground is masked (Nick 2026-09-21): ureth_fn segments urethra / prostate / catheter / non-anatomical (robot
+arm, instruments); all of it, grown by --dilate px, is dropped from the cloud, so the map is the static
+BACKGROUND, where the urethra leaves the pelvic floor. --black-input also blacks it in DA3's input, so the moving
+arm cannot pull the poses either (black may read as a flat surface, see CLAUDE.md: compare both).
+
 Scale is DA3's relative unit, NOT mm (localisation only). The scene must be roughly static across the window:
 keep --start/--end to one phase of the dissection.
 
@@ -43,6 +48,19 @@ def as44(e):
     return np.vstack([e, [0, 0, 0, 1]]) if e.shape == (3, 4) else e
 
 
+def segment(imgs, checkpoint):
+    """RGB uint8 list -> ureth_fn class maps at full res (0 bg, 1 urethra, 2 prostate, 3 catheter, 4 non-anat)."""
+    import torch
+    from PIL import Image
+    from overlay_dir import MetaFormerFPN, predict
+    sd = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    m = MetaFormerFPN(num_classes=sd["FPN.segmentation_head.0.bias"].shape[0], pretrained="ImageNet",
+                      pretrained_weights=None)
+    m.load_state_dict(sd)
+    m.eval()
+    return [predict(m, Image.fromarray(im), (512, 512), "cpu") for im in imgs]   # 512 square = sul_slide_video
+
+
 def build(a):
     import torch
     from arch_tip_data import A, FrameStore
@@ -56,6 +74,12 @@ def build(a):
     frames = [int(fs.frames[k]) for k in ks]
     imgs = [cv2.cvtColor(fs.jpg(k), cv2.COLOR_BGR2RGB) for k in ks]
     H0, W0 = imgs[0].shape[:2]
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * a.dilate + 1,) * 2)
+    fg = [cv2.dilate((s > 0).astype(np.uint8), ker) > 0 for s in segment(imgs, a.checkpoint)]
+    print("foreground (dilated) per frame: median %.0f%%" % (100 * np.median([f.mean() for f in fg])), flush=True)
+    orig = imgs
+    if a.black_input:
+        imgs = [np.where(f[..., None], 0, im).astype(np.uint8) for f, im in zip(fg, imgs)]
     print(f"{a.short}: {len(ks)} keyframes {frames[0]}..{frames[-1]}", flush=True)
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -64,8 +88,8 @@ def build(a):
         p = m.inference(imgs, process_res=a.res)
     D, C = np.asarray(p.depth, np.float32), np.asarray(p.conf, np.float32)
     Ks, W2C = np.asarray(p.intrinsics, np.float64), np.stack([as44(e) for e in p.extrinsics])
-    RGB = np.asarray(p.processed_images)
     n, h, w = D.shape
+    RGB = np.stack([cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA) for im in orig])  # unblacked colours
     sx, sy = w / W0, h / H0                              # processed = resize of the 1340x1072 crop
 
     keep = C >= np.percentile(C, a.conf_pct)             # DA3's own GLB export default: drop the lowest 40%
@@ -74,20 +98,21 @@ def build(a):
     pts, col, fid, tips3d = [], [], [], []
     for i, k in enumerate(ks):
         c2w = np.linalg.inv(W2C[i])
-        gui = cv2.resize(fs.mask(k).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        gui = cv2.resize((fs.mask(k) | fg[i]).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        RGB[i][gui] //= 3                                # thumbnails show what was masked, dimmed
         ok = keep[i] & ~gui & (D[i] > 0)
         X = backproject(D[i], Ks[i], c2w)
         pts.append(X[ok]); col.append(RGB[i][ok]); fid.append(np.full(ok.sum(), i, np.uint8))
         r = rows.get(frames[i])
         if r and r.get("tip"):
             u, v = r["tip"][0] * sx, r["tip"][1] * sy
-            if 0 <= u < w and 0 <= v < h and D[i, int(v), int(u)] > 0:
+            if 0 <= u < w and 0 <= v < h and D[i, int(v), int(u)] > 0:   # tip may sit on masked tissue: still lifted
                 tips3d.append(X[int(v), int(u)])
     pts, col, fid = np.concatenate(pts), np.concatenate(col), np.concatenate(fid)
     sel = np.random.default_rng(0).choice(len(pts), min(len(pts), a.max_points), replace=False)
     pts, col, fid = pts[sel], col[sel], fid[sel]         # ponytail: random subsample; voxel grid if it looks noisy
 
-    out = Path(a.out or f"outputs/surgical_map/{a.short}")
+    out = Path(a.out_root) / a.short
     out.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out / "map.npz", pts=pts, col=col, fid=fid, K=Ks, w2c=W2C, frames=frames,
                         depth=D.astype(np.float16), tips3d=np.array(tips3d).reshape(-1, 3), scale=[sx, sy])
@@ -217,7 +242,10 @@ if __name__ == "__main__":
     ap.add_argument("--conf-pct", type=float, default=40)
     ap.add_argument("--margin", type=int, default=12, help="px trimmed at the processed-frame border")
     ap.add_argument("--max-points", type=int, default=400_000)
-    ap.add_argument("--out")
+    ap.add_argument("--out-root", default="outputs/surgical_map")
+    ap.add_argument("--checkpoint", default="outputs/ureth_fn/best.pth")
+    ap.add_argument("--dilate", type=int, default=30, help="px (1340x1072 crop) grown around every foreground mask")
+    ap.add_argument("--black-input", action="store_true", help="also black the foreground in DA3's input")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
     self_test() if a.self_test else build(a)
