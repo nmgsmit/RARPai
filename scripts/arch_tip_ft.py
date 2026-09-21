@@ -25,7 +25,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from arch_tip_data import FrameStore  # noqa: E402
-from arch_tip_pure import GH, GW, PURE, ROOT, TEST, make_head, prep, targets, test_frames, train_data  # noqa: E402
+from arch_tip_pure import GH, GW, OUT, PURE, ROOT, TEST, make_head, prep, targets, test_frames, train_data  # noqa: E402
 
 CUT = 20
 TOK = PURE / "tokens"
@@ -66,6 +66,9 @@ def cache(args):
     for split, short, fs, ks in jobs:
         ks = list(range(len(fs))) if ks is None else ks
         path = TOK / split / f"{short}.npy"
+        if path.exists():                                     # e.g. the shared test tokens
+            print(f"{split} {short}: exists, skipped", flush=True)
+            continue
         path.parent.mkdir(parents=True, exist_ok=True)
         arr = np.lib.format.open_memmap(path, "w+", np.float16, (len(ks), 1 + GH * GW, 1024))
         for i in range(0, len(ks), 16):
@@ -182,7 +185,7 @@ def ft(args):
                             spread_vs_error_spearman=spearman(S, E), error_low_spread=float(E[lo].mean()),
                             error_high_spread=float(E[~lo].mean()))
 
-    out_dir = ROOT / "outputs" / "arch_tip_pure"
+    out_dir = OUT
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / f"ft_{args.method}.json").write_text(json.dumps(dict(method=args.method, cut=CUT, lr_blocks=args.lr_blocks,
                                                                      steps=args.steps, rows=rows, ensemble=ens), indent=1))

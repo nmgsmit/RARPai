@@ -37,7 +37,8 @@ from arch_tip_prep import oriented  # noqa: E402
 from compare_arch_multi import apex_of  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-PURE = ROOT.parent / "data" / "processed" / "arch_tip_pure"
+PURE = Path(os.environ.get("ARCH_TIP_PURE", ROOT.parent / "data" / "processed" / "arch_tip_pure"))   # training set root
+OUT = ROOT / "outputs" / PURE.name          # results per training set (arch_tip_pure = the 14-video set)
 TEST = ("46867a8e", "4db28d2e", "749c8234", "acd22d98", "cada5bef", "RARP_062", "RARP_063")
 COLORS = {(255, 255, 0): 1, (255, 0, 255): 2, (0, 0, 255): 3, (0, 255, 0): 4, (128, 128, 128): 5, (255, 0, 0): 6}
 NCLS = 7
@@ -75,8 +76,12 @@ def pack(src, out, k):
         if short in TEST:
             print(f"{short}: test video, skipped")
             continue
-        arch = {int(f): e for f, e in json.loads((d / "arches.json").read_text())["frames"].items()}
-        both = sorted(set(arch) & {int(f[:7]) for f in os.listdir(d / "masks")})
+        a = d / "arches.json"
+        arch = {int(f): e for f, e in json.loads(a.read_text())["frames"].items()} if a.exists() else {}
+        both = sorted(set(arch) & {int(f[:7]) for f in os.listdir(d / "masks")}) if (d / "masks").is_dir() else []
+        if not both:
+            print(f"{short}: no frame with both an arch and a mask, skipped")
+            continue
         fr, index, labels, unknown = even(both, k), [], {}, []
         (out / short).mkdir(exist_ok=True)
         with open(out / short / "frames.bin", "wb") as fh:
@@ -157,6 +162,9 @@ def feats(args):
         for split, short, fs, ks in jobs:
             ks = list(range(len(fs))) if ks is None else ks
             path = PURE / "feats" / name / split / f"{short}.npy"
+            if path.exists():                             # e.g. the shared test features
+                print(f"{name} {split} {short}: exists, skipped", flush=True)
+                continue
             path.parent.mkdir(parents=True, exist_ok=True)
             arr = np.lib.format.open_memmap(path, "w+", np.float16, (len(ks), C, GH, GW))
             k = 0
@@ -350,7 +358,7 @@ def predict(args):
     for seed in range(args.seeds):
         head = fit(X, yt, st, mu, sd, args.method, seed, args.steps, args.bs, dev)
         P, _ = infer_with(head, mu, sd, XA, dev)
-        out = ROOT / "outputs" / "arch_tip_pure" / "pred" / f"{args.method}_{bb}" / f"s{seed}"
+        out = OUT / "pred" / f"{args.method}_{bb}" / f"s{seed}"
         out.mkdir(parents=True, exist_ok=True)
         ends = P[:, -2:] if P.shape[1] > 2 else np.stack([P[:, 0], P[:, 0]], 1)   # outermost points = arch ends
         np.savez(out / f"{short}.npz", frames=fs.frames, tip=P[:, 0], left=ends[:, 0], right=ends[:, 1], test_frames=np.array(tf))
@@ -423,7 +431,7 @@ def ablate(args):
                   flush=True)
         if ext:
             del Xc
-    out = ROOT / "outputs" / "arch_tip_pure"
+    out = OUT
     out.mkdir(parents=True, exist_ok=True)
     (out / f"ablation_{args.method}_{bb}.json").write_text(json.dumps(dict(method=args.method, backbone=bb, rows=rows), indent=1))
     print(f"\n=== input ablation: {bb}, target {args.method}, {args.seeds} seeds; tip error vs consensus, 7 test videos ===")
@@ -487,7 +495,7 @@ def run(args):
             score(method, bb, seed, preds)
         del X
 
-    out = ROOT / "outputs" / "arch_tip_pure"
+    out = OUT
     out.mkdir(parents=True, exist_ok=True)
     (out / "results.json").write_text(json.dumps(dict(train=train_shorts, test={s: len(tests[s][0]) for s in TEST},
                                                       rows=rows), indent=1))
