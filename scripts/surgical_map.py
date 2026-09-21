@@ -77,10 +77,11 @@ def seg_model(checkpoint):
 def tip_window(rows, n):
     """Start/end of the n-frame window whose annotated tips spread least (mean distance to their median)."""
     f = np.array(sorted(rows)); t = np.array([rows[x]["tip"] for x in f], float)
+    dens = len(f) / (f[-1] - f[0] + 1)                   # Pure Arch packs hold 500 sampled frames, not every frame
     best = None
     for s in f[::10]:
         m = (f >= s) & (f < s + n)
-        if m.sum() < n // 2:                             # at least half the window annotated
+        if m.sum() < dens * n / 2:                       # at least half the video's label density in the window
             continue
         spread = np.mean(np.linalg.norm(t[m] - np.median(t[m], 0), axis=1))   # mean: every jump counts
         best = min(best or (np.inf, 0), (spread, int(s)))
@@ -96,7 +97,7 @@ def first_sight(fs, seg, stride, frac, cls=3):
         if u > frac and prev is not None:
             return int(fs.frames[prev])
         prev = k if u > frac else None
-    raise SystemExit(f"class {cls} never seen")
+    return None
 
 
 def end_point(X, p, d, r):
@@ -125,25 +126,104 @@ def frame_axis(fr, K_dv, sx, sy, Kda, c2w, s, n=5):
     return out
 
 
+def consistency(D, Ks, W2C, valid, per=20000, seed=0):
+    """Per keyframe j: median |z - D_j| / D_j of every OTHER keyframe's valid points reprojected into j (on j's valid
+    pixels). Registration + depth agreement in one number; occlusion also counts, so it is a pessimistic bound."""
+    rng, n = np.random.default_rng(seed), len(D)
+    Xs = []
+    for i in range(n):
+        X = backproject(D[i], Ks[i], np.linalg.inv(W2C[i]))[valid[i]]
+        Xs.append(X[rng.choice(len(X), min(per, len(X)), replace=False)] if len(X) else X)
+    err = np.full(n, np.nan)
+    h, w = D.shape[1:]
+    for j in range(n):
+        P = np.concatenate([Xs[i] for i in range(n) if i != j])
+        c = P @ W2C[j][:3, :3].T + W2C[j][:3, 3]
+        c = c[c[:, 2] > 0]
+        u = np.floor(Ks[j][0, 0] * c[:, 0] / c[:, 2] + Ks[j][0, 2]).astype(int)
+        v = np.floor(Ks[j][1, 1] * c[:, 1] / c[:, 2] + Ks[j][1, 2]).astype(int)
+        m = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        u, v, z = u[m], v[m], c[m, 2]
+        ok = valid[j][v, u]
+        if ok.sum() > 100:
+            err[j] = float(np.median(np.abs(z[ok] - D[j][v[ok], u[ok]]) / D[j][v[ok], u[ok]]))
+    return err
+
+
+def raycast(uv, i, D, Ks, W2C, valid, zr, n_steps=800):
+    """Ray of camera i through pixel uv (may be OFF the frame) -> where it first goes behind the surface of each other
+    keyframe that sees it. -> (world point = median hit, number of frames that agreed)."""
+    K, c2w = Ks[i], np.linalg.inv(W2C[i])
+    ray = c2w[:3, :3] @ np.array([(uv[0] - K[0, 2]) / K[0, 0], (uv[1] - K[1, 2]) / K[1, 1], 1.0])
+    o, zs = c2w[:3, 3], np.geomspace(*zr, n_steps)
+    P = o + zs[:, None] * ray
+    h, w = D.shape[1:]
+    hits = []
+    for j in range(len(D)):
+        if j == i:
+            continue
+        c = P @ W2C[j][:3, :3].T + W2C[j][:3, 3]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            u = np.floor(Ks[j][0, 0] * c[:, 0] / c[:, 2] + Ks[j][0, 2])
+            v = np.floor(Ks[j][1, 1] * c[:, 1] / c[:, 2] + Ks[j][1, 2])
+        inb = (c[:, 2] > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        s = np.full(len(zs), np.nan)
+        ui, vi = u[inb].astype(int), v[inb].astype(int)
+        dj = np.where(valid[j][vi, ui], D[j][vi, ui], np.nan)
+        s[inb] = c[inb, 2] - dj                          # < 0 in front of j's surface, > 0 behind it
+        k = np.flatnonzero((s[:-1] < 0) & (s[1:] >= 0))
+        if len(k):
+            k = k[0]
+            hits.append(zs[k] + (zs[k + 1] - zs[k]) * -s[k] / (s[k + 1] - s[k]))
+    return (o + np.median(hits) * ray if len(hits) >= 2 else None), len(hits)
+
+
+def load_rows(root, short):
+    """{frame: {"tip": [x, y], ...}}: labels_all.json (the 10 consensus videos) or <root>/<short>/labels.json."""
+    if (root / "labels_all.json").exists():
+        return {r["frame"]: r for r in json.loads((root / "labels_all.json").read_text())["rows"] if r["short"] == short}
+    return {int(f): v for f, v in json.loads((root / short / "labels.json").read_text())["labels"].items()}
+
+
+def pick_frames(fs, lo, hi, n):
+    """n packed frames evenly spread over [lo, hi] (nearest packed frame; the packs may be sparse)."""
+    have = fs.frames[(fs.frames >= lo) & (fs.frames <= hi)]
+    if not len(have):
+        return []
+    return sorted({int(have[np.abs(have - t).argmin()]) for t in np.linspace(lo, hi, n)})
+
+
 def build(a):
     import torch
     from arch_tip_data import A, FrameStore
     from depth_anything_3.api import DepthAnything3
 
-    fs = FrameStore(a.short)
-    rows = {r["frame"]: r for r in json.loads((A / "labels_all.json").read_text())["rows"] if r["short"] == a.short}
+    root = Path(a.root) if a.root else A
+    fs = FrameStore(a.short, root)
+    rows = {f: r for f, r in load_rows(root, a.short).items() if r.get("tip")}
     seg = seg_model(a.checkpoint)
+    cut = None
+    if a.precut:                                         # cut = the catheter's first sight (urethra opened)
+        cut = first_sight(fs, seg, a.sight_stride, a.sight_frac)
+        rows = {f: r for f, r in rows.items() if cut is None or f < cut}
+        print(f"cut (catheter first seen): {cut}; pre-cut annotated frames: {len(rows)}", flush=True)
+        if len(rows) < 3:
+            raise SystemExit("too few annotated frames before the cut")
     lo = a.start if a.start is not None else min(rows)
     hi = a.end if a.end is not None else max(rows)
     if a.freeze_first_sight:
         lo = first_sight(fs, seg, a.sight_stride, a.sight_frac)
+        if lo is None:
+            raise SystemExit("catheter never seen")
         hi = lo + (a.window or 400) - 1
         print(f"catheter first seen at frame {lo}", flush=True)
     elif a.window:
         lo, hi = tip_window(rows, a.window)
-    hi = min(hi, int(fs.frames[-1]))
-    ks = [fs.pos[f] for f in np.unique(np.linspace(lo, hi, a.n).round().astype(int)) if f in fs.pos]
-    frames = [int(fs.frames[k]) for k in ks]
+    hi = min(hi, int(fs.frames[-1]), cut - 1 if cut else 10 ** 9)
+    frames = pick_frames(fs, lo, hi, a.n)
+    ctx = pick_frames(fs, max(int(fs.frames[0]), lo - a.context_span), lo - 1, a.context) if a.context else []
+    frames = sorted(set(frames) | set(ctx))
+    ks = [fs.pos[f] for f in frames]
     imgs = [cv2.cvtColor(fs.jpg(k), cv2.COLOR_BGR2RGB) for k in ks]
     H0, W0 = imgs[0].shape[:2]
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * a.dilate + 1,) * 2)
@@ -153,36 +233,91 @@ def build(a):
     segs = [seg(im) for im in imgs]
     fg = [cv2.dilate(np.isin(sg, fz if a.freeze_first_sight and i == 0 else cls).astype(np.uint8), ker) > 0
           for i, sg in enumerate(segs)]
-    from urethra_cylinder import analyse
-    K_dv = (0.82 * W0, 1.02 * H0, 0.5 * W0, 0.5 * H0)   # what the ruler calibration and arch_cylinder_compare use
-    uni = np.load(A / a.short / "depth.npy", mmap_mode="r")
     print("foreground (dilated) per frame: median %.0f%%" % (100 * np.median([f.mean() for f in fg])), flush=True)
-    orig = imgs
-    if a.black_input:
-        imgs = [np.where(f[..., None], 0, im).astype(np.uint8) for f, im in zip(fg, imgs)]
-    print(f"{a.short}: {len(ks)} keyframes {frames[0]}..{frames[-1]}", flush=True)
+    imgs_in = [np.where(f[..., None], 0, im).astype(np.uint8) for f, im in zip(fg, imgs)] if a.black_input else imgs
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     m = DepthAnything3.from_pretrained(a.model).to(dev).eval()
-    with torch.no_grad():
-        p = m.inference(imgs, process_res=a.res)
-    D, C = np.asarray(p.depth, np.float32), np.asarray(p.conf, np.float32)
-    Ks, W2C = np.asarray(p.intrinsics, np.float64), np.stack([as44(e) for e in p.extrinsics])
+
+    def run(sel):
+        with torch.no_grad():
+            p = m.inference([imgs_in[i] for i in sel], process_res=a.res)
+        D, C = np.asarray(p.depth, np.float32), np.asarray(p.conf, np.float32)
+        Ks, W2C = np.asarray(p.intrinsics, np.float64), np.stack([as44(e) for e in p.extrinsics])
+        h, w = D.shape[1:]
+        keep = C >= np.percentile(C, a.conf_pct)         # DA3's own GLB export default: drop the lowest 40%
+        b = a.margin                                     # frame border = least constrained depth (sul_reveal)
+        keep[:, :b], keep[:, -b:], keep[:, :, :b], keep[:, :, -b:] = False, False, False, False
+        gui = np.stack([cv2.resize((fs.mask(ks[i]) | fg[i]).astype(np.uint8), (w, h),
+                                   interpolation=cv2.INTER_NEAREST) > 0 for i in sel])
+        valid = keep & ~gui & (D > 0)
+        return D, Ks, W2C, gui, valid, consistency(D, Ks, W2C, valid)
+
+    sel = list(range(len(ks)))
+    print(f"{a.short}: {len(ks)} keyframes ({len(ctx)} context before {lo}) {frames[0]}..{frames[-1]}", flush=True)
+    D, Ks, W2C, gui, valid, err = run(sel)
+    bad = [i for i, e in zip(sel, err) if not e <= a.max_err]
+    print(f"consistency (median |dz|/z vs the other keyframes): {np.nanmedian(err):.3f}; "
+          f"above {a.max_err}: frames {[frames[i] for i in bad]}", flush=True)
+    if bad and len(sel) - len(bad) >= 8:                 # drop the frames that do not fit and solve again, once
+        sel = [i for i in sel if i not in bad]
+        D, Ks, W2C, gui, valid, err = run(sel)
+        print(f"re-solved without them: consistency {np.nanmedian(err):.3f}, max {np.nanmax(err):.3f}", flush=True)
+    ctx_set = set(ctx)
+    frames, ks, segs, imgs = [frames[i] for i in sel], [ks[i] for i in sel], [segs[i] for i in sel], [imgs[i] for i in sel]
+    is_ctx = np.array([f in ctx_set for f in frames])
     n, h, w = D.shape
-    RGB = np.stack([cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA) for im in orig])  # unblacked colours
+    RGB = np.stack([cv2.resize(im, (w, h), interpolation=cv2.INTER_AREA) for im in imgs])  # unblacked colours
     sx, sy = w / W0, h / H0                              # processed = resize of the 1340x1072 crop
 
-    keep = C >= np.percentile(C, a.conf_pct)             # DA3's own GLB export default: drop the lowest 40%
-    b = a.margin                                         # frame border = least constrained depth (sul_reveal)
-    keep[:, :b], keep[:, -b:], keep[:, :, :b], keep[:, :, -b:] = False, False, False, False
-    pts, col, fid, tips3d, axP, rs = [], [], [], [], [], []
+    # --- annotated tips in 3D: a ray through the tip pixel (off-frame too) into the OTHER keyframes' surfaces
+    zr = (0.2 * np.percentile(D[valid], 1), 5 * np.percentile(D[valid], 99))
+    tips3d, off, chk = [], [], []
+    for i, f in enumerate(frames):
+        if f not in rows:
+            continue
+        u, v = rows[f]["tip"][0] * sx, rows[f]["tip"][1] * sy
+        X, nh = raycast((u, v), i, D, Ks, W2C, valid, zr)
+        inside = 0 <= u < w and 0 <= v < h
+        if X is not None:
+            tips3d.append(X)
+            off.append(not inside)
+            if inside and valid[i, int(v), int(u)]:      # own depth at the tip = an independent check of the ray
+                z_own = D[i, int(v), int(u)]
+                chk.append(abs((W2C[i][:3, :3] @ X + W2C[i][:3, 3])[2] - z_own) / z_own)
+    t = np.array(tips3d).reshape(-1, 3)
+    off = np.array(off, bool)
+    scene = float(np.median(D[valid]))
+    tip_med = np.median(t, 0) if len(t) else None
+    q = dict(consistency=float(np.nanmedian(err)), consistency_max=float(np.nanmax(err)), keyframes=n,
+             context=int(is_ctx.sum()), cut=cut, tips=len(t), tips_offframe=int(off.sum()))
+    if len(t):
+        dist = np.linalg.norm(t - tip_med, axis=1) / scene
+        q.update(tip_spread=float(np.median(dist)),
+                 tip_spread_offframe=float(np.median(dist[off])) if off.any() else None,
+                 ray_vs_own_depth=float(np.median(chk)) if chk else None)
+        cam = np.array([np.linalg.inv(W2C[i])[:3, 3] for i in range(n)])
+        dcam = np.linalg.norm(cam - tip_med, axis=1)     # camera-to-tip distance: how zoomed out each keyframe is
+        if is_ctx.any() and (~is_ctx).any():
+            q["zoom_out_ctx_vs_ann"] = float(np.median(dcam[is_ctx]) / np.median(dcam[~is_ctx]))
+        pr = np.array([project(tip_med, Ks[i], W2C[i]) for i in range(n)])
+        seen = (pr[:, 2] > 0) & (pr[:, 0] >= 0) & (pr[:, 0] < w) & (pr[:, 1] >= 0) & (pr[:, 1] < h)
+        q["tip_in_view"] = dict(context=int((seen & is_ctx).sum()), annotated=int((seen & ~is_ctx).sum()))
+    print("quality:", json.dumps(q), flush=True)
+
+    pts, col, fid, axP, rs = [], [], [], [], []
+    uni_p = root / a.short / "depth.npy"
+    uni = np.load(uni_p, mmap_mode="r") if uni_p.exists() else None   # ponytail: no UniDepth pack -> no cylinder
+    if uni is not None:
+        from urethra_cylinder import analyse
+        K_dv = (0.82 * W0, 1.02 * H0, 0.5 * W0, 0.5 * H0)   # what the ruler calibration and arch_cylinder_compare use
     for i, k in enumerate(ks):
         c2w = np.linalg.inv(W2C[i])
-        gui = cv2.resize((fs.mask(k) | fg[i]).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
-        RGB[i][gui] //= 3                                # thumbnails show what was masked, dimmed
-        ok = keep[i] & ~gui & (D[i] > 0)
+        RGB[i][gui[i]] //= 3                             # thumbnails show what was masked, dimmed
         X = backproject(D[i], Ks[i], c2w)
-        pts.append(X[ok]); col.append(RGB[i][ok]); fid.append(np.full(ok.sum(), i, np.uint8))
+        pts.append(X[valid[i]]); col.append(RGB[i][valid[i]]); fid.append(np.full(valid[i].sum(), i, np.uint8))
+        if uni is None:
+            continue
         g0 = fs.mask(k)
         zmap = cv2.resize(uni[k].astype(np.float32), (W0, H0), interpolation=cv2.INTER_LINEAR)
         zmap[g0] = 0
@@ -197,11 +332,6 @@ def build(a):
                 s_i = float(np.median(D[i][um] / zs[um]))
                 axP += frame_axis(fr, K_dv, sx, sy, Ks[i], c2w, s_i)
                 rs.append(fr["r"] * s_i)
-        r = rows.get(frames[i])
-        if r and r.get("tip"):
-            u, v = r["tip"][0] * sx, r["tip"][1] * sy
-            if 0 <= u < w and 0 <= v < h and D[i, int(v), int(u)] > 0:   # tip may sit on masked tissue: still lifted
-                tips3d.append(X[int(v), int(u)])
     pts, col, fid = np.concatenate(pts), np.concatenate(col), np.concatenate(fid)
     frozen = np.flatnonzero(fid == 0) if a.freeze_first_sight else np.array([], int)  # frozen organ: every point
     rest = np.setdiff1d(np.arange(len(pts)), frozen)
@@ -211,34 +341,31 @@ def build(a):
 
     out = Path(a.out_root) / a.short
     out.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out / "map.npz", pts=pts, col=col, fid=fid, K=Ks, w2c=W2C, frames=frames,
-                        depth=D.astype(np.float16), tips3d=np.array(tips3d).reshape(-1, 3), scale=[sx, sy])
-    t = np.array(tips3d).reshape(-1, 3)
-    if len(t):
-        spread = np.median(np.linalg.norm(t - np.median(t, 0), axis=1)) / np.median(D)
-        print(f"annotated tips lifted: {len(t)}, median spread around their median = {spread:.3f} x scene depth")
+    np.savez_compressed(out / "map.npz", pts=pts, col=col, fid=fid, K=Ks, w2c=W2C, frames=frames, is_ctx=is_ctx,
+                        depth=D.astype(np.float16), tips3d=t, scale=[sx, sy])
+    (out / "quality.json").write_text(json.dumps(q, indent=1))
 
     cyl = None
     if len(rs) >= 3:
         cp, cd, t0, t1 = axis_line(np.array(axP))
         cr = float(np.median(rs))
         print(f"cylinder: analyse() tube in {len(rs)}/{n} keyframes, r {cr:.4g}", flush=True)
-        end = end_point(np.median(t, 0), cp, cd, cr) if len(t) else None
+        end = end_point(tip_med, cp, cd, cr) if tip_med is not None else None
         te = None if end is None else float((end - cp) @ cd)
         cyl = dict(p=cp.tolist(), d=cd.tolist(), r=cr, t0=float(min(t0, te if te is not None else t0)),
                    t1=float(max(t1, te if te is not None else t1)), end=None if end is None else end.tolist())
         print(f"end: t {te} on axis span {t0:.4g}..{t1:.4g}", flush=True)
-    else:
+    elif uni is not None:
         print(f"no cylinder: analyse() tube in only {len(rs)} keyframes", flush=True)
 
     b64 = lambda x: base64.b64encode(np.ascontiguousarray(x).tobytes()).decode()
     thumbs = [base64.b64encode(cv2.imencode(".jpg", cv2.cvtColor(im, cv2.COLOR_RGB2BGR),
                                             [cv2.IMWRITE_JPEG_QUALITY, 80])[1]).decode() for im in RGB]
-    cons = [[rows[f]["tip"][0] * sx, rows[f]["tip"][1] * sy] if f in rows and rows[f].get("tip") else None
-            for f in frames]
+    cons = [[rows[f]["tip"][0] * sx, rows[f]["tip"][1] * sy] if f in rows else None for f in frames]
     data = dict(short=a.short, n=len(pts), w=w, h=h, pts=b64(pts.astype(np.float32)), col=b64(col.astype(np.uint8)),
                 fid=b64(fid), nf=n, K=Ks.tolist(), w2c=W2C.tolist(), frames=frames, thumbs=thumbs, cons=cons,
-                tips3d=t.tolist(), scale=[sx, sy], cyl=cyl)
+                tips3d=t.tolist(), scale=[sx, sy], cyl=cyl, ctx=is_ctx.tolist(), q=q,
+                tipMed=None if tip_med is None else tip_med.tolist())
     (out / "map.html").write_text(HTML.replace("__DATA__", json.dumps(data)), encoding="utf-8")
     print(f"wrote {out / 'map.html'} ({len(pts)} points)")
 
@@ -262,6 +389,16 @@ def self_test():
     assert np.allclose(A_[[0, -1]], [[0, -10, 100], [0, 10, 100]]), A_
     cp, cd, t0, t1 = axis_line(A_)
     assert abs(abs(cd[1]) - 1) < 1e-9 and abs(t1 - t0 - 20) < 1e-9
+    # plane z = 10 seen by a close camera and one 10 back (zoomed out): a pixel ABOVE the close frame must hit the
+    # plane where the far camera sees it, and the two views must agree
+    Kp = np.array([[100., 0, 50], [0, 100, 40], [0, 0, 1]])
+    far = np.eye(4); far[2, 3] = 10.0                    # w2c: world z = -10 is the camera centre
+    Dp = np.stack([np.full((80, 100), 10.0), np.full((80, 100), 20.0)])
+    Wp, Kps, Vp = np.stack([np.eye(4), far]), np.stack([Kp, Kp]), np.ones((2, 80, 100), bool)
+    X, nh = raycast((50, -30), 0, np.concatenate([Dp, Dp[1:]]), np.concatenate([Kps, Kps[1:]]),
+                    np.concatenate([Wp, Wp[1:]]), np.concatenate([Vp, Vp[1:]]), (1, 100))
+    assert X is not None and np.allclose(X, [0, -7, 10], atol=0.05), X
+    assert np.nanmax(consistency(Dp, Kps, Wp, Vp)) < 0.02
     print("self-test ok")
 
 
@@ -281,8 +418,8 @@ text-shadow:0 0 3px #000}button{background:#333;color:var(--fg);border:1px solid
 <label><input type="checkbox" id="byf"> colour by keyframe</label>
 <label><input type="checkbox" id="tp" checked> annotated tips</label><br>
 size <input type="range" id="ps" min="1" max="8" value="2" step="0.5"> <button id="dl">Download tip</button>
-<div id="pk" style="color:var(--mut)">no point picked</div></div></div>
-<div id="side"><div style="color:var(--mut);margin-bottom:6px">yellow = annotators' end on the cylinder, red = your
+<div id="pk" style="color:var(--mut)">no point picked</div><div id="q" style="color:var(--mut);max-width:300px"></div></div></div>
+<div id="side"><div style="color:var(--mut);margin-bottom:6px">yellow = annotators' end on the cylinder (no cylinder: their fused 3D tip), red = your
 end on the cylinder, green = annotators' 2D tip, blue = cylinder axis, arrow = off-frame</div><div class="g" id="g"></div></div>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
 "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
@@ -291,7 +428,11 @@ import * as THREE from 'three';import {OrbitControls} from 'three/addons/control
 const D=__DATA__;const f32=s=>new Float32Array(Uint8Array.from(atob(s),c=>c.charCodeAt(0)).buffer);
 const u8=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
 document.getElementById('t').textContent=D.short+' — '+D.nf+' keyframes, '+D.n.toLocaleString()+' points';
-const P=f32(D.pts),C8=u8(D.col),F=u8(D.fid);
+const P=f32(D.pts),C8=u8(D.col),F=u8(D.fid),Q=D.q||{},f3=v=>v==null?'-':(+v).toFixed(3);
+document.getElementById('q').textContent=Q.keyframes?('consistency '+f3(Q.consistency)+' (max '+f3(Q.consistency_max)+')'
+ +' | tips in 3D '+Q.tips+' ('+Q.tips_offframe+' off-frame), spread '+f3(Q.tip_spread)+' x scene'
+ +(Q.zoom_out_ctx_vs_ann?' | context '+(+Q.zoom_out_ctx_vs_ann).toFixed(2)+'x further out':'')
+ +(Q.cut!=null?' | cut at frame '+Q.cut:'')):'';
 const rgb=new Float32Array(P.length),byf=new Float32Array(P.length),c=new THREE.Color();
 for(let i=0;i<D.n;i++){for(let j=0;j<3;j++)rgb[3*i+j]=C8[3*i+j]/255;
  c.setHSL(F[i]/D.nf*0.8,0.9,0.55);byf[3*i]=c.r;byf[3*i+1]=c.g;byf[3*i+2]=c.b;}
@@ -330,10 +471,11 @@ if(Cy){const L=Cy.t1-Cy.t0,g=new THREE.CylinderGeometry(Cy.r,Cy.r,L,40,1,true),
  m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),V(Cy.d));m.position.copy(V(Cy.p)).addScaledVector(V(Cy.d),(Cy.t0+Cy.t1)/2);
  G.add(m);pickRing=ring(0xff2020);
  if(Cy.end){yEnd=Cy.end;ball(yEnd,0xffd400,bs.radius/120);place(ring(0xffd400),yEnd)}}
+if(!yEnd&&D.tipMed){yEnd=D.tipMed;ball(yEnd,0xffd400,bs.radius/120)}       // no cylinder: the fused 3D tip
 // thumbnails
 const g=document.getElementById('g'),cv=[];
 D.thumbs.forEach((b,i)=>{const d=document.createElement('div'),x=document.createElement('canvas'),s=document.createElement('span');
- x.width=D.w;x.height=D.h;s.textContent='frame '+D.frames[i];d.append(x,s);g.append(d);
+ x.width=D.w;x.height=D.h;s.textContent=(D.ctx&&D.ctx[i]?'CONTEXT ':'')+'frame '+D.frames[i];d.append(x,s);g.append(d);
  const im=new Image();im.onload=()=>{x.img=im;draw(i)};im.src='data:image/jpeg;base64,'+b;cv.push(x)});
 let tip=null;
 function proj(p,i){const m=D.w2c[i],K=D.K[i],c=[0,1,2].map(r=>m[r][0]*p[0]+m[r][1]*p[1]+m[r][2]*p[2]+m[r][3]);
@@ -383,6 +525,13 @@ if __name__ == "__main__":
     ap.add_argument("--margin", type=int, default=12, help="px trimmed at the processed-frame border")
     ap.add_argument("--max-points", type=int, default=400_000)
     ap.add_argument("--out-root", default="outputs/surgical_map")
+    ap.add_argument("--root", help="FrameStore root (default arch_tip_all); e.g. /scratch-shared/nsmit2/arch_tip/precut")
+    ap.add_argument("--precut", action="store_true",
+                    help="only frames BEFORE the catheter's first sight (the cut); annotated frames after it are dropped")
+    ap.add_argument("--context", type=int, default=0, help="extra keyframes from the footage BEFORE the window")
+    ap.add_argument("--context-span", type=int, default=1800, help="frames before the window to draw context from")
+    ap.add_argument("--max-err", type=float, default=0.10,
+                    help="keyframes whose consistency is worse are dropped and DA3 solved again (once)")
     ap.add_argument("--checkpoint", default="outputs/ureth_fn/best.pth")
     ap.add_argument("--dilate", type=int, default=30, help="px (1340x1072 crop) grown around every foreground mask")
     ap.add_argument("--mask-classes", default="1,2,3,4",

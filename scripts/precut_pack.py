@@ -7,9 +7,10 @@ to the last one, keeps every --stride-th frame plus every annotated frame, crops
 arch_tip_data.pack_video does, and writes a FrameStore pack with PARENT frame numbers:
     <out>/<short>/frames.bin + frames.npy     (FrameStore)
     <out>/<short>/labels.json                 {"video", "offset_frames", "shift_xy", "labels": {parent frame: {"tip"}}}
-The annotated frame f of the sub-clip is parent frame round(offset * fps) + f + dt; dt and the pixel shift of the
-annotation tool's crop against ours are MEASURED on annotated frames (packed jpg vs decoded parent crop) and the tips
-are moved by that shift, so a tip lands on the same tissue in our crop.
+The annotated frame f of the sub-clip is parent frame round(offset * fps + f * r) + dt. The annotation tool's frame
+numbers do NOT run at the parent's fps (first run: frame 0 matched, later frames matched nothing within +-4), so the
+rate ratio r (parent fps / a common rate), dt and the pixel shift of the tool's crop against ours are all MEASURED on
+5 annotated frames (packed jpg vs decoded parent crop, 1/4 res); nothing is packed unless every probe matches.
 
     python scripts/precut_pack.py --short RARP_079 RARP_088 e97cc145
 """
@@ -45,7 +46,7 @@ def align(ref, cand):
     return float(np.abs(g[0] - g[1])[ok].mean()), (dx, dy)
 
 
-def pack(short, out, before, stride, workers):
+def pack(short, out, before, stride, workers, a_max_diff=15.0):
     from arch_tip_render import _init, _mask
     from cut_cue_clips import content_box
     src = next(p / short for p in PURE if (p / short / "labels.json").exists())
@@ -59,30 +60,46 @@ def pack(short, out, before, stride, workers):
     off = int(round(t0 * fps))
     fs = FrameStore(short, src.parent)
 
-    # --- alignment on 5 annotated frames: dt in -4..4 by the smallest mean |diff|, then the pixel shift
+    # --- alignment on 5 annotated frames: rate ratio r x dt in -6..6 by the smallest mean |diff| (1/4 res)
     probe = sorted(tips)[:: max(1, len(tips) // 5)][:5]
-    want = {off + f + dt: (f, dt) for f in probe for dt in range(-4, 5)}
+    rates = sorted({1.0} | {fps / c for c in (59.94, 50, 30, 29.97, 25, 24, 20, 15, 12, 10)})
+    at = lambda f, r: int(round(off + f * r))
+    want = {at(f, r) + dt for r in rates for f in probe for dt in range(-6, 7)}
+    small = lambda x: cv2.resize(x, (335, 268), interpolation=cv2.INTER_AREA)
     got, i = {}, 0
     ok, fr = cap.read()
     box = content_box(cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY))
     while ok and i <= max(want):
         if i in want:
-            got[i] = _crop(fr)
-        ok, fr = cap.read()
+            got[i] = small(_crop(fr))
+        ok, fr = cap.read() if i < max(want) else (False, None)
         i += 1
-    dts, shifts = [], []
-    for f in probe:
-        ref = fs.jpg(fs.pos[f])
-        errs = {dt: align(ref, got[off + f + dt]) for dt in range(-4, 5) if off + f + dt in got}
-        dt = min(errs, key=lambda k: errs[k][0])
-        dts.append(dt); shifts.append(errs[dt][1])
-        print(f"  frame {f}: dt {dt:+d}, |diff| {errs[dt][0]:.1f} (dt 0: {errs[0][0]:.1f}), shift {np.round(errs[dt][1], 1)}")
-    dt, sh = int(np.median(dts)), np.median(shifts, 0)
-    if len(set(dts)) > 1:
-        print(f"  WARNING: dt not constant {dts} -> median {dt}")
+    refs = {f: small(fs.jpg(fs.pos[f])) for f in probe}
+    best = {}                                            # r -> (mean best |diff|, [(dt, |diff|, shift) per probe])
+    for r in rates:
+        per = []
+        for f in probe:
+            e = {dt: align(refs[f], got[at(f, r) + dt]) for dt in range(-6, 7) if at(f, r) + dt in got}
+            if not e:
+                break
+            dt = min(e, key=lambda k: e[k][0])
+            per.append((dt, *e[dt]))
+        if len(per) == len(probe):
+            best[r] = (float(np.mean([x[1] for x in per])), per)
+    r = min(best, key=lambda k: best[k][0])
+    err, per = best[r]
+    for f, (dt_f, e_f, sh_f) in zip(probe, per):
+        print(f"  frame {f}: r {r:.4f}, dt {dt_f:+d}, |diff| {e_f:.1f}, shift {np.round(np.array(sh_f) * 4, 1)} px")
+    print("  other rates: " + ", ".join(f"{k:.3f}:{v[0]:.0f}" for k, v in sorted(best.items())))
+    if max(x[1] for x in per) > a_max_diff:
+        raise SystemExit(f"{short}: no rate matches every probe (worst |diff| {max(x[1] for x in per):.1f}) - not packed")
+    dts = [x[0] for x in per]
+    dt, sh = int(np.median(dts)), np.median([x[2] for x in per], 0) * 4      # 1/4 res -> full-res px
+    if max(dts) - min(dts) > 1:
+        print(f"  WARNING: dt drifts {dts} -> median {dt}")
 
     # --- decode [first annotated - before, last annotated], keep the stride grid + every annotated frame
-    ann = {off + f + dt: f for f in tips}
+    ann = {at(f, r) + dt: f for f in tips}
     lo, hi = max(0, min(ann) - int(before * fps)), max(ann)
     keep = set(range(lo, hi + 1, stride)) | set(ann)
     d = out / short
@@ -109,9 +126,9 @@ def pack(short, out, before, stride, workers):
     (d / "frames.bin.part").replace(d / "frames.bin")
     np.save(d / "frames.npy", np.array(index, np.int64))
     labels = {str(p): {"tip": [tips[f][0] - sh[0], tips[f][1] - sh[1]]} for p, f in ann.items()}   # into OUR crop
-    (d / "labels.json").write_text(json.dumps(dict(video=lab["video"], parent=par, fps=fps, offset_frames=off + dt,
+    (d / "labels.json").write_text(json.dumps(dict(video=lab["video"], parent=par, fps=fps, rate=r, offset_frames=off + dt,
                                                    shift_xy=sh.tolist(), labels=labels)))
-    print(f"{short}: parent {par} @ {fps:.2f} fps, offset {off}+{dt}, shift {np.round(sh, 1)}, "
+    print(f"{short}: parent {par} @ {fps:.2f} fps, rate {r:.4f}, offset {off}+{dt}, shift {np.round(sh, 1)}, "
           f"packed {len(index)} frames {lo}..{hi} ({(min(ann) - lo) / fps:.0f} s before the first annotated)", flush=True)
 
 
