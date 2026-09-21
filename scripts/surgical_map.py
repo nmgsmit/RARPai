@@ -150,7 +150,10 @@ def build(a):
             if 0 <= u < w and 0 <= v < h and D[i, int(v), int(u)] > 0:   # tip may sit on masked tissue: still lifted
                 tips3d.append(X[int(v), int(u)])
     pts, col, fid = np.concatenate(pts), np.concatenate(col), np.concatenate(fid)
-    sel = np.random.default_rng(0).choice(len(pts), min(len(pts), a.max_points), replace=False)
+    frozen = np.flatnonzero(fid == 0) if a.freeze_first_sight else np.array([], int)  # frozen organ: every point
+    rest = np.setdiff1d(np.arange(len(pts)), frozen)
+    sel = np.concatenate([frozen, np.random.default_rng(0).choice(
+        rest, min(len(rest), max(a.max_points - len(frozen), 0)), replace=False)])
     pts, col, fid = pts[sel], col[sel], fid[sel]         # ponytail: random subsample; voxel grid if it looks noisy
 
     out = Path(a.out_root) / a.short
