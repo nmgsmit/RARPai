@@ -242,7 +242,7 @@ def urethra_tip(seg_logits):
 
 
 # Training targets. Point 0 is always the tip (the only thing scored); weights fall with distance from the tip.
-POINTS = {"tip": None, "tip+mid": None, "arc5": [0, -0.5, 0.5, -1, 1], "arc7": [0, -1 / 3, 1 / 3, -2 / 3, 2 / 3, -1, 1]}
+POINTS = {"tip1": None, "tip": None, "tip+mid": None, "arc5": [0, -0.5, 0.5, -1, 1], "arc7": [0, -1 / 3, 1 / 3, -2 / 3, 2 / 3, -1, 1]}
 
 
 def arc_points(tip, left, right, us, power=2.0):
@@ -258,6 +258,8 @@ def arc_points(tip, left, right, us, power=2.0):
 def targets(yt, method):
     """(N,3,2) tip/left/right tensor -> (N,P,2) target points and P weights for this method."""
     import torch
+    if method == "tip1":                              # the tip alone: no arch point enters training
+        return yt[:, :1], [1.0]
     if method in ("tip", "tip+seg", "seg->tip"):
         return yt, [1.0, 0.25, 0.25]
     if method == "tip+mid":
@@ -497,7 +499,7 @@ def run(args):
 
     out = OUT
     out.mkdir(parents=True, exist_ok=True)
-    (out / "results.json").write_text(json.dumps(dict(train=train_shorts, test={s: len(tests[s][0]) for s in TEST},
+    (out / f"results_{'_'.join(args.methods)}_{'_'.join(args.backbones)}.json").write_text(json.dumps(dict(train=train_shorts, test={s: len(tests[s][0]) for s in TEST},
                                                       rows=rows), indent=1))
     print(f"\n=== test: 7 three-annotator videos, better-agreeing half per video ({sum(len(t[0]) for t in tests.values())} "
           f"frames); train: {len(train_shorts)} videos x {len(YT) // len(train_shorts)} frames ===")
