@@ -159,7 +159,8 @@ G.add(new THREE.Points(geo,mat));
 const cam=new THREE.PerspectiveCamera(50,1,bs.radius/1000,bs.radius*20);
 const inv=m=>new THREE.Matrix4().fromArray(m.flat()).transpose().invert();       // w2c -> c2w
 const c0=new THREE.Vector3().setFromMatrixPosition(inv(D.w2c[0]));G.localToWorld(c0);
-const ctr=G.localToWorld(bs.center.clone());cam.position.copy(c0);cam.lookAt(ctr);
+const ctr=G.localToWorld(bs.center.clone());                                     // look from frame 0's side, whole field in view
+cam.position.copy(ctr).addScaledVector(c0.sub(ctr).normalize(),bs.radius*1.3);cam.lookAt(ctr);
 const oc=new OrbitControls(cam,R.domElement);oc.target.copy(ctr);oc.update();
 // camera centres
 const cc=new Float32Array(3*D.nf);D.w2c.forEach((m,i)=>new THREE.Vector3().setFromMatrixPosition(inv(m)).toArray(cc,3*i));
