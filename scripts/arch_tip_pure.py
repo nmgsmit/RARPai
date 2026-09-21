@@ -169,7 +169,7 @@ def feats(args):
 
 
 # ------------------------------------------------------------------------------------------------ model (GPU)
-def make_head(cin, npts=3, width=256):
+def make_head(cin, npts=3, width=256, void=False):
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -188,12 +188,16 @@ def make_head(cin, npts=3, width=256):
             self.register_buffer("cx", ((xs + 0.5) * CELL).float().flatten())
             self.register_buffer("cy", ((ys + 0.5) * CELL).float().flatten())
             self.register_buffer("coords", torch.stack([xs / (GW - 1), ys / (GH - 1)]).float()[None] * 2 - 1)
+            self.void = void
 
-        def forward(self, x):
+        def forward(self, x, v=None):
             f = F.dropout2d(self.red(x), 0.1, self.training)
             h = self.body(torch.cat([f, self.coords.expand(len(x), -1, -1, -1)], 1))
             o = self.vote(h).flatten(2)
-            w = o[:, :npts].softmax(-1)                  # per point: heat, dx, dy (point 0 = tip)
+            heat = o[:, :npts]                           # per point: heat, dx, dy (point 0 = tip)
+            if v is not None:                            # void cells (robot arm) may not vote; offsets still reach under them
+                heat = heat.masked_fill((v.flatten(1) > 0.5)[:, None, :], -1e4)
+            w = heat.softmax(-1)
             pts = torch.stack([(w * (self.cx + o[:, npts:2 * npts] * CELL)).sum(-1),
                                (w * (self.cy + o[:, 2 * npts:] * CELL)).sum(-1)], -1)
             return pts, self.seg(h)
@@ -277,14 +281,14 @@ def norm_stats(X):
     return mu, (sq / n - mu.flatten() ** 2).clamp_min(1e-6).sqrt().view(1, -1, 1, 1)
 
 
-def fit(X, yt, st, mu, sd, method, seed, steps, bs, dev):
+def fit(X, yt, st, mu, sd, method, seed, steps, bs, dev, void=False):
     """yt = (N,3,2) tip/left/right; targets() turns it into the method's points + weights. tip+seg adds the anatomy
     loss, seg->tip uses only the anatomy loss."""
     import torch
     import torch.nn.functional as F
     torch.manual_seed(seed)
     pts_t, wts = targets(yt, method)
-    head = make_head(X.shape[1], pts_t.shape[1]).to(dev)
+    head = make_head(X.shape[1], pts_t.shape[1], void=void).to(dev)
     opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=1e-2)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, 1e-3, total_steps=steps)
     wv = 0.0 if method == "seg->tip" else 1.0                  # point loss for every point method
@@ -293,7 +297,8 @@ def fit(X, yt, st, mu, sd, method, seed, steps, bs, dev):
     head.train()
     for _ in range(steps):
         b = torch.randint(0, len(X), (bs,), device=dev)
-        pts, seg = head((X[b].float() - mu) / sd)
+        xb = X[b].float()
+        pts, seg = head((xb - mu) / sd, xb[:, -1] if void else None)   # void = last input channel, raw
         lv = (F.smooth_l1_loss(pts / 100, pts_t[b] / 100, beta=0.2, reduction="none").sum(-1) * pw).sum(-1).mean()
         ls = -(st[b].float() * F.log_softmax(seg, 1)).sum(1).mean()
         loss = wv * lv + ws * ls
@@ -311,7 +316,7 @@ def infer_with(head, mu, sd, arr, dev, bs=256):
     with torch.no_grad():
         for i in range(0, len(arr), bs):
             x = (arr[i:i + bs] if torch.is_tensor(arr) else torch.from_numpy(np.asarray(arr[i:i + bs]))).to(dev).float()
-            p, s = head((x - mu) / sd)
+            p, s = head((x - mu) / sd, x[:, -1] if getattr(head, "void", False) else None)
             P.append(p.cpu().numpy())
             S.append(s)
     return np.concatenate(P), torch.cat(S)
