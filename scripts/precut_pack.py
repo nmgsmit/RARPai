@@ -49,11 +49,15 @@ def align(ref, cand):
 def pack(short, out, before, stride, workers, a_max_diff=15.0):
     from arch_tip_render import _init, _mask
     from cut_cue_clips import content_box
+    if (out / short / "frames.npy").exists():
+        print(f"{short}: already packed", flush=True)
+        return
     src = next(p / short for p in PURE if (p / short / "labels.json").exists())
     lab = json.loads((src / "labels.json").read_text())
     par, t0 = parent_of(lab["video"])
     if par is None or not (PARENTS / par).exists():
-        raise SystemExit(f"{short}: no parent clip for {lab['video']}")
+        print(f"{short}: no parent clip for {lab['video']} - NOT packed")
+        return
     tips = {int(f): v["tip"] for f, v in lab["labels"].items()}
     cap = cv2.VideoCapture(str(PARENTS / par))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -91,8 +95,11 @@ def pack(short, out, before, stride, workers, a_max_diff=15.0):
     for f, (dt_f, e_f, sh_f) in zip(probe, per):
         print(f"  frame {f}: r {r:.4f}, dt {dt_f:+d}, |diff| {e_f:.1f}, shift {np.round(np.array(sh_f) * 4, 1)} px")
     print("  other rates: " + ", ".join(f"{k:.3f}:{v[0]:.0f}" for k, v in sorted(best.items())))
-    if max(x[1] for x in per) > a_max_diff:
-        raise SystemExit(f"{short}: no rate matches every probe (worst |diff| {max(x[1] for x in per):.1f}) - not packed")
+    med = float(np.median([x[1] for x in per]))
+    second = min(v[0] for k, v in best.items() if abs(k - r) > 0.01)
+    if med > a_max_diff or err > second / 2:            # one blurred / occluded probe may miss; the rate must not
+        print(f"{short}: no clear rate (median |diff| {med:.1f}, mean {err:.1f} vs next rate {second:.1f}) - NOT packed")
+        return
     dts = [x[0] for x in per]
     dt, sh = int(np.median(dts)), np.median([x[2] for x in per], 0) * 4      # 1/4 res -> full-res px
     if max(dts) - min(dts) > 1:
