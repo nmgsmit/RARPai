@@ -18,9 +18,11 @@ static). --freeze-first-sight starts the window at the first frame the CATHETER 
 --sight-stride frames), keeps urethra + prostate ONLY from that frame (still attached to each other) and masks
 them in every later keyframe, so the moving / dissected organ is frozen at first sight on the static background.
 
-Cylinder (Nick 2026-09-21): urethra = largest ureth_fn component per keyframe (one segment per frame), eroded,
-pooled over all keyframes in 3D -> urethra_cylinder.fit_cylinder (in the middle keyframe's camera frame, radius held
-to 0.5-1.5x the silhouette half-width since DA3 units are not mm). END = the annotators' tip (median of the lifted
+Cylinder (Nick 2026-09-21): per keyframe urethra_cylinder.analyse exactly as arch_cylinder_compare runs it (ruler-
+calibrated UniDepth mm from arch_tip_all/<short>/depth.npy, largest ureth_fn urethra component, da Vinci K); each
+frame's axis (start..end, or +10 mm) is carried into the DA3 map at that frame's DA3/UniDepth depth ratio over the
+urethra, and ONE line is fitted through all frames' axis points (radius = median). A free fit on the pooled DA3
+urethra points came out 66 px wide and across the field: the mask is several pieces there and DA3 is flat across it. END = the annotators' tip (median of the lifted
 consensus tips) dropped perpendicular onto the axis; where that perpendicular meets the cylinder surface is the end
 (yellow ball + ring). A click (red) is turned into an end point the same way.
 
@@ -103,19 +105,24 @@ def end_point(X, p, d, r):
     return foot + r * (X - foot) / np.linalg.norm(X - foot)
 
 
-def cylinder(P, w2c):
-    """Fit in camera w2c's frame (fit_cylinder assumes the camera at the origin) -> world (p, d, r, t0, t1)."""
-    from urethra_cylinder import fit_cylinder, unit
-    Pc = P @ w2c[:3, :3].T + w2c[:3, 3]
-    c = Pc.mean(0)
-    d0 = np.linalg.svd(Pc - c, full_matrices=False)[2][0]
-    r_sil = np.subtract(*np.percentile((Pc - c) @ unit(np.cross(d0, unit(c))), [97, 3])) / 2
-    p, d, r, res, _ = fit_cylinder(Pc, r_range=(0.5 * r_sil, 1.5 * r_sil))
-    R = w2c[:3, :3].T                                    # back to world
-    p, d = R @ (p - w2c[:3, 3]), R @ d
+def axis_line(P):
+    """Line through (n,3) axis points -> (p, d, t0, t1). ponytail: plain PCA; RANSAC if a bad frame drags it."""
+    p = P.mean(0)
+    d = np.linalg.svd(P - p, full_matrices=False)[2][0]
     t = (P - p) @ d
-    print(f"cylinder: {len(P)} urethra pts, r {r:.4g} (silhouette {r_sil:.4g}), residual {res / r:.2f} r", flush=True)
-    return p, d, r, *np.percentile(t, [2, 98])
+    return p, d, *np.percentile(t, [0, 100])
+
+
+def frame_axis(fr, K_dv, sx, sy, Kda, c2w, s, n=5):
+    """analyse()'s axis (mm, da Vinci camera) -> n world points in the DA3 map: same pixel, depth x s."""
+    te = fr["t_end"] if fr["found"] else fr["t_start"] + 10.0
+    out = []
+    for t in np.linspace(fr["t_start"], te, n):
+        X = fr["p"] + t * fr["d"]
+        u, v, z = (K_dv[0] * X[0] / X[2] + K_dv[2]) * sx, (K_dv[1] * X[1] / X[2] + K_dv[3]) * sy, X[2] * s
+        c = np.array([(u - Kda[0, 2]) / Kda[0, 0] * z, (v - Kda[1, 2]) / Kda[1, 1] * z, z])
+        out.append(c2w[:3, :3] @ c + c2w[:3, 3])
+    return out
 
 
 def build(a):
@@ -146,8 +153,9 @@ def build(a):
     segs = [seg(im) for im in imgs]
     fg = [cv2.dilate(np.isin(sg, fz if a.freeze_first_sight and i == 0 else cls).astype(np.uint8), ker) > 0
           for i, sg in enumerate(segs)]
-    ero = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))  # urethra edges carry mixed depth
-    ure = [cv2.erode((_keep_largest(sg, 1) == 1).astype(np.uint8), ero) for sg in segs]
+    from urethra_cylinder import analyse
+    K_dv = (0.82 * W0, 1.02 * H0, 0.5 * W0, 0.5 * H0)   # what the ruler calibration and arch_cylinder_compare use
+    uni = np.load(A / a.short / "depth.npy", mmap_mode="r")
     print("foreground (dilated) per frame: median %.0f%%" % (100 * np.median([f.mean() for f in fg])), flush=True)
     orig = imgs
     if a.black_input:
@@ -167,7 +175,7 @@ def build(a):
     keep = C >= np.percentile(C, a.conf_pct)             # DA3's own GLB export default: drop the lowest 40%
     b = a.margin                                         # frame border = least constrained depth (sul_reveal)
     keep[:, :b], keep[:, -b:], keep[:, :, :b], keep[:, :, -b:] = False, False, False, False
-    pts, col, fid, tips3d, ureP = [], [], [], [], []
+    pts, col, fid, tips3d, axP, rs = [], [], [], [], [], []
     for i, k in enumerate(ks):
         c2w = np.linalg.inv(W2C[i])
         gui = cv2.resize((fs.mask(k) | fg[i]).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
@@ -175,8 +183,20 @@ def build(a):
         ok = keep[i] & ~gui & (D[i] > 0)
         X = backproject(D[i], Ks[i], c2w)
         pts.append(X[ok]); col.append(RGB[i][ok]); fid.append(np.full(ok.sum(), i, np.uint8))
-        u8 = cv2.resize(ure[i], (w, h), interpolation=cv2.INTER_NEAREST) > 0
-        ureP.append(X[u8 & ok])
+        g0 = fs.mask(k)
+        zmap = cv2.resize(uni[k].astype(np.float32), (W0, H0), interpolation=cv2.INTER_LINEAR)
+        zmap[g0] = 0
+        sg = _keep_largest(segs[i], 1)                   # one urethra segment per frame
+        sg[g0] = 0
+        fr = analyse(zmap, sg, K_dv)
+        if fr is not None:
+            um = (cv2.resize((sg == 1).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0) & (D[i] > 0)
+            zs = cv2.resize(zmap, (w, h), interpolation=cv2.INTER_NEAREST)
+            um &= zs > 0
+            if um.sum() > 50:
+                s_i = float(np.median(D[i][um] / zs[um]))
+                axP += frame_axis(fr, K_dv, sx, sy, Ks[i], c2w, s_i)
+                rs.append(fr["r"] * s_i)
         r = rows.get(frames[i])
         if r and r.get("tip"):
             u, v = r["tip"][0] * sx, r["tip"][1] * sy
@@ -199,16 +219,17 @@ def build(a):
         print(f"annotated tips lifted: {len(t)}, median spread around their median = {spread:.3f} x scene depth")
 
     cyl = None
-    ureP = np.concatenate(ureP)
-    if len(ureP) >= 200:
-        cp, cd, cr, t0, t1 = cylinder(ureP, W2C[n // 2])
+    if len(rs) >= 3:
+        cp, cd, t0, t1 = axis_line(np.array(axP))
+        cr = float(np.median(rs))
+        print(f"cylinder: analyse() tube in {len(rs)}/{n} keyframes, r {cr:.4g}", flush=True)
         end = end_point(np.median(t, 0), cp, cd, cr) if len(t) else None
         te = None if end is None else float((end - cp) @ cd)
         cyl = dict(p=cp.tolist(), d=cd.tolist(), r=cr, t0=float(min(t0, te if te is not None else t0)),
                    t1=float(max(t1, te if te is not None else t1)), end=None if end is None else end.tolist())
         print(f"end: t {te} on axis span {t0:.4g}..{t1:.4g}", flush=True)
     else:
-        print(f"no cylinder: {len(ureP)} urethra points", flush=True)
+        print(f"no cylinder: analyse() tube in only {len(rs)} keyframes", flush=True)
 
     b64 = lambda x: base64.b64encode(np.ascontiguousarray(x).tobytes()).decode()
     thumbs = [base64.b64encode(cv2.imencode(".jpg", cv2.cvtColor(im, cv2.COLOR_RGB2BGR),
@@ -235,10 +256,12 @@ def self_test():
     assert 290 <= tip_window(rows, 400)[0] <= 310       # the one static stretch wins
     e = end_point(np.array([3., 1, 7]), np.zeros(3), np.array([0., 0, 1]), 2.0)   # axis = z, r 2
     assert np.allclose(e, [2 * 3 / 10 ** .5, 2 / 10 ** .5, 7]), e
-    ang = rng.uniform(0, 2 * np.pi, 3000); z = rng.uniform(0, 20, 3000)          # tube r 3 along x, 40 in front
-    P = np.stack([z, 3 * np.cos(ang), 40 + 3 * np.sin(ang)], 1)[np.sin(ang) < 0]  # camera-facing half only
-    cp, cd, cr, t0, t1 = cylinder(P, np.eye(4))
-    assert abs(cr - 3) < 0.3 and abs(abs(cd[0]) - 1) < 1e-2, (cr, cd)
+    fr = dict(p=np.array([0., 0, 50]), d=np.array([0., 1, 0]), t_start=-5.0, t_end=5.0, found=True)
+    Kdv = (300., 300., 160., 120.)                       # same camera both sides, depth x2 -> axis x2
+    A_ = np.array(frame_axis(fr, Kdv, 1, 1, np.array([[300., 0, 160], [0, 300, 120], [0, 0, 1]]), np.eye(4), 2.0))
+    assert np.allclose(A_[[0, -1]], [[0, -10, 100], [0, 10, 100]]), A_
+    cp, cd, t0, t1 = axis_line(A_)
+    assert abs(abs(cd[1]) - 1) < 1e-9 and abs(t1 - t0 - 20) < 1e-9
     print("self-test ok")
 
 
