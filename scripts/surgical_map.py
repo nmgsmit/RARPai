@@ -18,6 +18,12 @@ static). --freeze-first-sight starts the window at the first frame the CATHETER 
 --sight-stride frames), keeps urethra + prostate ONLY from that frame (still attached to each other) and masks
 them in every later keyframe, so the moving / dissected organ is frozen at first sight on the static background.
 
+Cylinder (Nick 2026-09-21): urethra = largest ureth_fn component per keyframe (one segment per frame), eroded,
+pooled over all keyframes in 3D -> urethra_cylinder.fit_cylinder (in the middle keyframe's camera frame, radius held
+to 0.5-1.5x the silhouette half-width since DA3 units are not mm). END = the annotators' tip (median of the lifted
+consensus tips) dropped perpendicular onto the axis; where that perpendicular meets the cylinder surface is the end
+(yellow ball + ring). A click (red) is turned into an end point the same way.
+
 Scale is DA3's relative unit, NOT mm (localisation only). The scene must be roughly static across the window:
 keep --start/--end to one phase of the dissection.
 
@@ -91,6 +97,27 @@ def first_sight(fs, seg, stride, frac, cls=3):
     raise SystemExit(f"class {cls} never seen")
 
 
+def end_point(X, p, d, r):
+    """Perpendicular from X to the axis (p, d), continued to the cylinder surface."""
+    foot = p + ((X - p) @ d) * d
+    return foot + r * (X - foot) / np.linalg.norm(X - foot)
+
+
+def cylinder(P, w2c):
+    """Fit in camera w2c's frame (fit_cylinder assumes the camera at the origin) -> world (p, d, r, t0, t1)."""
+    from urethra_cylinder import fit_cylinder, unit
+    Pc = P @ w2c[:3, :3].T + w2c[:3, 3]
+    c = Pc.mean(0)
+    d0 = np.linalg.svd(Pc - c, full_matrices=False)[2][0]
+    r_sil = np.subtract(*np.percentile((Pc - c) @ unit(np.cross(d0, unit(c))), [97, 3])) / 2
+    p, d, r, res, _ = fit_cylinder(Pc, r_range=(0.5 * r_sil, 1.5 * r_sil))
+    R = w2c[:3, :3].T                                    # back to world
+    p, d = R @ (p - w2c[:3, 3]), R @ d
+    t = (P - p) @ d
+    print(f"cylinder: {len(P)} urethra pts, r {r:.4g} (silhouette {r_sil:.4g}), residual {res / r:.2f} r", flush=True)
+    return p, d, r, *np.percentile(t, [2, 98])
+
+
 def build(a):
     import torch
     from arch_tip_data import A, FrameStore
@@ -115,8 +142,12 @@ def build(a):
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * a.dilate + 1,) * 2)
     cls = [int(c) for c in a.mask_classes.split(",")]
     fz = [4]                                             # frozen first-sight frame: only the arm goes
-    fg = [cv2.dilate(np.isin(seg(im), fz if a.freeze_first_sight and i == 0 else cls).astype(np.uint8), ker) > 0
-          for i, im in enumerate(imgs)]
+    from overlay_dir import _keep_largest
+    segs = [seg(im) for im in imgs]
+    fg = [cv2.dilate(np.isin(sg, fz if a.freeze_first_sight and i == 0 else cls).astype(np.uint8), ker) > 0
+          for i, sg in enumerate(segs)]
+    ero = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))  # urethra edges carry mixed depth
+    ure = [cv2.erode((_keep_largest(sg, 1) == 1).astype(np.uint8), ero) for sg in segs]
     print("foreground (dilated) per frame: median %.0f%%" % (100 * np.median([f.mean() for f in fg])), flush=True)
     orig = imgs
     if a.black_input:
@@ -136,7 +167,7 @@ def build(a):
     keep = C >= np.percentile(C, a.conf_pct)             # DA3's own GLB export default: drop the lowest 40%
     b = a.margin                                         # frame border = least constrained depth (sul_reveal)
     keep[:, :b], keep[:, -b:], keep[:, :, :b], keep[:, :, -b:] = False, False, False, False
-    pts, col, fid, tips3d = [], [], [], []
+    pts, col, fid, tips3d, ureP = [], [], [], [], []
     for i, k in enumerate(ks):
         c2w = np.linalg.inv(W2C[i])
         gui = cv2.resize((fs.mask(k) | fg[i]).astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
@@ -144,6 +175,8 @@ def build(a):
         ok = keep[i] & ~gui & (D[i] > 0)
         X = backproject(D[i], Ks[i], c2w)
         pts.append(X[ok]); col.append(RGB[i][ok]); fid.append(np.full(ok.sum(), i, np.uint8))
+        u8 = cv2.resize(ure[i], (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        ureP.append(X[u8 & ok])
         r = rows.get(frames[i])
         if r and r.get("tip"):
             u, v = r["tip"][0] * sx, r["tip"][1] * sy
@@ -165,6 +198,18 @@ def build(a):
         spread = np.median(np.linalg.norm(t - np.median(t, 0), axis=1)) / np.median(D)
         print(f"annotated tips lifted: {len(t)}, median spread around their median = {spread:.3f} x scene depth")
 
+    cyl = None
+    ureP = np.concatenate(ureP)
+    if len(ureP) >= 200:
+        cp, cd, cr, t0, t1 = cylinder(ureP, W2C[n // 2])
+        end = end_point(np.median(t, 0), cp, cd, cr) if len(t) else None
+        te = None if end is None else float((end - cp) @ cd)
+        cyl = dict(p=cp.tolist(), d=cd.tolist(), r=cr, t0=float(min(t0, te if te is not None else t0)),
+                   t1=float(max(t1, te if te is not None else t1)), end=None if end is None else end.tolist())
+        print(f"end: t {te} on axis span {t0:.4g}..{t1:.4g}", flush=True)
+    else:
+        print(f"no cylinder: {len(ureP)} urethra points", flush=True)
+
     b64 = lambda x: base64.b64encode(np.ascontiguousarray(x).tobytes()).decode()
     thumbs = [base64.b64encode(cv2.imencode(".jpg", cv2.cvtColor(im, cv2.COLOR_RGB2BGR),
                                             [cv2.IMWRITE_JPEG_QUALITY, 80])[1]).decode() for im in RGB]
@@ -172,7 +217,7 @@ def build(a):
             for f in frames]
     data = dict(short=a.short, n=len(pts), w=w, h=h, pts=b64(pts.astype(np.float32)), col=b64(col.astype(np.uint8)),
                 fid=b64(fid), nf=n, K=Ks.tolist(), w2c=W2C.tolist(), frames=frames, thumbs=thumbs, cons=cons,
-                tips3d=t.tolist(), scale=[sx, sy])
+                tips3d=t.tolist(), scale=[sx, sy], cyl=cyl)
     (out / "map.html").write_text(HTML.replace("__DATA__", json.dumps(data)), encoding="utf-8")
     print(f"wrote {out / 'map.html'} ({len(pts)} points)")
 
@@ -188,6 +233,12 @@ def self_test():
     assert as44(np.eye(4)[:3]).shape == (4, 4)
     rows = {f: {"tip": [500 + (0 if 300 <= f < 700 else rng.normal(0, 60)), 300]} for f in range(1500)}
     assert 290 <= tip_window(rows, 400)[0] <= 310       # the one static stretch wins
+    e = end_point(np.array([3., 1, 7]), np.zeros(3), np.array([0., 0, 1]), 2.0)   # axis = z, r 2
+    assert np.allclose(e, [2 * 3 / 10 ** .5, 2 / 10 ** .5, 7]), e
+    ang = rng.uniform(0, 2 * np.pi, 3000); z = rng.uniform(0, 20, 3000)          # tube r 3 along x, 40 in front
+    P = np.stack([z, 3 * np.cos(ang), 40 + 3 * np.sin(ang)], 1)[np.sin(ang) < 0]  # camera-facing half only
+    cp, cd, cr, t0, t1 = cylinder(P, np.eye(4))
+    assert abs(cr - 3) < 0.3 and abs(abs(cd[0]) - 1) < 1e-2, (cr, cd)
     print("self-test ok")
 
 
@@ -208,8 +259,8 @@ text-shadow:0 0 3px #000}button{background:#333;color:var(--fg);border:1px solid
 <label><input type="checkbox" id="tp" checked> annotated tips</label><br>
 size <input type="range" id="ps" min="1" max="8" value="2" step="0.5"> <button id="dl">Download tip</button>
 <div id="pk" style="color:var(--mut)">no point picked</div></div></div>
-<div id="side"><div style="color:var(--mut);margin-bottom:6px">red = picked point projected, green = annotators'
-consensus, arrow = off-frame</div><div class="g" id="g"></div></div>
+<div id="side"><div style="color:var(--mut);margin-bottom:6px">yellow = annotators' end on the cylinder, red = your
+end on the cylinder, green = annotators' 2D tip, blue = cylinder axis, arrow = off-frame</div><div class="g" id="g"></div></div>
 <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
 "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
 <script type="module">
@@ -241,6 +292,21 @@ const ball=(p,col,r)=>{const m=new THREE.Mesh(new THREE.SphereGeometry(r,12,8),n
  m.position.fromArray(p);G.add(m);return m};
 const tipObjs=D.tips3d.map(p=>ball(p,0x999999,bs.radius/250));
 const pick=ball([0,0,0],0xff2020,bs.radius/120);pick.visible=false;
+// urethra cylinder + end points (perpendicular from a point onto the axis, continued to the surface)
+const V=a=>new THREE.Vector3().fromArray(a),Cy=D.cyl;
+function endOf(x){const p=V(Cy.p),d=V(Cy.d),X=V(x),f=p.clone().addScaledVector(d,X.clone().sub(p).dot(d));
+ return f.clone().addScaledVector(X.sub(f).normalize(),Cy.r).toArray()}
+function ring(col){const m=new THREE.Mesh(new THREE.TorusGeometry(Cy.r,Cy.r*0.07,8,48),new THREE.MeshBasicMaterial({color:col}));
+ m.quaternion.setFromUnitVectors(new THREE.Vector3(0,0,1),V(Cy.d));m.visible=false;G.add(m);return m}
+function place(rg,e){const p=V(Cy.p),d=V(Cy.d);rg.position.copy(p).addScaledVector(d,V(e).sub(p).dot(d));rg.visible=true}
+let pickRing,yEnd=null;
+if(Cy){const L=Cy.t1-Cy.t0,g=new THREE.CylinderGeometry(Cy.r,Cy.r,L,40,1,true),
+ m=new THREE.Mesh(g,new THREE.MeshBasicMaterial({color:0x33ccff,transparent:true,opacity:0.22,side:THREE.DoubleSide,depthWrite:false}));
+ m.add(new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.CylinderGeometry(Cy.r,Cy.r,L,24,6,true),1),
+  new THREE.LineBasicMaterial({color:0x33ccff,transparent:true,opacity:0.35})));
+ m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),V(Cy.d));m.position.copy(V(Cy.p)).addScaledVector(V(Cy.d),(Cy.t0+Cy.t1)/2);
+ G.add(m);pickRing=ring(0xff2020);
+ if(Cy.end){yEnd=Cy.end;ball(yEnd,0xffd400,bs.radius/120);place(ring(0xffd400),yEnd)}}
 // thumbnails
 const g=document.getElementById('g'),cv=[];
 D.thumbs.forEach((b,i)=>{const d=document.createElement('div'),x=document.createElement('canvas'),s=document.createElement('span');
@@ -257,20 +323,25 @@ function mark(x,u,v,col){const k=x.getContext('2d'),r=D.w/45;k.strokeStyle=col;k
  a=Math.atan2(v-cy,u-cx);k.fillStyle=col;k.beginPath();k.moveTo(ex+Math.cos(a)*r,ey+Math.sin(a)*r);
  k.lineTo(ex+Math.cos(a+2.5)*r,ey+Math.sin(a+2.5)*r);k.lineTo(ex+Math.cos(a-2.5)*r,ey+Math.sin(a-2.5)*r);k.fill()}
 function draw(i){const x=cv[i];if(!x||!x.img)return;const k=x.getContext('2d');k.drawImage(x.img,0,0);
- if(D.cons[i])mark(x,D.cons[i][0],D.cons[i][1],'#3f3');if(tip){const [u,v,z]=proj(tip,i);if(z>0)mark(x,u,v,'#f33')}}
+ if(Cy){const a=proj(V(Cy.p).addScaledVector(V(Cy.d),Cy.t0).toArray(),i),b=proj(V(Cy.p).addScaledVector(V(Cy.d),Cy.t1).toArray(),i);
+  if(a[2]>0&&b[2]>0){k.strokeStyle='#3cf';k.lineWidth=D.w/250;k.beginPath();k.moveTo(a[0],a[1]);k.lineTo(b[0],b[1]);k.stroke()}}
+ if(D.cons[i])mark(x,D.cons[i][0],D.cons[i][1],'#3f3');
+ if(yEnd){const [u,v,z]=proj(yEnd,i);if(z>0)mark(x,u,v,'#fd0')}
+ if(tip){const [u,v,z]=proj(tip,i);if(z>0)mark(x,u,v,'#f33')}}
 // picking
 const rc=new THREE.Raycaster(),mp=new THREE.Vector2();let down;
 R.domElement.addEventListener('pointerdown',e=>down=[e.clientX,e.clientY]);
 R.domElement.addEventListener('pointerup',e=>{if(!down||Math.hypot(e.clientX-down[0],e.clientY-down[1])>4)return;
  const b=R.domElement.getBoundingClientRect();mp.set((e.clientX-b.left)/b.width*2-1,-(e.clientY-b.top)/b.height*2+1);
  rc.params.Points.threshold=bs.radius/300;rc.setFromCamera(mp,cam);const h=rc.intersectObject(G.children[0])[0];
- if(!h)return;tip=[...P.slice(3*h.index,3*h.index+3)];pick.position.fromArray(tip);pick.visible=true;
- document.getElementById('pk').textContent='tip = ['+tip.map(v=>v.toFixed(3)).join(', ')+'] (DA3 units)';
+ if(!h)return;tip=[...P.slice(3*h.index,3*h.index+3)];if(Cy){tip=endOf(tip);place(pickRing,tip)}
+ pick.position.fromArray(tip);pick.visible=true;
+ document.getElementById('pk').textContent=(Cy?'end on cylinder':'tip')+' = ['+tip.map(v=>v.toFixed(3)).join(', ')+'] (DA3 units)';
  cv.forEach((_,i)=>draw(i))});
 document.getElementById('byf').onchange=e=>{geo.setAttribute('color',new THREE.BufferAttribute(e.target.checked?byf:rgb,3))};
 document.getElementById('tp').onchange=e=>tipObjs.forEach(o=>o.visible=e.target.checked);
 document.getElementById('ps').oninput=e=>mat.size=+e.target.value;
-document.getElementById('dl').onclick=()=>{if(!tip)return;const o={short:D.short,tip3d:tip,
+document.getElementById('dl').onclick=()=>{if(!tip)return;const o={short:D.short,tip3d:tip,annotators_end3d:yEnd,cylinder:Cy,
  per_frame:D.frames.map((f,i)=>{const [u,v,z]=proj(tip,i);return {frame:f,x:u/D.scale[0],y:v/D.scale[1],in_front:z>0}})};
  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(o,null,1)]));
  a.download=D.short+'_tip.json';a.click()};
