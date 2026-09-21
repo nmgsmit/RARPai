@@ -75,7 +75,8 @@ def build(a):
     imgs = [cv2.cvtColor(fs.jpg(k), cv2.COLOR_BGR2RGB) for k in ks]
     H0, W0 = imgs[0].shape[:2]
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * a.dilate + 1,) * 2)
-    fg = [cv2.dilate((s > 0).astype(np.uint8), ker) > 0 for s in segment(imgs, a.checkpoint)]
+    cls = [int(c) for c in a.mask_classes.split(",")]
+    fg = [cv2.dilate(np.isin(s, cls).astype(np.uint8), ker) > 0 for s in segment(imgs, a.checkpoint)]
     print("foreground (dilated) per frame: median %.0f%%" % (100 * np.median([f.mean() for f in fg])), flush=True)
     orig = imgs
     if a.black_input:
@@ -245,6 +246,8 @@ if __name__ == "__main__":
     ap.add_argument("--out-root", default="outputs/surgical_map")
     ap.add_argument("--checkpoint", default="outputs/ureth_fn/best.pth")
     ap.add_argument("--dilate", type=int, default=30, help="px (1340x1072 crop) grown around every foreground mask")
+    ap.add_argument("--mask-classes", default="1,2,3,4",
+                    help="ureth_fn ids to drop: 1 urethra, 2 prostate, 3 catheter, 4 non-anatomical (robot arm)")
     ap.add_argument("--black-input", action="store_true", help="also black the foreground in DA3's input")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
