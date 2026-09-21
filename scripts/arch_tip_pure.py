@@ -212,11 +212,12 @@ def make_head(cin, npts=3, width=256, void=False):
     return Head()
 
 
-def seg_targets(short, n):
+def seg_targets(short, n, root=None):
     """Soft 7-class targets on the 32x40 grid (area-downsampled one-hot of the packed masks), cached per video."""
-    path = PURE / short / "seg32.npy"
+    root = root or PURE
+    path = root / short / "seg32.npy"
     if not path.exists():
-        fs = FrameStore(short, root=PURE)
+        fs = FrameStore(short, root=root)
         t = np.stack([np.stack([cv2.resize((fs.labels(k) == c).astype(np.float32), (GW, GH), interpolation=cv2.INTER_AREA)
                                 for c in range(NCLS)]) for k in range(len(fs))]).astype(np.float16)
         np.save(path, t)
@@ -270,14 +271,15 @@ def targets(yt, method):
     return torch.from_numpy(pts.astype(np.float32)).to(yt.device), [1 - 0.75 * abs(u) for u in us]
 
 
-def train_data():
+def train_data(root=None):
     """Training videos, (N,3,2) tip/left/right targets and (N,7,32,40) soft anatomy targets, video by video."""
-    shorts = sorted(p.name for p in PURE.iterdir() if (p / "frames.npy").exists())
-    Y = {s: json.loads((PURE / s / "labels.json").read_text())["labels"] for s in shorts}
-    fr = {s: FrameStore(s, root=PURE).frames for s in shorts}
+    root = root or PURE
+    shorts = sorted(p.name for p in root.iterdir() if (p / "frames.npy").exists())
+    Y = {s: json.loads((root / s / "labels.json").read_text())["labels"] for s in shorts}
+    fr = {s: FrameStore(s, root=root).frames for s in shorts}
     YT = np.concatenate([np.array([[Y[s][str(f)][k] for k in ("tip", "left", "right")] for f in fr[s]], np.float32)
                          for s in shorts])
-    return shorts, YT, np.concatenate([seg_targets(s, len(fr[s])) for s in shorts])
+    return shorts, YT, np.concatenate([seg_targets(s, len(fr[s]), root) for s in shorts])
 
 
 def norm_stats(X):
@@ -445,6 +447,94 @@ def ablate(args):
               f"{np.mean([r['within50'] for r in rs]):6.0%}  " + " ".join(f"{np.mean([r['per_video'][s] for r in rs]):8.1f}" for s in TEST))
 
 
+# ------------------------------------------------------------------------------------------------ consistency (GPU)
+def jitter(frames, tips):
+    """Frame-to-frame tip movement (px) between CONSECUTIVE frame numbers only."""
+    frames, tips = np.asarray(frames), np.asarray(tips, np.float32)
+    ok = np.diff(frames) == 1
+    return np.linalg.norm(np.diff(tips, axis=0), axis=1)[ok]
+
+
+def consistency(args):
+    """Every frame of the 7 test videos, frozen surgical DINOv3 + arc7 trained on each training set (3 seeds): tip jitter
+    between consecutive frames vs the annotators' own jitter, and on the scored frames the error split into a constant
+    per-video offset and the scatter around it. Per-frame predictions -> outputs/<training set>/pred_all/<short>.npz."""
+    import torch
+    dev, bb = "cuda", "dinov3_surg"
+    base = ROOT.parent / "data" / "processed"
+    sets = {"14 videos": base / "arch_tip_pure", "36 videos": base / "arch_tip_pure40"}
+    allf = base / "arch_tip_pure" / "feats" / bb / "allframes"
+    tests = test_frames()
+    rows = json.loads((A / "labels_all.json").read_text())["rows"]
+    human = {}
+    for s in TEST:                                           # annotators' consensus tip on consecutive 3-annotator frames
+        rs = sorted((r for r in rows if r["short"] == s and r["n_annot"] == 3), key=lambda r: r["frame"])
+        human[s] = jitter([r["frame"] for r in rs], [r["tip"] for r in rs])
+
+    need = [s for s in TEST if not (allf / f"{s}.npy").exists()]
+    if need:
+        f, C = backbone(bb, dev)
+        for s in need:
+            fs = FrameStore(s)
+            allf.mkdir(parents=True, exist_ok=True)
+            arr = np.lib.format.open_memmap(allf / f"{s}.npy", "w+", np.float16, (len(fs), C, GH, GW))
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                for i in range(0, len(fs), 32):
+                    x = torch.from_numpy(np.stack([prep(fs.jpg(k)) for k in range(i, min(i + 32, len(fs)))])).to(dev)
+                    arr[i:i + len(x)] = f(x).float().cpu().numpy()
+            arr.flush()
+            print(f"all-frame features {s}: {len(fs)} frames", flush=True)
+
+    report = {}
+    for name, root in sets.items():
+        shorts, YT, ST = train_data(root)
+        X = torch.from_numpy(np.concatenate([np.load(root / "feats" / bb / "train" / f"{t}.npy") for t in shorts])).to(dev)
+        mu, sd = norm_stats(X)
+        yt, st = torch.from_numpy(YT).to(dev), torch.from_numpy(ST).to(dev)
+        heads = [fit(X, yt, st, mu, sd, args.method, seed, args.steps, args.bs, dev) for seed in range(args.seeds)]
+        del X
+        out = ROOT / "outputs" / root.name / "pred_all"
+        out.mkdir(parents=True, exist_ok=True)
+        report[name] = {}
+        for s in TEST:
+            fs = FrameStore(s)
+            feats_all = np.load(allf / f"{s}.npy", mmap_mode="r")
+            P = np.stack([infer_with(h, mu, sd, feats_all, dev)[0][:, 0] for h in heads])     # (seeds, frames, 2)
+            ens = P.mean(0)
+            np.savez(out / f"{s}.npz", frames=fs.frames, tip_seeds=P, tip=ens)
+            j_ens, j_seed = jitter(fs.frames, ens), np.concatenate([jitter(fs.frames, q) for q in P])
+            tf, gt, _ = tests[s]
+            d = ens[[fs.pos[fr] for fr in tf]] - gt
+            off = d.mean(0)
+            report[name][s] = dict(jitter_median=float(np.median(j_ens)), jitter_mean=float(j_ens.mean()),
+                                   jitter_p95=float(np.percentile(j_ens, 95)), jitter_seed_median=float(np.median(j_seed)),
+                                   error=float(np.linalg.norm(d, axis=1).mean()), offset=float(np.linalg.norm(off)),
+                                   offset_xy=off.round(1).tolist(), scatter=float(np.linalg.norm(d - off, axis=1).mean()),
+                                   human_jitter_median=float(np.median(human[s])))
+            r = report[name][s]
+            print(f"{name} {s}: jitter median {r['jitter_median']:.1f} px/frame, error {r['error']:.1f} "
+                  f"= offset {r['offset']:.1f} + scatter {r['scatter']:.1f}", flush=True)
+        del heads
+    (ROOT / "outputs" / "arch_tip_pure40" / f"consistency_{args.method}.json").write_text(json.dumps(report, indent=1))
+
+    print()
+    print("=== frame-to-frame tip movement (px per frame, consecutive frames, all frames of each test video) ===")
+    print(f"{'video':<10}{'annotators':>11}" + "".join(f"{n + ' median':>18}{'mean':>7}{'p95':>7}" for n in sets))
+    for s in TEST:
+        print(f"{s:<10}{report['14 videos'][s]['human_jitter_median']:11.1f}" + "".join(
+            f"{report[n][s]['jitter_median']:18.1f}{report[n][s]['jitter_mean']:7.1f}{report[n][s]['jitter_p95']:7.1f}"
+            for n in sets))
+    for n in sets:
+        print(f"{n}: median over videos {np.median([report[n][s]['jitter_median'] for s in TEST]):.1f} px/frame "
+              f"(single seed {np.median([report[n][s]['jitter_seed_median'] for s in TEST]):.1f}; 3-seed average above)")
+    print()
+    print("=== error on the scored frames = constant per-video offset + scatter around it (3-seed average, px) ===")
+    print(f"{'video':<10}" + "".join(f"{n + ' error':>17}{'offset':>8}{'scatter':>9}" for n in sets))
+    for s in TEST:
+        print(f"{s:<10}" + "".join(f"{report[n][s]['error']:17.1f}{report[n][s]['offset']:8.1f}{report[n][s]['scatter']:9.1f}"
+                                   for n in sets))
+
+
 def run(args):
     import torch
     dev = "cuda"
@@ -516,7 +606,7 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["pack", "feats", "run", "predict", "ablate"])
+    ap.add_argument("cmd", choices=["pack", "feats", "run", "predict", "ablate", "consistency"])
     ap.add_argument("--video", default="cada5bef", help="predict: test video short id")
     ap.add_argument("--method", default="tip", choices=list(POINTS) + ["tip+seg"], help="predict: method")
     ap.add_argument("--methods", nargs="+", default=["tip", "tip+mid", "arc5", "arc7"],
@@ -537,6 +627,8 @@ def main():
         predict(args)
     elif args.cmd == "ablate":
         ablate(args)
+    elif args.cmd == "consistency":
+        consistency(args)
     else:
         run(args)
 
