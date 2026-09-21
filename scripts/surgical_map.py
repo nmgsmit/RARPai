@@ -14,7 +14,7 @@ BACKGROUND, where the urethra leaves the pelvic floor. --black-input also blacks
 arm cannot pull the poses either (black may read as a flat surface, see CLAUDE.md: compare both).
 
 --window N picks, per video, the N-frame stretch where the annotated tip moves least (camera and tissue most
-static). --freeze-first-sight starts the window at the first frame the urethra is segmented instead (scan every
+static). --freeze-first-sight starts the window at the first frame the CATHETER is segmented instead (Nick) (scan every
 --sight-stride frames), keeps urethra + prostate ONLY from that frame (still attached to each other) and masks
 them in every later keyframe, so the moving / dissected organ is frozen at first sight on the static background.
 
@@ -80,15 +80,15 @@ def tip_window(rows, n):
     return best[1], best[1] + n - 1
 
 
-def first_sight(fs, seg, stride, frac):
-    """First frame whose urethra covers > frac of the frame on two consecutive scans."""
+def first_sight(fs, seg, stride, frac, cls=3):
+    """First frame where class cls (3 = catheter) covers > frac of the frame on two consecutive scans."""
     prev = None
     for k in range(0, len(fs), stride):
-        u = (seg(cv2.cvtColor(fs.jpg(k), cv2.COLOR_BGR2RGB)) == 1).mean()
+        u = (seg(cv2.cvtColor(fs.jpg(k), cv2.COLOR_BGR2RGB)) == cls).mean()
         if u > frac and prev is not None:
             return int(fs.frames[prev])
         prev = k if u > frac else None
-    raise SystemExit("urethra never seen")
+    raise SystemExit(f"class {cls} never seen")
 
 
 def build(a):
@@ -104,7 +104,7 @@ def build(a):
     if a.freeze_first_sight:
         lo = first_sight(fs, seg, a.sight_stride, a.sight_frac)
         hi = lo + (a.window or 400) - 1
-        print(f"urethra first seen at frame {lo}", flush=True)
+        print(f"catheter first seen at frame {lo}", flush=True)
     elif a.window:
         lo, hi = tip_window(rows, a.window)
     hi = min(hi, int(fs.frames[-1]))
@@ -294,7 +294,7 @@ if __name__ == "__main__":
     ap.add_argument("--freeze-first-sight", action="store_true",
                     help="window starts at the urethra's first sight; urethra+prostate kept from that frame only")
     ap.add_argument("--sight-stride", type=int, default=10)
-    ap.add_argument("--sight-frac", type=float, default=0.005, help="urethra area fraction that counts as seen")
+    ap.add_argument("--sight-frac", type=float, default=0.005, help="catheter area fraction that counts as seen")
     ap.add_argument("--black-input", action="store_true", help="also black the foreground in DA3's input")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
