@@ -13,6 +13,11 @@ arm, instruments); all of it, grown by --dilate px, is dropped from the cloud, s
 BACKGROUND, where the urethra leaves the pelvic floor. --black-input also blacks it in DA3's input, so the moving
 arm cannot pull the poses either (black may read as a flat surface, see CLAUDE.md: compare both).
 
+--window N picks, per video, the N-frame stretch where the annotated tip moves least (camera and tissue most
+static). --freeze-first-sight starts the window at the first frame the urethra is segmented instead (scan every
+--sight-stride frames), keeps urethra + prostate ONLY from that frame (still attached to each other) and masks
+them in every later keyframe, so the moving / dissected organ is frozen at first sight on the static background.
+
 Scale is DA3's relative unit, NOT mm (localisation only). The scene must be roughly static across the window:
 keep --start/--end to one phase of the dissection.
 
@@ -48,8 +53,8 @@ def as44(e):
     return np.vstack([e, [0, 0, 0, 1]]) if e.shape == (3, 4) else e
 
 
-def segment(imgs, checkpoint):
-    """RGB uint8 list -> ureth_fn class maps at full res (0 bg, 1 urethra, 2 prostate, 3 catheter, 4 non-anat)."""
+def seg_model(checkpoint):
+    """-> f(RGB uint8) = ureth_fn class map at full res (0 bg, 1 urethra, 2 prostate, 3 catheter, 4 non-anat)."""
     import torch
     from PIL import Image
     from overlay_dir import MetaFormerFPN, predict
@@ -58,7 +63,32 @@ def segment(imgs, checkpoint):
                       pretrained_weights=None)
     m.load_state_dict(sd)
     m.eval()
-    return [predict(m, Image.fromarray(im), (512, 512), "cpu") for im in imgs]   # 512 square = sul_slide_video
+    return lambda im: predict(m, Image.fromarray(im), (512, 512), "cpu")   # 512 square = sul_slide_video
+
+
+def tip_window(rows, n):
+    """Start/end of the n-frame window whose annotated tips spread least (mean distance to their median)."""
+    f = np.array(sorted(rows)); t = np.array([rows[x]["tip"] for x in f], float)
+    best = None
+    for s in f[::10]:
+        m = (f >= s) & (f < s + n)
+        if m.sum() < n // 2:                             # at least half the window annotated
+            continue
+        spread = np.mean(np.linalg.norm(t[m] - np.median(t[m], 0), axis=1))   # mean: every jump counts
+        best = min(best or (np.inf, 0), (spread, int(s)))
+    print(f"window: tip spread {best[0]:.0f} px", flush=True)
+    return best[1], best[1] + n - 1
+
+
+def first_sight(fs, seg, stride, frac):
+    """First frame whose urethra covers > frac of the frame on two consecutive scans."""
+    prev = None
+    for k in range(0, len(fs), stride):
+        u = (seg(cv2.cvtColor(fs.jpg(k), cv2.COLOR_BGR2RGB)) == 1).mean()
+        if u > frac and prev is not None:
+            return int(fs.frames[prev])
+        prev = k if u > frac else None
+    raise SystemExit("urethra never seen")
 
 
 def build(a):
@@ -68,15 +98,25 @@ def build(a):
 
     fs = FrameStore(a.short)
     rows = {r["frame"]: r for r in json.loads((A / "labels_all.json").read_text())["rows"] if r["short"] == a.short}
+    seg = seg_model(a.checkpoint)
     lo = a.start if a.start is not None else min(rows)
     hi = a.end if a.end is not None else max(rows)
+    if a.freeze_first_sight:
+        lo = first_sight(fs, seg, a.sight_stride, a.sight_frac)
+        hi = lo + (a.window or 400) - 1
+        print(f"urethra first seen at frame {lo}", flush=True)
+    elif a.window:
+        lo, hi = tip_window(rows, a.window)
+    hi = min(hi, int(fs.frames[-1]))
     ks = [fs.pos[f] for f in np.unique(np.linspace(lo, hi, a.n).round().astype(int)) if f in fs.pos]
     frames = [int(fs.frames[k]) for k in ks]
     imgs = [cv2.cvtColor(fs.jpg(k), cv2.COLOR_BGR2RGB) for k in ks]
     H0, W0 = imgs[0].shape[:2]
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * a.dilate + 1,) * 2)
     cls = [int(c) for c in a.mask_classes.split(",")]
-    fg = [cv2.dilate(np.isin(s, cls).astype(np.uint8), ker) > 0 for s in segment(imgs, a.checkpoint)]
+    fz = [4]                                             # frozen first-sight frame: only the arm goes
+    fg = [cv2.dilate(np.isin(seg(im), fz if a.freeze_first_sight and i == 0 else cls).astype(np.uint8), ker) > 0
+          for i, im in enumerate(imgs)]
     print("foreground (dilated) per frame: median %.0f%%" % (100 * np.median([f.mean() for f in fg])), flush=True)
     orig = imgs
     if a.black_input:
@@ -143,6 +183,8 @@ def self_test():
     u, v, z = project(X[100, 200], K, w2c)
     assert abs(u - 200.5) < 1e-6 and abs(v - 100.5) < 1e-6 and z > 0, (u, v, z)
     assert as44(np.eye(4)[:3]).shape == (4, 4)
+    rows = {f: {"tip": [500 + (0 if 300 <= f < 700 else rng.normal(0, 60)), 300]} for f in range(1500)}
+    assert 290 <= tip_window(rows, 400)[0] <= 310       # the one static stretch wins
     print("self-test ok")
 
 
@@ -248,6 +290,11 @@ if __name__ == "__main__":
     ap.add_argument("--dilate", type=int, default=30, help="px (1340x1072 crop) grown around every foreground mask")
     ap.add_argument("--mask-classes", default="1,2,3,4",
                     help="ureth_fn ids to drop: 1 urethra, 2 prostate, 3 catheter, 4 non-anatomical (robot arm)")
+    ap.add_argument("--window", type=int, help="frames; pick the stretch where the annotated tip moves least")
+    ap.add_argument("--freeze-first-sight", action="store_true",
+                    help="window starts at the urethra's first sight; urethra+prostate kept from that frame only")
+    ap.add_argument("--sight-stride", type=int, default=10)
+    ap.add_argument("--sight-frac", type=float, default=0.005, help="urethra area fraction that counts as seen")
     ap.add_argument("--black-input", action="store_true", help="also black the foreground in DA3's input")
     ap.add_argument("--self-test", action="store_true")
     a = ap.parse_args()
