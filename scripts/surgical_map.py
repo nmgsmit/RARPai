@@ -85,6 +85,9 @@ def tip_window(rows, n):
             continue
         spread = np.mean(np.linalg.norm(t[m] - np.median(t[m], 0), axis=1))   # mean: every jump counts
         best = min(best or (np.inf, 0), (spread, int(s)))
+    if best is None:                                     # annotated stretch shorter than the window: take all of it
+        print(f"window: no {n}-frame window with enough labels; using {f[0]}..{f[-1]}", flush=True)
+        return int(f[0]), int(f[-1])
     print(f"window: tip spread {best[0]:.0f} px", flush=True)
     return best[1], best[1] + n - 1
 
