@@ -447,6 +447,28 @@ def ablate(args):
               f"{np.mean([r['within50'] for r in rs]):6.0%}  " + " ".join(f"{np.mean([r['per_video'][s] for r in rs]):8.1f}" for s in TEST))
 
 
+# ------------------------------------------------------------------------------------------------ saved model
+def load_arch_model(path, dev="cpu"):
+    """A model saved by `consistency --save`: the seed heads (eval mode), feature normalisation and its settings.
+    Input features: the frozen backbone named in m['backbone'] (backbone(name) here) on a 512x640 feed of the
+    GUI-blacked 1340x1072 crop (prep()), i.e. (N, cin, 32, 40)."""
+    import torch
+    m = torch.load(path, map_location="cpu", weights_only=False)
+    m["heads"] = []
+    for sd_ in m["state_dicts"]:
+        h = make_head(m["cin"], m["npts"])
+        h.load_state_dict(sd_)
+        m["heads"].append(h.to(dev).eval())
+    m["mu"], m["sd"] = m["mu"].to(dev), m["sd"].to(dev)
+    return m
+
+
+def predict_tips(m, feats, dev="cpu"):
+    """(N, cin, 32, 40) backbone features -> (N, 2) tip in crop px (3-seed mean) and (seeds, N, 2) per seed."""
+    P = np.stack([infer_with(h, m["mu"], m["sd"], feats, dev)[0][:, 0] for h in m["heads"]])
+    return P.mean(0), P
+
+
 # ------------------------------------------------------------------------------------------------ consistency (GPU)
 def jitter(frames, tips):
     """Frame-to-frame tip movement (px) between CONSECUTIVE frame numbers only."""
@@ -493,6 +515,15 @@ def consistency(args):
         yt, st = torch.from_numpy(YT).to(dev), torch.from_numpy(ST).to(dev)
         heads = [fit(X, yt, st, mu, sd, args.method, seed, args.steps, args.bs, dev) for seed in range(args.seeds)]
         del X
+        if args.save:
+            mp = ROOT / "outputs" / root.name / "model" / f"arch_tip_{args.method}_{bb}.pt"
+            mp.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(dict(state_dicts=[{k: v.cpu() for k, v in h.state_dict().items()} for h in heads],
+                            mu=mu.cpu(), sd=sd.cpu(), cin=int(mu.shape[1]), npts=int(targets(yt[:1], args.method)[0].shape[1]),
+                            method=args.method, backbone=bb, feed_hw=(512, 640), grid_hw=(GH, GW), crop_hw=(1072, 1340),
+                            train_set=root.name, train_videos=shorts, steps=args.steps, seeds=list(range(args.seeds)),
+                            note="frozen backbone features -> load_arch_model + predict_tips (tip = point 0, 3-seed mean)"), mp)
+            print(f"saved model {mp}", flush=True)
         out = ROOT / "outputs" / root.name / "pred_all"
         out.mkdir(parents=True, exist_ok=True)
         report[name] = {}
@@ -620,6 +651,7 @@ def main():
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--sets", nargs="+", default=["arch_tip_pure", "arch_tip_pure40"],
                     help="consistency: training-set roots (names under data/processed) to train on and predict with")
+    ap.add_argument("--save", action="store_true", help="consistency: also save the trained heads -> outputs/<set>/model/")
     args = ap.parse_args()
     if args.cmd == "pack":
         pack(args.src, Path(args.out), args.k)
