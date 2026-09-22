@@ -462,7 +462,7 @@ def consistency(args):
     import torch
     dev, bb = "cuda", "dinov3_surg"
     base = ROOT.parent / "data" / "processed"
-    sets = {"14 videos": base / "arch_tip_pure", "36 videos": base / "arch_tip_pure40"}
+    sets = {n: base / n for n in args.sets}                  # training-set roots under data/processed
     allf = base / "arch_tip_pure" / "feats" / bb / "allframes"
     tests = test_frames()
     rows = json.loads((A / "labels_all.json").read_text())["rows"]
@@ -515,13 +515,13 @@ def consistency(args):
             print(f"{name} {s}: jitter median {r['jitter_median']:.1f} px/frame, error {r['error']:.1f} "
                   f"= offset {r['offset']:.1f} + scatter {r['scatter']:.1f}", flush=True)
         del heads
-    (ROOT / "outputs" / "arch_tip_pure40" / f"consistency_{args.method}.json").write_text(json.dumps(report, indent=1))
+    (ROOT / "outputs" / list(sets.values())[-1].name / f"consistency_{args.method}.json").write_text(json.dumps(report, indent=1))
 
     print()
     print("=== frame-to-frame tip movement (px per frame, consecutive frames, all frames of each test video) ===")
     print(f"{'video':<10}{'annotators':>11}" + "".join(f"{n + ' median':>18}{'mean':>7}{'p95':>7}" for n in sets))
     for s in TEST:
-        print(f"{s:<10}{report['14 videos'][s]['human_jitter_median']:11.1f}" + "".join(
+        print(f"{s:<10}{report[list(sets)[0]][s]['human_jitter_median']:11.1f}" + "".join(
             f"{report[n][s]['jitter_median']:18.1f}{report[n][s]['jitter_mean']:7.1f}{report[n][s]['jitter_p95']:7.1f}"
             for n in sets))
     for n in sets:
@@ -618,6 +618,8 @@ def main():
     ap.add_argument("--steps", type=int, default=3000)
     ap.add_argument("--bs", type=int, default=64)
     ap.add_argument("--seeds", type=int, default=3)
+    ap.add_argument("--sets", nargs="+", default=["arch_tip_pure", "arch_tip_pure40"],
+                    help="consistency: training-set roots (names under data/processed) to train on and predict with")
     args = ap.parse_args()
     if args.cmd == "pack":
         pack(args.src, Path(args.out), args.k)
