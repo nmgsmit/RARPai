@@ -33,7 +33,10 @@ def window_frames(rows):
         rs = sorted((r for r in rows if r["short"] == s and r["n_annot"] == 3), key=lambda r: r["frame"])
         med = np.median([r["agree_px"] for r in rs])
         inw = [r for r in rs if t0 * FPS <= r["frame"] < t1 * FPS]
-        out[s] = {"all-3": inw, "best-half": [r for r in inw if r["agree_px"] <= med]}
+        anyw = sorted((r for r in rows if r["short"] == s and t0 * FPS <= r["frame"] < t1 * FPS), key=lambda r: r["frame"])
+        # "any": every annotated frame in the window vs the mean of whoever annotated it; 749c8234 and RARP_062 only
+        # have Nick inside their windows, so this is the only set that covers all 7 videos
+        out[s] = {"all-3": inw, "best-half": [r for r in inw if r["agree_px"] <= med], "any": anyw}
     return out
 
 
@@ -48,10 +51,12 @@ def main():
     a = ap.parse_args()
     rows = json.loads((A / "labels_all.json").read_text())["rows"]
     W = window_frames(rows)
-    print("frames per window (all-3 / best-half):  " + "  ".join(f"{s} {len(w['all-3'])}/{len(w['best-half'])}" for s, w in W.items()))
+    print("frames per window (all-3 / best-half / any):  "
+          + "  ".join(f"{s} {len(w['all-3'])}/{len(w['best-half'])}/{len(w['any'])}" for s, w in W.items()))
     res = {}
-    for ts in ("best-half", "all-3"):
-        res[ts] = {"human": {s: float(human(W[s][ts]).mean()) if W[s][ts] else float("nan") for s in WINDOWS}}
+    for ts in ("best-half", "all-3", "any"):
+        res[ts] = {"human": {s: float(human(W[s][ts]).mean()) if W[s][ts] and all(len(r["tips"]) > 1 for r in W[s][ts])
+                             else float("nan") for s in WINDOWS}}
         for name in a.sets:
             per = {}
             for s in WINDOWS:
