@@ -14,10 +14,10 @@ module load Python/3.11.3-GCCcore-12.3.0
 cd $SLURM_SUBMIT_DIR
 source venv/bin/activate
 
-# Re-annotated Pure Arch (20fps) training set: frozen surgical DINOv3 + arc7 (3 seeds), predict every test frame,
-# then score all training sets on the cutting windows only.
+# Re-annotated arches (json only) on the frames/features already packed for the 36-video set; frozen surgical DINOv3
+# + arc7 (3 seeds, saved), predict every test frame, then score all training sets on the cutting windows only.
 export ARCH_TIP_PURE=$HOME/data/processed/arch_tip_pure_v2
 set -e
-python scripts/arch_tip_pure.py feats --backbones dinov3_surg
-python scripts/arch_tip_pure.py consistency --method arc7 --sets arch_tip_pure_v2
+python scripts/arch_tip_pure.py relabel --from-pack $HOME/data/processed/arch_tip_pure40 --arches-dir $HOME/data/processed/arch_tip_v2_arches
+python scripts/arch_tip_pure.py consistency --method arc7 --sets arch_tip_pure_v2 --save
 python scripts/arch_tip_window.py --sets arch_tip_pure arch_tip_pure40 arch_tip_pure_v2

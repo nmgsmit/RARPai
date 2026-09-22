@@ -447,6 +447,66 @@ def ablate(args):
               f"{np.mean([r['within50'] for r in rs]):6.0%}  " + " ".join(f"{np.mean([r['per_video'][s] for r in rs]):8.1f}" for s in TEST))
 
 
+# ------------------------------------------------------------------------------------------------ relabel (CPU)
+def relabel(args):
+    """Re-annotated arches on frames that are ALREADY packed (no image upload): for every video of --from-pack, keep the
+    packed frames that still have an arch in <--arches-dir>/<short>/arches.json, label them with the NEW arch, link the
+    same frames.bin, and slice the already computed backbone features of those frames -> <PURE> (ARCH_TIP_PURE)."""
+    src, arches = Path(args.from_pack), Path(args.arches_dir)
+    PURE.mkdir(parents=True, exist_ok=True)
+    for d in sorted(p for p in src.iterdir() if (p / "frames.npy").exists()):
+        s = d.name
+        a = arches / s / "arches.json"
+        arch = {int(f): e for f, e in json.loads(a.read_text())["frames"].items()} if a.exists() else {}
+        idx = np.load(d / "frames.npy")
+        keep = [k for k, f in enumerate(idx[:, 0]) if int(f) in arch]
+        if not keep:
+            print(f"{s}: no packed frame has a new arch, skipped", flush=True)
+            continue
+        out = PURE / s
+        out.mkdir(exist_ok=True)
+        np.save(out / "frames.npy", idx[keep])
+        if not (out / "frames.bin").exists():
+            (out / "frames.bin").symlink_to((d / "frames.bin").resolve())
+        labels = {}
+        for f in idx[keep, 0]:
+            left, right, _, _ = oriented(arch[int(f)], np.zeros(2))
+            labels[int(f)] = dict(tip=apex_of(arch[int(f)])[0].tolist(), left=left.tolist(), right=right.tolist())
+        (out / "labels.json").write_text(json.dumps(dict(video=s, labels=labels)))
+        for fb in sorted(p for p in (src / "feats").iterdir() if (p / "train" / f"{s}.npy").exists()):
+            dst = PURE / "feats" / fb.name / "train" / f"{s}.npy"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            np.save(dst, np.load(fb / "train" / f"{s}.npy", mmap_mode="r")[keep])
+        print(f"{s}: {len(keep)} of {len(idx)} packed frames keep an arch ({len(arch)} re-annotated frames in total)", flush=True)
+    for fb in (src / "feats").iterdir():                     # the shared test features
+        t = PURE / "feats" / fb.name / "test"
+        if (fb / "test").exists() and not t.exists():
+            t.parent.mkdir(parents=True, exist_ok=True)
+            t.symlink_to((fb / "test").resolve())
+
+
+# ------------------------------------------------------------------------------------------------ saved model
+def load_arch_model(path, dev="cpu"):
+    """A model saved by `consistency --save`: the seed heads (eval mode), feature normalisation and its settings.
+    Input features: the frozen backbone named in m['backbone'] (backbone(name) here) on a 512x640 feed of the
+    GUI-blacked 1340x1072 crop (prep()), i.e. (N, cin, 32, 40)."""
+    import torch
+    m = torch.load(path, map_location="cpu", weights_only=False)
+    m["heads"] = []
+    for sd_ in m["state_dicts"]:
+        h = make_head(m["cin"], m["npts"])
+        h.load_state_dict(sd_)
+        m["heads"].append(h.to(dev).eval())
+    m["mu"], m["sd"] = m["mu"].to(dev), m["sd"].to(dev)
+    return m
+
+
+def predict_tips(m, feats, dev="cpu"):
+    """(N, cin, 32, 40) backbone features -> (N, 2) tip in crop px (3-seed mean) and (seeds, N, 2) per seed."""
+    P = np.stack([infer_with(h, m["mu"], m["sd"], feats, dev)[0][:, 0] for h in m["heads"]])
+    return P.mean(0), P
+
+
 # ------------------------------------------------------------------------------------------------ consistency (GPU)
 def jitter(frames, tips):
     """Frame-to-frame tip movement (px) between CONSECUTIVE frame numbers only."""
@@ -493,6 +553,15 @@ def consistency(args):
         yt, st = torch.from_numpy(YT).to(dev), torch.from_numpy(ST).to(dev)
         heads = [fit(X, yt, st, mu, sd, args.method, seed, args.steps, args.bs, dev) for seed in range(args.seeds)]
         del X
+        if args.save:
+            mp = ROOT / "outputs" / root.name / "model" / f"arch_tip_{args.method}_{bb}.pt"
+            mp.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(dict(state_dicts=[{k: v.cpu() for k, v in h.state_dict().items()} for h in heads],
+                            mu=mu.cpu(), sd=sd.cpu(), cin=int(mu.shape[1]), npts=int(targets(yt[:1], args.method)[0].shape[1]),
+                            method=args.method, backbone=bb, feed_hw=(512, 640), grid_hw=(GH, GW), crop_hw=(1072, 1340),
+                            train_set=root.name, train_videos=shorts, steps=args.steps, seeds=list(range(args.seeds)),
+                            note="frozen backbone features -> load_arch_model + predict_tips (tip = point 0, 3-seed mean)"), mp)
+            print(f"saved model {mp}", flush=True)
         out = ROOT / "outputs" / root.name / "pred_all"
         out.mkdir(parents=True, exist_ok=True)
         report[name] = {}
@@ -606,7 +675,9 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["pack", "feats", "run", "predict", "ablate", "consistency"])
+    ap.add_argument("cmd", choices=["pack", "feats", "run", "predict", "ablate", "consistency", "relabel"])
+    ap.add_argument("--from-pack", help="relabel: packed training set whose frames/features are reused")
+    ap.add_argument("--arches-dir", help="relabel: <dir>/<short>/arches.json with the re-annotated arches")
     ap.add_argument("--video", default="cada5bef", help="predict: test video short id")
     ap.add_argument("--method", default="tip", choices=list(POINTS) + ["tip+seg"], help="predict: method")
     ap.add_argument("--methods", nargs="+", default=["tip", "tip+mid", "arc5", "arc7"],
@@ -620,6 +691,7 @@ def main():
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--sets", nargs="+", default=["arch_tip_pure", "arch_tip_pure40"],
                     help="consistency: training-set roots (names under data/processed) to train on and predict with")
+    ap.add_argument("--save", action="store_true", help="consistency: also save the trained heads -> outputs/<set>/model/")
     args = ap.parse_args()
     if args.cmd == "pack":
         pack(args.src, Path(args.out), args.k)
@@ -631,6 +703,8 @@ def main():
         ablate(args)
     elif args.cmd == "consistency":
         consistency(args)
+    elif args.cmd == "relabel":
+        relabel(args)
     else:
         run(args)
 
