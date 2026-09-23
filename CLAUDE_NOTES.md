@@ -3,6 +3,21 @@
 Append-only. Newest on top. Record design choices made and where things were put, so future
 sessions don't re-derive them. Keep entries one or two lines.
 
+## 2026-09-23 — STANDARD SUL: cylinder depth-step START + arch model END (`scripts/sul_arch_cyl.py`)
+- Nick fixed the method on 2026-09-23: START = `urethra_cylinder.analyse` t_start (axis="mask", depth step near the mask's
+  proximal end, knee rule, outward only), END = arch model tip (outputs/arch_tip_pure40 arc7 dinov3_surg, 3-seed mean) matched
+  in the IMAGE to the nearest point of the tube's top line, SUL = t_end - t_start. Depth = UniDepth V2, no K, frozen ruler calib
+  scale mode (z_m / s_only, as arch_tip_unidepth) on the GUI-blacked 1340x1072 crop, K = da Vinci K_NORM. Catheter-top start
+  (sul_slide_video) is NOT the standard; nor the roof end.
+- Layout: a labelling-tool folder <root>/{images,masks} (1920x1080 console frames, palette masks) -> <root>/depth/<stem>.npz
+  ('depth' mm float32 full res, 'gui'), <root>/visualization/<stem>.jpg, <root>/sul.csv. genoa job `jobs/sul_arch_cyl.sh`.
+- GoodRulerTest SUL (job 27061981, 4 pre-cut frames, hand masks; Snellius ~/data/GoodRulerTest/SUL, local transfer_atlas_mod/
+  workspace/GoodRulerTest/SUL): real / SUL mm 1132f8e5 16 / 15.8, 9e125883 27 / 35.0, c9d54c9b 16 / 20.2, fa38ea7e 18 / 19.8
+  -> MAE 3.5, mean signed +3.5. The depth step moves the start <= 1 mm from the mask's start (mask start: MAE 3.2).
+  Cylinder roof end instead of the arch: 20.7 / 34.5 / none / 28.4 (worse on all 3). 9e125883's +8 is not tilt (axis 11 deg
+  out of plane). The same frozen calibration read the ruler lines of these cases 1.30x long (GoodRulerTest entry): /1.30 would
+  give MAE 1.8, but that factor is fitted on these same patients -> in-sample, not a result.
+
 ## 2026-09-16 - Urethra cylinder from the MASK is the default now (urethra_cylinder.mask_tube, analyse(axis="mask"))
 - Why: on monocular calibrated UniDepth the free fit failed: the urethra's depth is only ~1-2 mm deeper at its edges
   than its middle -> radius hit the 8 mm bound (unbounded 8-20); the refit pulled in tissue beside the urethra
