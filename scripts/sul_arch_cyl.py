@@ -4,13 +4,16 @@ Per frame of a labelling-tool workspace folder (images/*.png = 1920x1080 console
 hand masks, palette ids):
   crop   1340x1072 content frame (source_crop x289 y4); GUI blacked and kept as a mask (full_gui_mask)
   depth  UniDepth V2 ViT-L, no K, frozen ruler calibration (metric_calib_proxy, scale mode: z_mm = z_m / s_only),
-         as arch_tip_unidepth -> <root>/depth/<stem>.npz ('depth' float32 mm, 'gui' bool), reused when present
+         as arch_tip_unidepth -> <root>/depth/<stem>.npz ('depth' float32 mm, 'gui' bool), reused when present.
+         No depth is READ from the GUI or from non-anatomical tissue (the ruler, tools) + TOOL_GROW px: zeroed after
+         inference; the networks still see the full frame (the arch model is worse with tools blacked).
   tube   urethra_cylinder.analyse on the hand mask (axis="mask"), K = da Vinci K_NORM on the crop
   START  analyse's t_start: the depth step near the mask's proximal end (knee rule, outward only)
   END    arch model tip (outputs/arch_tip_pure40, surgical DINOv3 + arc7, 3-seed mean), matched IN THE IMAGE to
          the nearest point of the tube's top line (as hand_measure / the catheter start)
   SUL    t_end - t_start along the axis
-Out: <root>/sul.csv, <root>/visualization/<stem>.jpg; with --truth the error vs the real length.
+Out: <root>/sul.csv, <root>/visualization/<stem>.jpg (frame + depth at 50% + cylinder + SUL line | the case's ruler
+frame from --rulers), <root>/sul_overview.jpg (all of them stacked).
 
     sbatch jobs/sul_arch_cyl.sh                       # ../data/GoodRulerTest/SUL
     python scripts/sul_arch_cyl.py --self-test        # synthetic tube, no models
@@ -27,11 +30,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cut_cue_clips import content_box, full_gui_mask  # noqa: E402
 from prep_sharpest_clips import CUE, _crop, load_gui_templates  # noqa: E402
-from urethra_cylinder import analyse, draw, load_mask, profile, proj, toward_camera  # noqa: E402
+from urethra_cylinder import NONANAT, URETHRA, analyse, load_mask, proj, toward_camera, tube_line  # noqa: E402
 
 W, H = 1340, 1072
 K = (0.82 * W, 1.02 * H, 0.5 * W, 0.5 * H)       # da Vinci K_NORM on the crop, as the ruler calibration
 PT = 250                                          # grey margin on top: arch tips can sit above the frame
+TOOL_GROW = 15                                    # px around non-anatomical masks with no depth (analyse's tool_grow)
 
 
 def frame_inputs(img_path, mask_path, T):
@@ -68,25 +72,41 @@ def measure(zmap, seg, tip):
     return fr, t_end - fr["t_start"], off
 
 
-def panel(img, zmap, seg, fr, tip, title):
-    """[hand mask + tube (green start, red arch end) + arch tip star | depth] over the gap profile, top padded."""
-    Kp = (K[0], K[1], K[2], K[3] + PT)
-    pad = lambda a, v: cv2.copyMakeBorder(a, PT, 0, 0, 0, cv2.BORDER_CONSTANT, value=v)
+def no_depth(seg, gui):
+    """GUI + non-anatomical tissue (the ruler) grown by TOOL_GROW, outside the urethra: never read depth there."""
+    tool = cv2.dilate((seg == NONANAT).astype(np.uint8), np.ones((2 * TOOL_GROW + 1,) * 2, np.uint8)).astype(bool)
+    return gui | (tool & (seg != URETHRA))
+
+
+def text(img, s, org, scale=1.6):
+    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 9, cv2.LINE_AA)
+    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 3, cv2.LINE_AA)
+
+
+def panel(img, zmap, fr, sul, title, ruler=None, ruler_title=""):
+    """[frame + depth at 50% (none where masked) + cylinder outline + SUL line, green start -> red end | ruler frame]."""
+    pad = lambda a: cv2.copyMakeBorder(a, PT, 0, 0, 0, cv2.BORDER_CONSTANT, value=(45, 45, 45))
     ok = zmap > 0
     lo, hi = np.percentile(zmap[ok], [2, 98])
     heat = cv2.applyColorMap((np.clip((hi - zmap) / (hi - lo), 0, 1) * 255).astype(np.uint8), cv2.COLORMAP_TURBO)
-    heat[~ok] = 90
-    q = tuple(int(round(v)) for v in (tip[0], tip[1] + PT))
-    cols = []
-    for base in (img, heat):
-        p = draw(pad(base, (45, 45, 45)), pad(seg, 0), fr, Kp) if fr is not None else pad(base, (45, 45, 45))
-        cv2.drawMarker(p, q, (255, 0, 255), cv2.MARKER_STAR, 50, 4, cv2.LINE_AA)
-        cols.append(p)
-    cv2.putText(cols[1], "UniDepth %.0f-%.0f mm" % (lo, hi), (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6,
-                (255, 255, 255), 3, cv2.LINE_AA)
-    cv2.putText(cols[0], title, (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (255, 255, 255), 3, cv2.LINE_AA)
-    top = cv2.resize(np.hstack(cols), (W, (H + PT) // 2), interpolation=cv2.INTER_AREA)
-    return np.vstack([top, profile(fr, W, 260, 1.5)])
+    base = img.copy()
+    base[ok] = (0.5 * img[ok] + 0.5 * heat[ok]).astype(np.uint8)
+    p = pad(base)
+    if fr is not None:
+        Kp = (K[0], K[1], K[2], K[3] + PT)
+        edges = [tube_line(fr, fr["t_start"], fr["t_end"], side, Kp) for side in (-1, 1)]
+        cv2.polylines(p, edges, False, (255, 255, 0), 4, cv2.LINE_AA)
+        a, b = map(tuple, tube_line(fr, fr["t_start"], fr["t_end"], 0, Kp, 2).tolist())
+        cv2.line(p, a, b, (0, 0, 0), 11, cv2.LINE_AA)
+        cv2.line(p, a, b, (255, 255, 255), 5, cv2.LINE_AA)
+        cv2.circle(p, a, 14, (0, 255, 0), -1, cv2.LINE_AA)
+        cv2.circle(p, b, 14, (0, 0, 255), -1, cv2.LINE_AA)
+        text(p, "%.1f mm" % sul, (int(np.vstack(edges)[:, 0].max()) + 25, (a[1] + b[1]) // 2))
+    text(p, title, (15, 60))
+    text(p, "depth %.0f-%.0f mm (red = near)" % (lo, hi), (15, 130), 1.1)
+    r = pad(_crop(cv2.imread(str(ruler)))) if ruler else np.full_like(p, 45)
+    text(r, ruler_title, (15, 60))
+    return cv2.resize(np.hstack([p, r]), (W, (H + PT) // 2), interpolation=cv2.INTER_AREA)
 
 
 def read_truth(path):
@@ -121,6 +141,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="../data/GoodRulerTest/SUL")
     ap.add_argument("--truth", default="../data/GoodRulerTest/realsizeurethra.txt")
+    ap.add_argument("--rulers", default="../data/GoodRulerTest", help="folder of <case>*.png ruler frames to show")
     ap.add_argument("--calib", default="outputs/metric_calib_proxy/results.json")
     ap.add_argument("--arch", default="outputs/arch_tip_pure40/model/arch_tip_arc7_dinov3_surg.pt")
     ap.add_argument("--model", default="lpiccinelli/unidepth-v2-vitl14")
@@ -144,7 +165,7 @@ def main():
     ud = UniDepthV2.from_pretrained(a.model).to(dev).eval()
     print(f"arch model {a.arch} ({arch['train_set']}, {arch['method']}), UniDepth s_only {s_only:.4g}, {dev}")
 
-    rows = []
+    rows, panels = [], []
     for ip in sorted((root / "images").glob("*.png")):
         mp = root / "masks" / ip.name
         if not mp.exists():
@@ -158,7 +179,7 @@ def main():
                 z = ud.infer(rgb)["depth"][0, 0].float().cpu().numpy() / s_only
                 np.savez(dp, depth=z.astype(np.float32), gui=gui, s_only=s_only)
             zmap = np.load(dp)["depth"].copy()
-            zmap[gui] = 0
+            zmap[no_depth(seg, gui)] = 0
             tip = predict_tips(arch, feat(torch.from_numpy(prep(img))[None].to(dev)).float(), dev)[0][0]
         fr, sul, off = measure(zmap, seg, tip)
         case = ip.name[:8]
@@ -172,9 +193,10 @@ def main():
                    depth_median_mm=round(float(np.median(zmap[zmap > 0])), 1))
         rows.append(row)
         print(row, flush=True)
-        cv2.imwrite(str(root / "visualization" / f"{ip.stem}.jpg"),
-                    panel(img, zmap, seg, fr, tip, f"{case}  SUL {sul:.1f} mm  (real {tr:g})"),
-                    [cv2.IMWRITE_JPEG_QUALITY, 90])
+        rp = sorted(Path(a.rulers).glob(f"{case}*.png")) if a.rulers else []
+        panels.append(panel(img, zmap, fr, sul, f"{case}  SUL {sul:.1f} mm  (real {tr:g} mm)",
+                            rp[0] if rp else None, f"ruler: {tr:g} mm" if rp else "no ruler frame"))
+        cv2.imwrite(str(root / "visualization" / f"{ip.stem}.jpg"), panels[-1], [cv2.IMWRITE_JPEG_QUALITY, 90])
 
     with open(root / "sul.csv", "w", newline="") as fh:
         wr = csv.DictWriter(fh, fieldnames=list(rows[0]))
@@ -187,7 +209,8 @@ def main():
         print(f"{r['case']:<10}{r['true_mm']:6g}{r['sul_mm']:7.1f}{r['err_mm']:+7.1f}  {r['start']} ok={r['start_ok']}")
     if e.size:
         print(f"MAE {np.abs(e).mean():.1f} mm, mean signed {e.mean():+.1f} mm, n={e.size}")
-    print(f"wrote {root}/sul.csv, depth/, visualization/")
+    cv2.imwrite(str(root / "sul_overview.jpg"), np.vstack(panels), [cv2.IMWRITE_JPEG_QUALITY, 85])
+    print(f"wrote {root}/sul.csv, sul_overview.jpg, depth/, visualization/")
 
 
 if __name__ == "__main__":
