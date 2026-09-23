@@ -17,6 +17,11 @@ sessions don't re-derive them. Keep entries one or two lines.
   Cylinder roof end instead of the arch: 20.7 / 34.5 / none / 28.4 (worse on all 3). 9e125883's +8 is not tilt (axis 11 deg
   out of plane). The same frozen calibration read the ruler lines of these cases 1.30x long (GoodRulerTest entry): /1.30 would
   give MAE 1.8, but that factor is fitted on these same patients -> in-sample, not a result.
+- Rerun (job 27062730): the ruler (non-anatomical, only annotated in 1132f8e5) + 15 px now gets NO depth read (zeroed
+  like the GUI; the networks still see it): 1132f8e5 unchanged at 15.8. c9d54c9b replaced by a pre-cut seg1 frame
+  (00.00.25.506): 16.1 vs 16. -> MAE 2.5, mean signed +2.4 (9e125883 +8.0 is the only big miss). Picture (Nick) = frame + 50%
+  depth overlay + cylinder outline + SUL line (green start -> red end) | the case's ruler frame; no masks, no gap profile;
+  <root>/sul_overview.jpg stacks all cases.
 
 ## 2026-09-16 - Urethra cylinder from the MASK is the default now (urethra_cylinder.mask_tube, analyse(axis="mask"))
 - Why: on monocular calibrated UniDepth the free fit failed: the urethra's depth is only ~1-2 mm deeper at its edges
